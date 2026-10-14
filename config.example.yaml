@@ -1,0 +1,141 @@
+# Dashboard HTTP 监听端口。
+port: 3000
+# 自动交易总闸。默认关闭。打开后仍要在 /trade 手动启动；进程重启后页面开关恢复关闭。
+# 私钥只从 .env 读取。每轮下单额不得超过 maxTradeSizeUsdt。
+trading:
+  enabled: false
+  tradeSizeUsdt: 100
+  maxTradeSizeUsdt: 100
+runtime:
+  # 健康检查探测周期，单位：秒。
+  healthProbeIntervalSeconds: 300
+  # Dashboard 页面自动刷新周期，单位：秒。
+  dashboardRefreshSeconds: 15
+  # 异常保护阈值；超过阈值时暂停相关收益估算。
+  guardrails:
+    # Ethereum USDT/USD 指数偏离上限，百分比。正好等于阈值仍通过，超过才暂停 USDT 估值。
+    maxUsdtUsdDeviationPercent: 0.5
+    # X Layer USDT0/USDT 指数偏离上限，百分比。与上一阈值独立。
+    maxUsdt0UsdtDeviationPercent: 0.5
+    # OKX Index Price 刷新间隔，单位：秒。
+    indexPriceRefreshSeconds: 15
+    # 指数源时间允许的最大年龄，单位：秒。正好等于该值仍通过。
+    indexPriceMaxAgeSeconds: 60
+    # DEX 报价允许的最大价格影响百分比；超过后该报价会被拦截。
+    maxDexPriceImpactPercent: 2
+    # 相对上次确认值允许的最大 multiplier 变化百分比；超过后需人工核对。
+    maxMultiplierChangePercent: 1
+mysql:
+  # MySQL 连接信息；password 填本机数据库密码，勿提交真实密码到示例配置。
+  host: 127.0.0.1
+  port: 3306
+  user: trade_observer
+  password: ""
+  database: trade_observer
+assets:
+  # 同一资产的 OKX 现货信息和观察参数；每条 routes 配置对应一条独立链路线。
+  - instId: XAAPL-USDT
+    # 资产总开关；false 时禁用该资产下所有链路线。省略时默认开启。
+    enabled: true
+    # DEX 上 XAAPL 映射代币的显示符号。
+    tokenSymbol: AAPLx
+    # OKX 账户资产查询使用的币种代码。
+    okxCurrency: XAAPL
+    # 每轮报价观察的输入规模，单位：USDT 等值。
+    observationSizesUsdt: [100, 250, 500]
+    # 预估链上 Gas 时增加的安全缓冲百分比。
+    gasSafetyBufferPercent: 20
+    # 同一资产、同一路线两次 DEX 报价的最短间隔，单位：毫秒（至少 2000）。
+    dexQuoteIntervalMs: 5000
+    # 链路线逐条配置；资产和各链的报价、机会分别记录，不跨链合并。
+    routes:
+      # 单链路线开关；资产总开关和该开关都为 true 才启用。
+      - enabled: true
+        # 页面展示的网络名称。
+        network: X Layer
+        # 可选：每笔观察摊销的再平衡成本，单位：USDT；未配置时收益估算不含该成本。
+        # rebalanceCostUsdtPerTrade: 0.10
+        # multiplier 异常变化后，核对实际值并填入以确认；确认后可删除此项。
+        # approvedMultiplier: "1.0"
+        # OKX DEX 使用的链 ID，以及 OKX 账户网络名称。
+        chainIndex: "196"
+        okxChain: XAAPL-X Layer
+        # XAAPL 映射代币合约地址及其最小单位精度。
+        tokenAddress: "0x9d275685dc284c8eb1c79f6aba7a63dc75ec890a"
+        tokenDecimals: 18
+        # DEX 报价币地址、精度和符号。
+        quoteTokenAddress: "0x779ded0c9e1022225f8e0630b35a9b54be713736"
+        quoteTokenDecimals: 6
+        # 官方 X Layer USDT0。没有全费用兑换报价时不按 1:1 折成 USDT。
+        quoteTokenSymbol: USDT0
+      - enabled: true
+        network: Solana
+        # 可选：每笔观察摊销的再平衡成本，单位：USDT；未配置时收益估算不含该成本。
+        # rebalanceCostUsdtPerTrade: 0.10
+        # multiplier 异常变化后，核对实际值并填入以确认；确认后可删除此项。
+        # approvedMultiplier: "1.0"
+        # OKX DEX 使用的链 ID，以及 OKX 账户网络名称。
+        chainIndex: "501"
+        okxChain: XAAPL-Solana
+        # XAAPL 映射代币 mint 地址及其最小单位精度。
+        tokenAddress: "XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp"
+        tokenDecimals: 8
+        # DEX 报价币地址、精度和符号。
+        quoteTokenAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+        quoteTokenDecimals: 6
+        # 官方 Solana 原生 USDT。指数健康时按 identity 计 USDT，不检查 USDT0 储备。
+        quoteTokenSymbol: USDT
+  - instId: XSPCX-USDT
+    # 新资产默认关闭；确认 OKX 账户网络、地址和库存后再启用。
+    enabled: false
+    tokenSymbol: SPCXx
+    okxCurrency: XSPCX
+    observationSizesUsdt: [100, 250, 500]
+    gasSafetyBufferPercent: 20
+    dexQuoteIntervalMs: 5000
+    routes:
+      - enabled: true
+        network: X Layer
+        chainIndex: "196"
+        okxChain: XSPCX-X Layer
+        tokenAddress: "0x68fa48b1c2fe52b3d776e1953e0e782b5044ce28"
+        tokenDecimals: 18
+        quoteTokenAddress: "0x779ded0c9e1022225f8e0630b35a9b54be713736"
+        quoteTokenDecimals: 6
+        quoteTokenSymbol: USDT0
+      - enabled: false
+        network: Solana
+        chainIndex: "501"
+        okxChain: XSPCX-Solana
+        tokenAddress: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8"
+        tokenDecimals: 8
+        quoteTokenAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+        quoteTokenDecimals: 6
+        quoteTokenSymbol: USDT
+  - instId: XNVDA-USDT
+    # 新资产默认关闭；确认 OKX 账户网络、地址和库存后再启用。
+    enabled: false
+    tokenSymbol: NVDAx
+    okxCurrency: XNVDA
+    observationSizesUsdt: [100, 250, 500]
+    gasSafetyBufferPercent: 20
+    dexQuoteIntervalMs: 5000
+    routes:
+      - enabled: true
+        network: X Layer
+        chainIndex: "196"
+        okxChain: XNVDA-X Layer
+        tokenAddress: "0xc845b2894dbddd03858fd2d643b4ef725fe0849d"
+        tokenDecimals: 18
+        quoteTokenAddress: "0x779ded0c9e1022225f8e0630b35a9b54be713736"
+        quoteTokenDecimals: 6
+        quoteTokenSymbol: USDT0
+      - enabled: true
+        network: Solana
+        chainIndex: "501"
+        okxChain: XNVDA-Solana
+        tokenAddress: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+        tokenDecimals: 8
+        quoteTokenAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+        quoteTokenDecimals: 6
+        quoteTokenSymbol: USDT

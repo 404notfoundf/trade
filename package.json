@@ -1,0 +1,36 @@
+{
+  "name": "xlayer-stock-opportunity-observer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "dev:collector": "tsx watch src/main.ts --collector-only",
+    "dev:dashboard": "tsx watch src/dashboard-server.ts",
+    "db:migrate": "tsx src/migrate.ts",
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "start:collector": "node dist/main.js --collector-only",
+    "start:dashboard": "node dist/dashboard-server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.99.0",
+    "bs58": "^6.0.0",
+    "decimal.js": "^10.5.0",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.17.0",
+    "mysql2": "^3.14.0",
+    "ws": "^8.18.0",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/ws": "^8.5.14",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

@@ -53,7 +53,7 @@ export type Config = {
   port: number;
   marketdata: { quoteProvider: "aggregator" | "direct_pool"; aggregatorShadow: boolean; coalesceWindowMs: number; directQuoteRetentionDays: number; directDecisionRetentionDays: number };
   directPoolObservation: { xlayerWrapThenSwapGasUsdt: number; xlayerSwapThenUnwrapGasUsdt: number; solanaSwapGasUsdt: number };
-  runtime: { healthProbeIntervalSeconds: number; dashboardRefreshSeconds: number; guardrails: { maxUsdtUsdDeviationPercent: number; maxUsdt0UsdtDeviationPercent: number; indexPriceRefreshSeconds: number; indexPriceMaxAgeSeconds: number; maxDexPriceImpactPercent: number; maxMultiplierChangePercent: number } };
+  runtime: { healthProbeIntervalSeconds: number; guardrails: { maxUsdtUsdDeviationPercent: number; maxUsdt0UsdtDeviationPercent: number; indexPriceRefreshSeconds: number; indexPriceMaxAgeSeconds: number; maxDexPriceImpactPercent: number; maxMultiplierChangePercent: number } };
   mysql: { host: string; port: number; user: string; password: string; database: string };
   okx: { key: string; secret: string; passphrase: string };
   dex: { key: string; secret: string; passphrase: string };
@@ -116,7 +116,6 @@ export async function loadConfig(): Promise<Config> {
     throw new Error("direct_pool_observation gas budgets must be between 0 and 1000 USDT");
   }
   const healthProbeIntervalSeconds = settings.runtime?.healthProbeIntervalSeconds ?? 300;
-  const dashboardRefreshSeconds = settings.runtime?.dashboardRefreshSeconds ?? 15;
   const guardrails = {
     maxUsdtUsdDeviationPercent: settings.runtime?.guardrails?.maxUsdtUsdDeviationPercent ?? 0.5,
     maxUsdt0UsdtDeviationPercent: settings.runtime?.guardrails?.maxUsdt0UsdtDeviationPercent ?? 0.5,
@@ -127,9 +126,6 @@ export async function loadConfig(): Promise<Config> {
   };
   if (!Number.isSafeInteger(healthProbeIntervalSeconds) || healthProbeIntervalSeconds < 1 || healthProbeIntervalSeconds > 2_147_483) {
     throw new Error("runtime.healthProbeIntervalSeconds must be an integer from 1 to 2147483");
-  }
-  if (!Number.isSafeInteger(dashboardRefreshSeconds) || dashboardRefreshSeconds < 1 || dashboardRefreshSeconds > 86_400) {
-    throw new Error("runtime.dashboardRefreshSeconds must be an integer from 1 to 86400");
   }
   if (!Number.isFinite(guardrails.maxUsdtUsdDeviationPercent) || guardrails.maxUsdtUsdDeviationPercent <= 0 || guardrails.maxUsdtUsdDeviationPercent > 100
     || !Number.isFinite(guardrails.maxUsdt0UsdtDeviationPercent) || guardrails.maxUsdt0UsdtDeviationPercent <= 0 || guardrails.maxUsdt0UsdtDeviationPercent > 100
@@ -204,7 +200,7 @@ export async function loadConfig(): Promise<Config> {
       directDecisionRetentionDays: marketdata.directDecisionRetentionDays as number,
     },
     directPoolObservation: observation,
-    runtime: { healthProbeIntervalSeconds, dashboardRefreshSeconds, guardrails },
+    runtime: { healthProbeIntervalSeconds, guardrails },
     mysql: settings.mysql,
     okx: { key: process.env.OKX_API_KEY || "", secret: process.env.OKX_API_SECRET || "", passphrase: process.env.OKX_API_PASSPHRASE || "" },
     dex: { key: process.env.OKX_DEX_API_KEY || "", secret: process.env.OKX_DEX_API_SECRET || "", passphrase: process.env.OKX_DEX_API_PASSPHRASE || "" },

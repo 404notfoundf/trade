@@ -21,8 +21,6 @@ trading:
 runtime:
   # 健康检查探测周期，单位：秒。
   healthProbeIntervalSeconds: 300
-  # Dashboard 页面自动刷新周期，单位：秒。
-  dashboardRefreshSeconds: 15
   # 异常保护阈值；超过阈值时暂停相关收益估算。
   guardrails:
     # Ethereum USDT/USD 指数偏离上限，百分比。正好等于阈值仍通过，超过才暂停 USDT 估值。

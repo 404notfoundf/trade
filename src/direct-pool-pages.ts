@@ -75,7 +75,59 @@ function subNav(path: string, range: DirectPoolRange, filters?: DecisionFilters)
 function rangeControl(path: string, range: DirectPoolRange, escapeHtml: Helpers["escapeHtml"], filters?: DecisionFilters): string {
   const positiveOnly = filters?.positiveOnly ?? false;
   const decisionFields = filters ? `<label>资产 / 池地址<input type="search" name="assetPool" value="${escapeHtml(filters.assetPool)}" maxlength="128" placeholder="输入资产代码或池地址片段"></label><label>交易方向<select name="direction"><option value="">全部方向</option><option value="cex_buy_dex_sell"${filters.direction === "cex_buy_dex_sell" ? " selected" : ""}>CEX 买入 · DEX 卖出</option><option value="dex_buy_cex_sell"${filters.direction === "dex_buy_cex_sell" ? " selected" : ""}>DEX 买入 · CEX 卖出</option></select></label>` : "";
-  return `<form class="direct-range direct-range-improved" action="${path}" method="get">${positiveOnly ? '<input type="hidden" name="profit" value="positive">' : ""}<label class="direct-range-preset">时间范围<select name="range"><option value="5m"${range.preset === "5m" ? " selected" : ""}>最近 5 分钟</option><option value="1h"${range.preset === "1h" ? " selected" : ""}>最近 1 小时</option><option value="24h"${range.preset === "24h" ? " selected" : ""}>最近 24 小时</option><option value="custom"${range.preset === "custom" ? " selected" : ""}>自定义时间</option></select></label><div class="direct-custom-range"${range.preset === "custom" ? "" : " hidden"}><label>开始时间（UTC+8）<input type="datetime-local" name="from" value="${escapeHtml(formatUtc8Input(range.from))}"></label><span aria-hidden="true">至</span><label>结束时间（UTC+8）<input type="datetime-local" name="to" value="${escapeHtml(formatUtc8Input(range.to))}"></label></div>${decisionFields}<button type="submit">应用筛选</button></form><script>(()=>{const form=document.currentScript.previousElementSibling;const preset=form.querySelector('[name="range"]');const panel=form.querySelector('.direct-custom-range');const sync=()=>{const active=preset.value==="custom";panel.hidden=!active;panel.querySelectorAll('input').forEach(input=>input.required=active)};preset.addEventListener('change',sync);sync()})();</script><style>.direct-range.direct-range-improved{align-items:flex-end;flex-wrap:wrap;gap:12px;margin:0 0 16px}.direct-range.direct-range-improved label{display:grid;gap:6px;color:#53627a;font-size:12px;font-weight:600}.direct-range.direct-range-improved select,.direct-range.direct-range-improved input{box-sizing:border-box;height:40px;padding:0 11px;border:1px solid #d5deeb;border-radius:8px;background:#fff;color:#26364f;font:inherit}.direct-range.direct-range-improved select{min-width:180px;cursor:pointer}.direct-range.direct-range-improved input{width:100%;min-width:0;font-variant-numeric:tabular-nums}.direct-range.direct-range-improved .direct-custom-range{display:grid;grid-template-columns:minmax(220px,1fr) auto minmax(220px,1fr);align-items:end;gap:10px;flex:1 1 520px;padding:12px;border:1px solid #e2e8f1;border-radius:10px;background:#f7f9fc}.direct-range.direct-range-improved .direct-custom-range[hidden]{display:none}.direct-range.direct-range-improved .direct-custom-range>span{padding:0 2px 12px;color:#758198}.direct-range.direct-range-improved button{height:40px;padding:0 18px;border:0;border-radius:8px;background:#315fba;color:#fff;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer}.direct-range.direct-range-improved button:hover{background:#274f9f}.direct-range.direct-range-improved select:focus-visible,.direct-range.direct-range-improved input:focus-visible,.direct-range.direct-range-improved button:focus-visible{outline:3px solid #9bb9f4;outline-offset:2px}@media(max-width:700px){.direct-range.direct-range-improved{align-items:stretch;flex-direction:column}.direct-range.direct-range-improved select{width:100%}.direct-range.direct-range-improved .direct-custom-range{grid-template-columns:1fr;gap:8px;flex:auto}.direct-range.direct-range-improved .direct-custom-range>span{display:none}.direct-range.direct-range-improved button{width:100%}}</style>`;
+  const dateTimeField = (name: "from" | "to", label: string, date: Date) => {
+    return `<input class="direct-datetime-input" type="datetime-local" name="${name}" step="1" value="${escapeHtml(formatUtc8Input(date))}" aria-label="${label}（UTC+8）">`;
+  };
+  return `<form class="direct-range direct-range-improved" action="${path}" method="get">${positiveOnly ? '<input type="hidden" name="profit" value="positive">' : ""}<label class="direct-range-preset">时间范围<select name="range"><option value="5m"${range.preset === "5m" ? " selected" : ""}>最近 5 分钟</option><option value="1h"${range.preset === "1h" ? " selected" : ""}>最近 1 小时</option><option value="24h"${range.preset === "24h" ? " selected" : ""}>最近 24 小时</option><option value="custom"${range.preset === "custom" ? " selected" : ""}>自定义时间</option></select></label><div class="direct-custom-range"><span class="direct-range-label">时间区间（UTC+8）</span><div class="direct-range-control">${dateTimeField("from", "开始时间", range.from)}<span class="direct-range-separator" aria-hidden="true">~</span>${dateTimeField("to", "结束时间", range.to)}<button class="direct-range-calendar" type="button" aria-label="编辑自定义时间"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4.5" width="14" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6.5 3v3M13.5 3v3M3.5 8h13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button></div></div>${decisionFields}<button type="submit">应用筛选</button></form>
+  <script>
+    (() => {
+      const form = document.currentScript.previousElementSibling;
+      const preset = form.querySelector('[name="range"]');
+      const panel = form.querySelector('.direct-custom-range');
+      const sync = () => {
+        const active = preset.value === "custom";
+        panel.classList.toggle("is-disabled", !active);
+        panel.querySelectorAll(".direct-datetime-input").forEach((input) => { input.required = active; input.disabled = !active; });
+      };
+      preset.addEventListener("change", sync);
+      sync();
+      panel.querySelector(".direct-range-calendar").addEventListener("click", () => {
+        preset.value = "custom";
+        sync();
+        const picker = panel.querySelector(".direct-datetime-input");
+        if (typeof picker.showPicker === "function") picker.showPicker();
+        else picker.focus();
+      });
+      panel.querySelectorAll(".direct-datetime-input").forEach((picker) => picker.addEventListener("click", () => {
+        if (typeof picker.showPicker === "function") {
+          try { picker.showPicker(); } catch {}
+        }
+      }));
+    })();
+  </script>
+  <style>
+    .direct-range.direct-range-improved{align-items:flex-end;flex-wrap:wrap;gap:12px;margin:0 0 16px}
+    .direct-range.direct-range-improved label{display:grid;gap:6px;color:#53627a;font-size:12px;font-weight:600}
+    .direct-range.direct-range-improved select,.direct-range.direct-range-improved input{box-sizing:border-box;height:40px;padding:0 11px;border:1px solid #d5deeb;border-radius:8px;background:#fff;color:#26364f;font:500 14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+    .direct-range.direct-range-improved select{min-width:180px;cursor:pointer}
+    .direct-range.direct-range-improved input{width:100%;min-width:0;font-variant-numeric:tabular-nums}
+    .direct-range.direct-range-improved .direct-custom-range{display:grid;gap:6px;flex:0 1 auto;min-width:0;padding:0;border:0;border-radius:0;background:transparent}
+    .direct-range.direct-range-improved .direct-range-label{color:#53627a;font-size:12px;font-weight:600}
+    .direct-range.direct-range-improved .direct-custom-range.is-disabled .direct-datetime-input{opacity:.55}
+    .direct-range.direct-range-improved .direct-range-control{box-sizing:border-box;display:flex;align-items:center;width:460px;max-width:100%;height:40px;padding:0 8px;border:1px solid #d5deeb;border-radius:8px;background:#fff;transition:border-color .15s,box-shadow .15s}
+    .direct-range.direct-range-improved .direct-range-control:focus-within{border-color:#6b93dc;box-shadow:0 0 0 3px #9bb9f433}
+    .direct-range.direct-range-improved .direct-datetime-input{flex:1 1 0;width:0;min-width:0;height:34px;padding:0 4px;border:0;border-radius:5px;background:transparent;font-size:12px;cursor:pointer}
+    .direct-range.direct-range-improved .direct-datetime-input::-webkit-calendar-picker-indicator{display:none}
+    .direct-range.direct-range-improved .direct-datetime-input:focus{outline:0}
+    .direct-range.direct-range-improved .direct-range-separator{padding:0 5px;color:#758198}
+    .direct-range.direct-range-improved .direct-range-calendar{display:grid;place-items:center;flex:0 0 28px;width:28px;height:34px;margin-left:auto;padding:0;border:0;border-left:1px solid #e8edf4;border-radius:0;background:transparent;color:#71809a;cursor:pointer}
+    .direct-range.direct-range-improved .direct-range-calendar svg{width:18px;height:18px}
+    .direct-range.direct-range-improved .direct-range-calendar:hover{background:#f2f6fc;color:#315fba}
+    .direct-range.direct-range-improved button{height:40px;padding:0 18px;border:0;border-radius:8px;background:#315fba;color:#fff;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer}
+    .direct-range.direct-range-improved button:hover{background:#274f9f}
+    .direct-range.direct-range-improved select:focus-visible,.direct-range.direct-range-improved input:focus-visible,.direct-range.direct-range-improved button:focus-visible{outline:3px solid #9bb9f4;outline-offset:2px}
+    @media(max-width:700px){.direct-range.direct-range-improved{align-items:stretch;flex-direction:column}.direct-range.direct-range-improved select{width:100%}.direct-range.direct-range-improved .direct-custom-range{width:100%;flex:auto}.direct-range.direct-range-improved .direct-range-control{width:100%;box-sizing:border-box}.direct-range.direct-range-improved .direct-datetime-input{font-size:11px}.direct-range.direct-range-improved button{width:100%}.direct-range.direct-range-improved .direct-range-control>.direct-range-calendar{width:28px;flex-basis:28px}}
+  </style>`;
 }
 
 function pagination(path: string, range: DirectPoolRange, page: number, hasNext: boolean, label: string, extra?: Record<string, string>): string {

@@ -24,7 +24,7 @@ test("existing wrapped and non-pinned pools stay observe-only and produce no can
   assert.equal(registry.dexes.uniswap_v3_xlayer?.factory, "0x4B2ab38DBF28D31D467aA8993f6c2585981D6804");
   assert.equal(registry.dexes.raydium_clmm_solana?.program_id, "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
   assert.deepEqual(registry.pools.map((pool) => [pool.mode, pool.reason]), [
-    ["observe_only", "wrapper_required"], ["observe_only", "quote_asset_not_pinned"],
+    ["observe_only", "wrapper_required"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"],
   ]);
   assert.deepEqual(solveDirectPoolCandidates(registry, [{ enabled: true, instId: "XNVDA-USDT", okxCurrency: "XNVDA", chainIndex: "196", tokenAddress: "0xc845b2894dbddd03858fd2d643b4ef725fe0849d", quoteTokenAddress: "0x779ded0c9e1022225f8e0630b35a9b54be713736" }]), []);
 });

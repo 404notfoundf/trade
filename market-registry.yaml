@@ -94,7 +94,7 @@ pools:
     token_in_out: { asset_address: "0xa8ddb5cd96b5222afe198316e9a57caa642850d5", asset_decimals: 18, quote_address: "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8", quote_decimals: 6 }
     expected_fee_tier: 500
   - id: xnvda-solana-raydium-clmm
-    enabled: true
+    enabled: false
     instrument_id: XNVDA
     chain: solana
     dex: raydium_clmm_solana
@@ -103,3 +103,13 @@ pools:
     verified: true
     address: "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
     token_in_out: { asset_address: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
+  - id: xspcx-solana-raydium-usdc-clmm
+    enabled: true
+    instrument_id: XSPCX
+    chain: solana
+    dex: raydium_clmm_solana
+    mode: observe_only
+    reason: quote_asset_not_pinned
+    verified: true
+    address: "AHNN6JmvaGG6XUoSg7sEr38gRYDB2jTbUvqXVuqaRHpq"
+    token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }

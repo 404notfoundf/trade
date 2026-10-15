@@ -2,9 +2,12 @@ import { createHash } from "node:crypto";
 import Decimal from "decimal.js";
 import { Interface, JsonRpcProvider } from "ethers";
 import { AccountState, ExtensionType, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getDefaultAccountState, getExtensionTypes, getPausableConfig, getScaledUiAmountConfig, getTransferFeeConfig, getTransferHook, unpackMint } from "@solana/spl-token";
-import { Connection, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import { PoolUtils, Raydium, Token, TokenAmount, toBN, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import { solanaRpcFetch } from "../solana-rpc-logging.js";
 import type { MarketRegistry, RegisteredPool } from "./market-registry.js";
+import { simulateRaydiumSwap } from "./raydium-simulator.js";
+export { createSolanaSimulationTransaction } from "./raydium-simulator.js";
 
 const evmPoolInterface = new Interface([
   "function token0() view returns (address)", "function token1() view returns (address)",
@@ -15,6 +18,7 @@ const erc20Interface = new Interface(["function decimals() view returns (uint8)"
 const erc4626Interface = new Interface([
   "function asset() view returns (address)",
   "function previewDeposit(uint256 assets) view returns (uint256 shares)",
+  "function previewMint(uint256 shares) view returns (uint256 assets)",
   "function previewRedeem(uint256 shares) view returns (uint256 assets)",
 ]);
 const factoryGetterInterface = new Interface(["function factory() view returns (address)"]);
@@ -24,12 +28,11 @@ const swapRouterInterface = new Interface([
 const quoterInterface = new Interface([
   "function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
 ]);
-const token2022ObservationPool = {
-  id: "xnvda-solana-raydium-clmm", address: "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6",
-  programId: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", assetMint: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
-  quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-};
-// shortcut: only this reviewed XNVDA observe-only pool is supported; widen after separate extension review.
+const token2022ObservationPools = [
+  { id: "xnvda-solana-raydium-clmm", instrumentId: "XNVDA", address: "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6", programId: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", assetMint: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh", quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+  { id: "xspcx-solana-raydium-usdc-clmm", instrumentId: "XSPCX", address: "AHNN6JmvaGG6XUoSg7sEr38gRYDB2jTbUvqXVuqaRHpq", programId: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", assetMint: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+];
+// shortcut: only these reviewed observe-only pools are supported; add a pool after checking its mint extensions.
 const allowedToken2022Extensions = new Set<ExtensionType>([
   ExtensionType.ConfidentialTransferMint, ExtensionType.DefaultAccountState, ExtensionType.PermanentDelegate,
   ExtensionType.TransferHook, ExtensionType.MetadataPointer, ExtensionType.TokenMetadata,
@@ -41,17 +44,19 @@ export type ExactInQuote = {
   poolId: string; direction: "asset_to_quote" | "quote_to_asset"; amountInRaw: bigint; amountOutRaw: bigint;
   minimumAmountOutRaw: bigint; priceImpactPercent: string; networkFeeNativeRaw: bigint | null; networkFeeUsdt: string | null;
   assetUiMultiplier: string; version: PoolVersion; quotedAt: number; raw: unknown;
+  mintTokenPrograms?: { asset: string; quote: string };
 };
 export type QuoteInput = { direction: ExactInQuote["direction"]; amountInRaw: bigint; slippageBps: number; expectedAssetUiMultiplier?: string };
-export type SwapBuildInput = { quote: ExactInQuote; wallet: string; deadlineSeconds?: number };
+export type SwapBuildInput = { quote: ExactInQuote; wallet: string; deadlineSeconds?: number; simulationOnly?: boolean };
 export type UnsignedSwap = {
   chain: "xlayer" | "solana"; poolId: string; direction: ExactInQuote["direction"]; wallet: string;
-  amountInRaw: bigint; minimumAmountOutRaw: bigint; stateFingerprint: string; version: PoolVersion;
+  amountInRaw: bigint; minimumAmountOutRaw: bigint; stateFingerprint: string; version: PoolVersion; simulationOnly?: boolean;
 } & ({ chain: "xlayer"; to: string; data: string; value: "0x0" }
-  | { chain: "solana"; transactionBase64: string });
+  | { chain: "solana"; transactionBase64: string; mintTokenPrograms: { asset: string; quote: string } });
 export type SwapSimulationResult = {
   chain: "xlayer" | "solana"; ok: boolean; amountOutRaw?: string; computeUnits?: number;
-  networkFeeNativeRaw?: string; error?: string; logs?: string[];
+  networkFeeNativeRaw?: string; amountInDebitedRaw?: string; amountOutCreditedRaw?: string;
+  skipped?: boolean; error?: string; logs?: string[];
 };
 type SolanaMintState = { mint: ReturnType<typeof unpackMint>; owner: PublicKey; extensions: ExtensionType[]; uiMultiplier?: string; multiplierEffectiveTimestamp?: string | null };
 export class PoolIdentityMismatchError extends Error {}
@@ -64,7 +69,7 @@ export interface PoolAdapter {
   getAssetUiMultiplier(pool: RegisteredPool): Promise<string>;
   quoteExactIn(pool: RegisteredPool, input: QuoteInput): Promise<ExactInQuote>;
   buildSwap(pool: RegisteredPool, input: SwapBuildInput): Promise<UnsignedSwap>;
-  simulateSwap(pool: RegisteredPool, swap: UnsignedSwap): Promise<SwapSimulationResult>;
+  simulateSwap(pool: RegisteredPool, swap: UnsignedSwap, signer?: Keypair): Promise<SwapSimulationResult>;
 }
 
 export function createPoolAdapter(pool: RegisteredPool, registry: MarketRegistry): PoolAdapter {
@@ -114,18 +119,25 @@ export class XLayerWrapperAdapter {
     this.verified = true;
   }
 
-  async previewDeposit(underlyingAmountRaw: bigint): Promise<bigint> {
-    return this.preview("previewDeposit", underlyingAmountRaw);
+  async previewDeposit(underlyingAmountRaw: bigint, blockNumber?: bigint): Promise<bigint> {
+    return this.preview("previewDeposit", underlyingAmountRaw, blockNumber);
   }
 
-  async previewRedeem(wrapperAmountRaw: bigint): Promise<bigint> {
-    return this.preview("previewRedeem", wrapperAmountRaw);
+  async previewMint(wrapperAmountRaw: bigint, blockNumber?: bigint): Promise<bigint> {
+    return this.preview("previewMint", wrapperAmountRaw, blockNumber);
   }
 
-  private async preview(method: "previewDeposit" | "previewRedeem", amountRaw: bigint): Promise<bigint> {
+  async previewRedeem(wrapperAmountRaw: bigint, blockNumber?: bigint): Promise<bigint> {
+    return this.preview("previewRedeem", wrapperAmountRaw, blockNumber);
+  }
+
+  private async preview(method: "previewDeposit" | "previewMint" | "previewRedeem", amountRaw: bigint, blockNumber?: bigint): Promise<bigint> {
     if (amountRaw <= 0n) throw new Error("Wrapper preview amount must be positive");
     await this.verify();
-    const data = await this.provider.call({ to: this.wrapperAddress, data: erc4626Interface.encodeFunctionData(method, [amountRaw]) });
+    const data = await this.provider.call(
+      { to: this.wrapperAddress, data: erc4626Interface.encodeFunctionData(method, [amountRaw]),
+        blockTag: blockNumber === undefined ? undefined : `0x${blockNumber.toString(16)}` },
+    );
     const amount = BigInt(erc4626Interface.decodeFunctionResult(method, data)[0]);
     if (amount <= 0n) throw new Error(`X Layer wrapper ${method} returned a non-positive amount`);
     return amount;
@@ -280,7 +292,7 @@ class RaydiumClmmAdapter implements PoolAdapter {
     const rpc = registry.chains.solana.rpc_http;
     if (!dex || !dex.program_id || !rpc) throw new Error("Solana RPC or Raydium CLMM Program ID is not configured");
     this.dex = dex;
-    this.connection = new Connection(rpc, { commitment: "confirmed", wsEndpoint: registry.chains.solana.rpc_ws ?? undefined });
+    this.connection = new Connection(rpc, { commitment: "confirmed", wsEndpoint: registry.chains.solana.rpc_ws ?? undefined, fetch: solanaRpcFetch, disableRetryOnRateLimit: true });
   }
 
   private sdk(owner = PublicKey.default): Promise<Raydium> {
@@ -333,7 +345,7 @@ class RaydiumClmmAdapter implements PoolAdapter {
       throw new PoolIdentityMismatchError("Raydium quote mint pair or decimals do not match registry");
     }
     const assetToken = this.validateTokenSupport(pool, tokenState.mints.get(pool.token_in_out.asset_address)!, tokenState.blockTimestamp);
-    this.validateTokenSupport(pool, tokenState.mints.get(pool.token_in_out.quote_address)!, tokenState.blockTimestamp);
+    const quoteToken = this.validateTokenSupport(pool, tokenState.mints.get(pool.token_in_out.quote_address)!, tokenState.blockTimestamp);
     if (input.direction === "asset_to_quote" && input.expectedAssetUiMultiplier !== undefined
       && !new Decimal(input.expectedAssetUiMultiplier).eq(assetToken.uiMultiplier)) {
       throw new Error("Raydium scaled UI multiplier changed while sizing the exact-in amount");
@@ -365,9 +377,10 @@ class RaydiumClmmAdapter implements PoolAdapter {
       priceImpactPercent: computed.priceImpact.toFixed(10), networkFeeNativeRaw: null, networkFeeUsdt: null,
       assetUiMultiplier: assetToken.uiMultiplier,
       version: { chain: "solana", slot: BigInt(after), observedAt: Date.now(), stateFingerprint }, quotedAt: Date.now(),
+      mintTokenPrograms: { asset: assetToken.owner.toBase58(), quote: quoteToken.owner.toBase58() },
       raw: { slot: after, tickArrays: tickAddresses, amountOutRaw: amountOutRaw.toString(), priceImpactPercent: computed.priceImpact.toFixed(10), feeRaw: computed.fee.toString(),
         assetUiMultiplier: assetToken.uiMultiplier, multiplierEffectiveTimestamp: assetToken.multiplierEffectiveTimestamp, chainTimestamp: tokenState.blockTimestamp.toString(),
-        assetTokenProgram: assetToken.owner.toBase58(), assetExtensions: assetToken.extensions.map(extensionName) },
+        assetTokenProgram: assetToken.owner.toBase58(), quoteTokenProgram: quoteToken.owner.toBase58(), assetExtensions: assetToken.extensions.map(extensionName) },
     };
   }
 
@@ -394,20 +407,20 @@ class RaydiumClmmAdapter implements PoolAdapter {
     if (state.owner.equals(TOKEN_PROGRAM_ID)) return { ...state, uiMultiplier: "1", multiplierEffectiveTimestamp: null };
     if (!state.owner.equals(TOKEN_2022_PROGRAM_ID)) throw new UnsupportedTokenError("TOKEN_PROGRAM_UNSUPPORTED", `Unsupported Solana token program: ${state.owner.toBase58()}`);
     const programId = this.dex.program_id;
-    if (!programId || !isScopedToken2022Pool(pool, programId) || state.mint.address.toBase58() !== token2022ObservationPool.assetMint) {
-      throw new UnsupportedTokenError("TOKEN_PROGRAM_UNSUPPORTED", "Token-2022 is enabled only for the registered XNVDA Raydium observe-only pool");
+    if (!programId || !isScopedToken2022Pool(pool, programId) || !token2022ObservationPools.some((entry) => entry.assetMint === state.mint.address.toBase58())) {
+      throw new UnsupportedTokenError("TOKEN_PROGRAM_UNSUPPORTED", "Token-2022 is enabled only for reviewed Raydium observe-only pools");
     }
     const unsupported = state.extensions.filter((extension) => !allowedToken2022Extensions.has(extension));
-    if (unsupported.length) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", `Unsupported XNVDA Token-2022 extensions: ${unsupported.map(extensionName).join(", ")}`);
-    if (getTransferFeeConfig(state.mint)) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "XNVDA transfer-fee extensions are not supported for observation quotes");
+    if (unsupported.length) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", `Unsupported Token-2022 extensions: ${unsupported.map(extensionName).join(", ")}`);
+    if (getTransferFeeConfig(state.mint)) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "Token-2022 transfer fees are not supported for observation quotes");
     const hook = getTransferHook(state.mint);
-    if (hook && !hook.programId.equals(PublicKey.default)) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "XNVDA transfer hook is enabled");
+    if (hook && !hook.programId.equals(PublicKey.default)) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "Token-2022 transfer hook is enabled");
     const defaultState = getDefaultAccountState(state.mint);
-    if (defaultState && defaultState.state !== AccountState.Initialized) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "XNVDA default token-account state is not initialized");
-    if (getPausableConfig(state.mint)?.paused) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "XNVDA mint is paused");
+    if (defaultState && defaultState.state !== AccountState.Initialized) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "Token-2022 default token-account state is not initialized");
+    if (getPausableConfig(state.mint)?.paused) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "Token-2022 mint is paused");
     const scaled = getScaledUiAmountConfig(state.mint);
     const multiplier = scaled && blockTimestamp >= scaled.newMultiplierEffectiveTimestamp ? scaled.newMultiplier : scaled?.multiplier ?? 1;
-    if (!Number.isFinite(multiplier) || multiplier <= 0) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "XNVDA scaled UI multiplier is invalid");
+    if (!Number.isFinite(multiplier) || multiplier <= 0) throw new UnsupportedTokenError("TOKEN_EXTENSION_UNSUPPORTED", "Token-2022 scaled UI multiplier is invalid");
     return { ...state, uiMultiplier: String(multiplier), multiplierEffectiveTimestamp: scaled?.newMultiplierEffectiveTimestamp.toString() ?? null };
   }
 
@@ -427,37 +440,24 @@ class RaydiumClmmAdapter implements PoolAdapter {
       remainingAccounts: tickArrays.map((tickArray) => tickArray.address), associatedOnly: true, txVersion: TxVersion.LEGACY,
     });
     if (built.signers.length) throw new Error("Raydium unsigned swap unexpectedly requires additional signers");
+    const mintTokenPrograms = input.quote.mintTokenPrograms;
+    if (!mintTokenPrograms) throw new Error("Solana quote is missing validated mint token programs");
     const latestBlockhash = await this.connection.getLatestBlockhash("confirmed");
     built.transaction.feePayer = new PublicKey(input.wallet);
     built.transaction.recentBlockhash = latestBlockhash.blockhash;
     return { chain: "solana", poolId: pool.id, direction: input.quote.direction, wallet: input.wallet,
       amountInRaw: input.quote.amountInRaw, minimumAmountOutRaw: input.quote.minimumAmountOutRaw,
-      stateFingerprint, version: input.quote.version,
+      stateFingerprint, version: input.quote.version, simulationOnly: input.simulationOnly === true,
+      mintTokenPrograms,
       transactionBase64: built.transaction.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64") };
   }
 
-  async simulateSwap(pool: RegisteredPool, swap: UnsignedSwap): Promise<SwapSimulationResult> {
-    if (swap.chain !== "solana" || swap.poolId !== pool.id) throw new Error("Unsigned Solana swap does not match the registered pool");
-    try {
-      if (pool.mode !== "trade_candidate" || !pool.verified) throw new Error("Observe-only pools cannot be simulated for execution");
-      await this.verify(pool);
-      const { poolInfo, computePoolInfo, tickData } = await (await this.sdk(new PublicKey(swap.wallet))).clmm.getPoolInfoFromRpc(pool.address);
-      if (fingerprintRaydiumState(poolInfo, computePoolInfo, tickData[pool.address] ?? {}) !== swap.stateFingerprint) {
-        throw new Error("Raydium pool state changed since the unsigned swap was built");
-      }
-      const latestBlockhash = await this.connection.getLatestBlockhash("confirmed");
-      const simulatedTransaction = createSolanaSimulationTransaction(swap.transactionBase64, swap.wallet, latestBlockhash.blockhash);
-      const [simulation, fee] = await Promise.all([
-        this.connection.simulateTransaction(simulatedTransaction, { sigVerify: false, replaceRecentBlockhash: true, commitment: "confirmed" }),
-        this.connection.getFeeForMessage(simulatedTransaction.message, "confirmed"),
-      ]);
-      return simulation.value.err
-        ? { chain: "solana", ok: false, error: JSON.stringify(simulation.value.err), logs: simulation.value.logs ?? [] }
-        : { chain: "solana", ok: true, computeUnits: simulation.value.unitsConsumed ?? undefined,
-          networkFeeNativeRaw: fee.value === null ? undefined : String(fee.value), logs: simulation.value.logs ?? [] };
-    } catch (error) {
-      return { chain: "solana", ok: false, error: errorMessage(error) };
-    }
+  async simulateSwap(pool: RegisteredPool, swap: UnsignedSwap, signer?: Keypair): Promise<SwapSimulationResult> {
+    return simulateRaydiumSwap({ pool, swap, signer, connection: this.connection, verifyPool: () => this.verify(pool),
+      currentStateFingerprint: async () => {
+        const { poolInfo, computePoolInfo, tickData } = await (await this.sdk(new PublicKey(swap.wallet))).clmm.getPoolInfoFromRpc(pool.address);
+        return fingerprintRaydiumState(poolInfo, computePoolInfo, tickData[pool.address] ?? {});
+      } });
   }
 }
 
@@ -466,15 +466,9 @@ export function encodeUniswapV3Swap(params: { tokenIn: string; tokenOut: string;
   return swapRouterInterface.encodeFunctionData("exactInputSingle", [{ ...params, sqrtPriceLimitX96: 0n }]);
 }
 
-export function createSolanaSimulationTransaction(transactionBase64: string, wallet: string, recentBlockhash: string): VersionedTransaction {
-  const transaction = Transaction.from(Buffer.from(transactionBase64, "base64"));
-  if (!transaction.feePayer?.equals(new PublicKey(wallet))) throw new Error("Solana unsigned transaction fee payer does not match its wallet");
-  return new VersionedTransaction(new TransactionMessage({ payerKey: new PublicKey(wallet), recentBlockhash,
-    instructions: transaction.instructions }).compileToV0Message());
-}
-
 function assertExecutionInput(pool: RegisteredPool, input: SwapBuildInput, chain: "xlayer" | "solana"): void {
-  if (pool.mode !== "trade_candidate" || !pool.verified || pool.chain !== chain || input.quote.poolId !== pool.id || input.quote.version.chain !== chain
+  const poolEligible = pool.mode === "trade_candidate" || (chain === "solana" && input.simulationOnly === true && pool.mode === "observe_only");
+  if (!poolEligible || !pool.verified || pool.chain !== chain || (chain !== "solana" && input.simulationOnly === true) || input.quote.poolId !== pool.id || input.quote.version.chain !== chain
     || input.quote.amountInRaw <= 0n || input.quote.amountOutRaw <= 0n || input.quote.minimumAmountOutRaw <= 0n
     || input.quote.minimumAmountOutRaw > input.quote.amountOutRaw || (chain === "xlayer"
       ? input.quote.version.blockNumber === undefined || !input.quote.version.blockHash
@@ -518,11 +512,9 @@ function expectedDecimals(mint: string, pool: RegisteredPool): number {
 }
 
 function isScopedToken2022Pool(pool: RegisteredPool, programId: string): boolean {
-  return pool.id === token2022ObservationPool.id && pool.instrument_id === "XNVDA" && pool.chain === "solana"
-    && pool.mode === "observe_only" && pool.verified
-    && pool.address === token2022ObservationPool.address && programId === token2022ObservationPool.programId
-    && pool.token_in_out.asset_address === token2022ObservationPool.assetMint
-    && pool.token_in_out.quote_address === token2022ObservationPool.quoteMint;
+  return token2022ObservationPools.some((entry) => pool.id === entry.id && pool.instrument_id === entry.instrumentId
+    && pool.chain === "solana" && pool.mode === "observe_only" && pool.verified && pool.address === entry.address
+    && programId === entry.programId && pool.token_in_out.asset_address === entry.assetMint && pool.token_in_out.quote_address === entry.quoteMint);
 }
 
 function extensionName(extension: ExtensionType): string { return ExtensionType[extension] ?? `Unknown(${extension})`; }

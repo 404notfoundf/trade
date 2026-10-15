@@ -4,6 +4,7 @@ import { PublicKey } from "@solana/web3.js";
 import { Interface } from "ethers";
 import WebSocket from "ws";
 import type { FixedPoolConfig } from "./config.js";
+import { solanaRpcFetch } from "./solana-rpc-logging.js";
 
 const Q96 = new Decimal(2).pow(96);
 const Q64 = new Decimal(2).pow(64);
@@ -496,7 +497,7 @@ async function evmRpc<T = unknown>(url: string, method: string, params: unknown[
 }
 
 async function solanaRpc<T>(url: string, method: string, params: unknown[]): Promise<T> {
-  const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(10_000) });
+  const response = await solanaRpcFetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(10_000) });
   if (!response.ok) throw new Error("Solana RPC HTTP " + response.status);
   const payload = await response.json() as { result?: T; error?: { message?: string } };
   if (payload.error || payload.result === undefined) throw new Error(payload.error?.message ?? "Solana RPC " + method + " failed");

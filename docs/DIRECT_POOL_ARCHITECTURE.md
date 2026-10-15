@@ -33,14 +33,14 @@ Solana 指定 Raydium CLMM 池状态 ─────────┘
 | X Layer quote | 经已验证 QuoterV2 用 `eth_call` 执行 `quoteExactInputSingle`。 |
 | Solana quote | 使用锁定版本的 Raydium SDK，在一致的 Pool State/Tick Array 快照上本地计算 exact-in。 |
 | CEX/DEX 关联 | `instrument_id` 为跨场所业务主键；地址、交易对和显示 symbol 都只是 listing 属性。 |
-| 稳定币 | 交易候选必须为资产与该链固定报价币的直接池：X Layer 为 USDT0，Solana 为 USDT。USDG/USDC 等池只可观察。 |
-| 包装资产 | 包装 token 池必须 `observe_only`，理由为 `wrapper_required`；观察收益通过 ERC-4626 `previewDeposit` / `previewRedeem` 换算数量，仍不可执行。 |
+| 稳定币 | 交易候选必须为资产与该链固定报价币的直接池：X Layer 为 USDT0，Solana 为 USDT。USDG/USDC 等池只可观察，观察估值按配置口径标记 1:1 假设。 |
+| 包装资产 | 包装 token 池必须 `observe_only`，理由为 `wrapper_required`；CEX 买入后以 `previewDeposit` 估算可得 wrapper 份额、以 `previewMint` 折算目标份额所需底层资产，DEX 买入后以 `previewRedeem` 折算底层资产。X Layer EVM XNVDA 数量已含 Backed multiplier，不重复相乘；结果仍不可执行。 |
 | 新鲜度 | 池价格不变不等于失效。连接、回补、RPC 快照和状态版本决定池健康；CEX 继续使用独立订单簿新鲜度规则。 |
 | 触发 | CEX 簿或池状态变化时标记 dirty；每条路线经 200--250ms 合并窗口后报价。每轮只轮换一个配置规模。 |
 | 失败 | 单池失败局部熔断与退避，继续尝试下一优先池。身份失配必须人工修正注册表并显式 re-arm；不得自动恢复。 |
 | 库存 | 只使用预置在 OKX 与每条链钱包中的库存；不自动充值、提币、跨链或补货。 |
 | Aggregator | 最终不属于决策或交易路径；迁移期可以以 `aggregator_shadow: true` 被动记录对照数据。故障时绝不自动回退。 |
-| 第一批执行资格 | 全部 direct-pool 决策固定为 `NOT_EXECUTABLE`；只构造和模拟交易，不签名、不广播。 |
+| 第一批执行资格 | 全部 direct-pool 决策固定为 `NOT_EXECUTABLE`；Solana observe-only 模拟可用独立钱包签名后调用 `simulateTransaction`，不广播。 |
 | 数据 | 旧 Aggregator 表保留，新系统使用新的 raw quote 表和决策表，二者不混合。 |
 | 切换 | 新代码通过约定测试后，由显式配置切换至 `direct_pool`；不以累计运行天数为条件。 |
 
@@ -61,7 +61,7 @@ Solana 指定 Raydium CLMM 池状态 ─────────┘
 - 不自动处理 wrap/unwrap、充值、提币、跨链桥、库存补货或再平衡。
 - 不支持多跳、拆单、动态最优路由、自动发现池或自动加入新池。
 - 不把边际价（`slot0`/Pool State 当前价格）当作固定金额成交价。
-- Token-2022 不作为交易候选；仅登记的 XNVDA/USDC Raydium observe-only 池可按明确扩展白名单计算只读报价。其他 Token-2022 mint、未知扩展、转账费、启用中的 transfer hook 和暂停 mint 均拒绝。
+- Token-2022 不作为交易候选；仅登记的 XNVDA/USDC 与 SPCXx/USDC Raydium observe-only 池可按明确扩展白名单报价和模拟。其他 Token-2022 mint、未知扩展、转账费、启用中的 transfer hook 和暂停 mint 均拒绝。
 
 ## 4. 配置模型
 
@@ -191,7 +191,7 @@ pools:
 
 不配置真实、已验证的直接池时，该资产不生成 direct-pool 路线；进程正常运行，并报告 `not_configured`。
 
-在 `quote_provider: direct_pool` 下，已登记且 `verified: true` 的 `observe_only` 池会进入只读监控，并按观测规模记录 Exact-In 与同规模 CEX VWAP 观察决策。USDG/USDC 当前明确按 1:1 假设折成 USDT；固定 Gas 预算按配置扣除，收益状态标记 `ASSUMED_1_TO_1`。X Layer Wrapper 通过 `asset()` 校验底层 XNVDA，并用 `previewDeposit` / `previewRedeem` 实时换算数量；失败只阻断 X Layer 收益估算，原始池报价与 Solana 路线独立运行。观察估值不能构造或模拟真实 swap，执行资格固定 `NOT_EXECUTABLE`。池 token decimals 必须在注册表中填写并由链上身份核对确认。
+在 `quote_provider: direct_pool` 下，已登记且 `verified: true` 的 `observe_only` 池会进入只读监控，并按观测规模记录 Exact-In 与同规模 CEX VWAP 观察决策。USDG/USDC 当前明确按 1:1 假设折成 USDT；固定 Gas 预算按配置扣除，收益状态标记 `ASSUMED_1_TO_1`。X Layer Wrapper 通过 `asset()` 校验底层 XNVDA：CEX 买入、存入路径用 `previewMint` 将目标 wrapper 份额折成所需底层资产，DEX 买入、赎回路径用 `previewRedeem` 将 wrapper 份额折成底层资产；EVM XNVDA 余额已反映 Backed multiplier，不再手动重复换算。用于收益换算的预览与 DEX Exact-In 报价使用同一 X Layer 区块；换算失败只阻断 X Layer 收益估算，原始池报价与 Solana 路线独立运行。`direct_pool_observation.simulation_enabled` 打开时，合格的 Solana observe-only 报价会由 `SOLANA_SIMULATION_PRIVATE_KEY` 对应的钱包签名并调用模拟 RPC；缺少钱包库存或手续费余额时记录跳过。模拟不广播，也不会改变 `NOT_EXECUTABLE` 执行资格。池 token decimals 必须在注册表中填写并由链上身份核对确认。
 
 ## 5. 运行时架构
 
@@ -263,9 +263,9 @@ interface PoolAdapter {
 - 启动验证 Pool State、mints、decimals、Raydium CLMM Program ID 与账户布局。
 - WebSocket 订阅 Pool State；用锁定版本的 Raydium SDK 读取必要 Tick Array 并执行 exact-in 本地计算。SDK 会分多次 RPC 读取，期间 slot 前进属于正常情况。
 - quote 记录读取完成时的 slot、所读 Tick Array 和状态指纹；构建/模拟时重新读取并校验指纹。该 slot 是读取完成标记，不代表 SDK 各次账户读取的原子 context；单一 context 校验见 [TODO](TODO.md)。
-- 所有 Solana 交易候选仍仅允许传统 SPL Token。只读例外仅限已登记的 XNVDA/USDC observe-only 池：允许已核验的 metadata、permanent delegate、默认账户状态、Scaled UI Amount、未暂停的 Pausable、无活动程序的 Transfer Hook 与当前 Confidential Transfer 配置；转账费、启用中的 hook、暂停状态、未知扩展及其他 Token-2022 mint 均拒绝。
+- 所有 Solana 交易候选仍仅允许传统 SPL Token。只读例外仅限已登记的 XNVDA/USDC 与 SPCXx/USDC observe-only 池：允许已核验的 metadata、permanent delegate、默认账户状态、Scaled UI Amount、未暂停的 Pausable、无活动程序的 Transfer Hook 与当前 Confidential Transfer 配置；转账费、启用中的 hook、暂停状态、未知扩展及其他 Token-2022 mint 均拒绝。
 - 对该池用同批 RPC context 读取 Clock 与 mint，按链上时间选取当前有效 Scaled UI multiplier；池计算、报价存储和最低输出继续使用链上 raw 数量，CEX 股数/收益和 Dashboard 展示换算为 UI 数量。
-- `observe_only` 是硬边界：Token-2022 池不得构造或模拟执行交易，也不能因只读报价成功而提升为 `trade_candidate`。
+- `observe_only` 是硬边界：Token-2022 池只能在模拟开关开启时构造 simulation-only 指令并模拟，不能广播，也不能因只读报价或模拟成功而提升为 `trade_candidate`。
 - 网络费来自构造交易后的 fee 与 priority fee 估算；未知费用不能进入可执行资格。
 
 ## 6. 状态、新鲜度与报价调度

@@ -10,6 +10,7 @@ import type { SimulatedTransactionAccountInfo } from "@solana/web3.js";
 import type { AssetConfig, Config } from "../config.js";
 import type { QuoteObservation } from "../observations.js";
 import { execute, query, withNamedLock } from "../db.js";
+import { solanaRpcFetch } from "../solana-rpc-logging.js";
 import { bookStale, floorToStep, vwap, type Instrument } from "../market.js";
 import {
   dexApproveTransaction, dexSolanaSwapInstructions, dexSwap, okxPrivateGet, okxPrivatePost,
@@ -752,7 +753,7 @@ async function readChainBalances(asset: AssetConfig, owner: string, signers: Con
     ]);
     return { asset: token, quote, native };
   }
-  const connection = new Connection(signers.solanaRpcUrl, "confirmed");
+  const connection = new Connection(signers.solanaRpcUrl, { commitment: "confirmed", fetch: solanaRpcFetch });
   const ownerKey = new PublicKey(owner);
   const tokenKey = new PublicKey(asset.tokenAddress);
   const quoteKey = new PublicKey(asset.quoteTokenAddress);
@@ -808,7 +809,7 @@ async function readSwapDeltas(asset: AssetConfig, txHash: string, owner: string,
     }
     return { assetDelta, quoteDelta };
   }
-  const connection = new Connection(solanaRpcUrl, "confirmed");
+  const connection = new Connection(solanaRpcUrl, { commitment: "confirmed", fetch: solanaRpcFetch });
   const transaction = await connection.getTransaction(txHash, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
   const meta = transaction?.meta;
   if (!meta || meta.err) throw new Error("Confirmed Solana swap metadata is unavailable");
@@ -908,7 +909,7 @@ async function sendSolanaSwap(
   cycleId: number, asset: AssetConfig, owner: Keypair, bundle: SwapBundle, rpcUrl: string,
   expected: { fromToken: string; toToken: string; amount: bigint; maxSlippagePercent: number },
 ): Promise<string> {
-  const connection = new Connection(rpcUrl, "confirmed");
+  const connection = new Connection(rpcUrl, { commitment: "confirmed", fetch: solanaRpcFetch });
   const ownerAddress = owner.publicKey.toBase58();
   const quote = validateSolanaSwapQuote(bundle, ownerAddress, expected);
   const rentLimit = BigInt(await connection.getMinimumBalanceForRentExemption(165, "confirmed")) * 2n;

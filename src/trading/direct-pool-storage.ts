@@ -14,6 +14,9 @@ export type DirectPoolDecisionRecord = {
   cexBid: string | null; cexAsk: string | null; cexVwap: string | null; cexFeeUsdt: string | null;
   dexNetworkFeeUsdt: string | null; gasBudgetUsdt: string | null; valuationInputs: unknown; grossProfitUsdt: string | null; netProfitUsdt: string | null;
   roi: string | null; valuationStatus: string; decisionStatus: string; blockReason: string | null;
+  simulationStatus?: string; simulationReason?: string | null; simulationAt?: Date | null;
+  simulationInputDebitedRaw?: string | null; simulationOutputCreditedRaw?: string | null;
+  simulationNetworkFeeNativeRaw?: string | null; simulationComputeUnits?: number | null;
 };
 
 export type AggregatorShadowRecord = {
@@ -41,12 +44,16 @@ export async function saveDirectPoolQuote(row: DirectPoolQuoteRecord): Promise<n
 export async function saveDirectPoolDecision(row: DirectPoolDecisionRecord): Promise<void> {
   await execute(`INSERT INTO direct_pool_decision
     (scan_id,instrument_id,chain_index,pool_id,direction,size_usdt,selected_quote_id,cex_book_at,cex_received_at,cex_seq_id,cex_bid,cex_ask,
-     cex_vwap,cex_fee_usdt,dex_network_fee_usdt,gas_budget_usdt,valuation_inputs,gross_profit_usdt,net_profit_usdt,roi,valuation_status,decision_status,block_reason,execution_status)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'NOT_EXECUTABLE')`, [
+     cex_vwap,cex_fee_usdt,dex_network_fee_usdt,gas_budget_usdt,valuation_inputs,gross_profit_usdt,net_profit_usdt,roi,valuation_status,decision_status,block_reason,execution_status,
+     simulation_status,simulation_reason,simulation_at,simulation_input_debited_raw,simulation_output_credited_raw,simulation_network_fee_native_raw,simulation_compute_units)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'NOT_EXECUTABLE',?,?,?,?,?,?,?)`, [
     row.scanId, row.instrumentId, row.chainIndex, row.poolId, row.direction, row.sizeUsdt, row.selectedQuoteId,
     row.cexBookAt, row.cexReceivedAt, row.cexSeqId, row.cexBid, row.cexAsk, row.cexVwap, row.cexFeeUsdt,
     row.dexNetworkFeeUsdt, row.gasBudgetUsdt, row.valuationInputs === null ? null : JSON.stringify(row.valuationInputs), row.grossProfitUsdt,
     row.netProfitUsdt, row.roi, row.valuationStatus, row.decisionStatus, row.blockReason?.slice(0, 500) ?? null,
+    row.simulationStatus ?? "NOT_REQUESTED", row.simulationReason?.slice(0, 500) ?? null, row.simulationAt ?? null,
+    row.simulationInputDebitedRaw ?? null, row.simulationOutputCreditedRaw ?? null,
+    row.simulationNetworkFeeNativeRaw ?? null, row.simulationComputeUnits ?? null,
   ]);
 }
 

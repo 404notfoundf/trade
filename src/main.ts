@@ -46,6 +46,7 @@ const setHealth = (dependency: string, status: string, error: string | null = nu
 const messageOf = (error: unknown) => error instanceof Error ? error.message : "unknown error";
 const routeKey = (asset: AssetConfig) => `${asset.instId}:${asset.chainIndex}`;
 const assetHealthKey = (dependency: string, asset: AssetConfig) => `${dependency}_${asset.chainIndex}_${asset.instId}`;
+const SOLANA_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const sameAddress = (asset: AssetConfig, actual: string | undefined) => asset.chainIndex === "196" ? actual?.toLowerCase() === asset.tokenAddress.toLowerCase() : actual === asset.tokenAddress;
 function multiplierActivationTime(value: number | string | undefined): number | null {
   if (value === undefined) return null;
@@ -59,13 +60,14 @@ function poolMonitorConfig(pool: RegisteredPool, config: Awaited<ReturnType<type
   const instrument = config.marketRegistry.instruments.find((item) => item.instrument_id === pool.instrument_id)!;
   const listing = instrument.cex_listings.find((item) => item.venue === "okx")!;
   const chainAsset = instrument.chain_assets.find((item) => item.chain === pool.chain)!;
+  const configuredAsset = config.assets.find((item) => item.instId === listing.symbol && item.chainIndex === config.marketRegistry.chains[pool.chain].chain_id.toString());
   const dex = config.marketRegistry.dexes[pool.dex]!;
   const chainIndex = config.marketRegistry.chains[pool.chain].chain_id.toString() as "196" | "501";
   return {
     enabled: pool.enabled, id: pool.id, instId: listing.symbol, chainIndex,
     dex: pool.chain === "xlayer" ? "uniswap-v3" : "raydium-clmm", address: pool.address,
-    baseTokenSymbol: pool.mode === "trade_candidate" ? pool.instrument_id : pool.token_in_out.asset_address, baseTokenAddress: pool.token_in_out.asset_address,
-    baseTokenDecimals: pool.token_in_out.asset_decimals, quoteTokenSymbol: pool.mode === "trade_candidate" ? chainAsset.quote_asset.symbol : pool.token_in_out.quote_address,
+    baseTokenSymbol: pool.mode === "trade_candidate" ? pool.instrument_id : configuredAsset?.tokenSymbol ?? pool.token_in_out.asset_address, baseTokenAddress: pool.token_in_out.asset_address,
+    baseTokenDecimals: pool.token_in_out.asset_decimals, quoteTokenSymbol: pool.mode === "trade_candidate" ? chainAsset.quote_asset.symbol : pool.token_in_out.quote_address === SOLANA_USDC_MINT ? "USDC" : pool.token_in_out.quote_address,
     quoteTokenAddress: pool.token_in_out.quote_address, quoteTokenDecimals: pool.token_in_out.quote_decimals,
     baseTokenToCexAssetRatio: "1", expectedFee: pool.expected_fee_tier,
     expectedFactory: dex.factory ?? undefined, expectedProgramId: dex.program_id ?? undefined,
@@ -437,6 +439,7 @@ async function main(): Promise<void> {
       registry: config.marketRegistry, assets: config.assets, guardrails: config.runtime.guardrails,
       coalesceWindowMs: config.marketdata.coalesceWindowMs,
       observationGas: config.directPoolObservation,
+      solanaSimulationPrivateKey: config.signers.solanaSimulationPrivateKey,
       getState: (asset, pool) => {
         const market = markets.get(asset.instId) ?? {};
         const route = routes.get(routeKey(asset));

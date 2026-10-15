@@ -9,6 +9,8 @@ marketdata:
   direct_decision_retention_days: 180
 # Fixed USDT gas budgets for read-only direct-pool profit observations.
 direct_pool_observation:
+  # Solana observe-only simulation; default off, signer from SOLANA_SIMULATION_PRIVATE_KEY, never broadcasts.
+  simulation_enabled: false
   xlayer_wrap_then_swap_gas_usdt: 0.05
   xlayer_swap_then_unwrap_gas_usdt: 0.05
   solana_swap_gas_usdt: 0.01

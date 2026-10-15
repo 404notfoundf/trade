@@ -52,12 +52,12 @@ type AssetDefinition = Omit<AssetConfig, "enabled" | "network" | "chainIndex" | 
 export type Config = {
   port: number;
   marketdata: { quoteProvider: "aggregator" | "direct_pool"; aggregatorShadow: boolean; coalesceWindowMs: number; directQuoteRetentionDays: number; directDecisionRetentionDays: number };
-  directPoolObservation: { xlayerWrapThenSwapGasUsdt: number; xlayerSwapThenUnwrapGasUsdt: number; solanaSwapGasUsdt: number };
+  directPoolObservation: { simulationEnabled: boolean; xlayerWrapThenSwapGasUsdt: number; xlayerSwapThenUnwrapGasUsdt: number; solanaSwapGasUsdt: number };
   runtime: { healthProbeIntervalSeconds: number; guardrails: { maxUsdtUsdDeviationPercent: number; maxUsdt0UsdtDeviationPercent: number; indexPriceRefreshSeconds: number; indexPriceMaxAgeSeconds: number; maxDexPriceImpactPercent: number; maxMultiplierChangePercent: number } };
   mysql: { host: string; port: number; user: string; password: string; database: string };
   okx: { key: string; secret: string; passphrase: string };
   dex: { key: string; secret: string; passphrase: string };
-  signers: { xlayerPrivateKey: string; solanaPrivateKey: string; solanaRpcUrl: string };
+  signers: { xlayerPrivateKey: string; solanaPrivateKey: string; solanaSimulationPrivateKey: string; solanaRpcUrl: string };
   assets: AssetConfig[];
   fixedPools: FixedPoolConfig[];
   marketRegistry: MarketRegistry;
@@ -76,6 +76,7 @@ export async function loadConfig(): Promise<Config> {
       direct_decision_retention_days?: number;
     };
     direct_pool_observation?: {
+      simulation_enabled?: boolean;
       xlayer_wrap_then_swap_gas_usdt?: number;
       xlayer_swap_then_unwrap_gas_usdt?: number;
       solana_swap_gas_usdt?: number;
@@ -108,12 +109,15 @@ export async function loadConfig(): Promise<Config> {
     throw new Error("marketdata.aggregator_shadow requires quote_provider: direct_pool");
   }
   const observation = {
+    simulationEnabled: settings.direct_pool_observation?.simulation_enabled ?? false,
     xlayerWrapThenSwapGasUsdt: settings.direct_pool_observation?.xlayer_wrap_then_swap_gas_usdt ?? 0.05,
     xlayerSwapThenUnwrapGasUsdt: settings.direct_pool_observation?.xlayer_swap_then_unwrap_gas_usdt ?? 0.05,
     solanaSwapGasUsdt: settings.direct_pool_observation?.solana_swap_gas_usdt ?? 0.01,
   };
-  if (Object.values(observation).some((value) => !Number.isFinite(value) || value < 0 || value > 1_000)) {
-    throw new Error("direct_pool_observation gas budgets must be between 0 and 1000 USDT");
+  if (typeof observation.simulationEnabled !== "boolean"
+    || [observation.xlayerWrapThenSwapGasUsdt, observation.xlayerSwapThenUnwrapGasUsdt, observation.solanaSwapGasUsdt]
+      .some((value) => !Number.isFinite(value) || value < 0 || value > 1_000)) {
+    throw new Error("direct_pool_observation requires a boolean simulation_enabled and gas budgets between 0 and 1000 USDT");
   }
   const healthProbeIntervalSeconds = settings.runtime?.healthProbeIntervalSeconds ?? 300;
   const guardrails = {
@@ -207,6 +211,7 @@ export async function loadConfig(): Promise<Config> {
     signers: {
       xlayerPrivateKey: process.env.XLAYER_PRIVATE_KEY || "",
       solanaPrivateKey: process.env.SOLANA_PRIVATE_KEY || "",
+      solanaSimulationPrivateKey: process.env.SOLANA_SIMULATION_PRIVATE_KEY || "",
       solanaRpcUrl: process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
     },
     assets,

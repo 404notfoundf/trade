@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import bs58 from "bs58";
 import Decimal from "decimal.js";
+import { Keypair } from "@solana/web3.js";
 import type { AssetConfig, Config } from "../config.js";
 import { bookStale, floorToStep, vwap, type Instrument } from "../market.js";
 import type { Book } from "../okx.js";
@@ -7,22 +9,29 @@ import type { PoolMonitorState } from "../fixed-pools.js";
 import { saveDirectPoolDecision, saveDirectPoolQuote } from "./direct-pool-storage.js";
 import { createPoolAdapter, createXLayerWrapperAdapter, PoolIdentityMismatchError, UnsupportedTokenError, type ExactInQuote, type PoolAdapter, type XLayerWrapperAdapter } from "./pool-adapters.js";
 import type { AggregatorShadowRequest } from "./aggregator-shadow.js";
+import { netMarginOk } from "./gates.js";
 import { solveDirectPoolCandidates, type MarketRegistry, type RegisteredPool } from "./market-registry.js";
 
 type MarketSnapshot = { instrument?: Instrument; feeRate?: Decimal; multiplier?: Decimal; book?: Book; pool?: PoolMonitorState; dbOnline: boolean; quoteValuationStatus: "VERIFIED" | "UNKNOWN" };
-type Route = { asset: AssetConfig; pools: RegisteredPool[]; sizeIndex: number; dueAt: number; running: boolean };
+type Route = { asset: AssetConfig; pools: RegisteredPool[]; sizeIndex: number; dueAt: number; lastScanAt: number; running: boolean };
 type AdapterState = { adapter: PoolAdapter; verified: boolean; identityMismatch: boolean; retryAt: number; retryDelayMs: number };
 type WrapperState = { adapter: XLayerWrapperAdapter; verified: boolean; identityMismatch: boolean; retryAt: number; retryDelayMs: number };
 type ScanOptions = {
   registry: MarketRegistry; assets: AssetConfig[]; guardrails: Config["runtime"]["guardrails"]; coalesceWindowMs: number;
   observationGas: Config["directPoolObservation"];
+  solanaSimulationPrivateKey: string;
   slippageBps?: number; getState: (asset: AssetConfig, pool: RegisteredPool) => MarketSnapshot;
   onHealth: (poolId: string, status: string, reason?: string | null) => void;
   onDatabaseError: (error: unknown) => void;
   onAggregatorShadow?: (request: AggregatorShadowRequest) => void;
 };
 type Direction = "cex_buy_dex_sell" | "dex_buy_cex_sell";
-type ObserveRoute = { asset: AssetConfig; pool: RegisteredPool; sizeIndex: number; dueAt: number; running: boolean };
+type ObserveRoute = { asset: AssetConfig; pool: RegisteredPool; sizeIndex: number; dueAt: number; lastScanAt: number; running: boolean };
+type SimulationStatus = "NOT_APPLICABLE" | "DISABLED" | "NOT_QUALIFIED" | "COOLDOWN" | "SKIPPED" | "PASSED" | "FAILED";
+type SimulationOutcome = {
+  status: SimulationStatus; reason: string | null; at: Date | null; inputDebitedRaw?: string;
+  outputCreditedRaw?: string; networkFeeNativeRaw?: string; computeUnits?: number;
+};
 
 const messageOf = (error: unknown) => error instanceof Error ? error.message.replace(/https?:\/\/[^\s"'<>]+/g, "[rpc endpoint]").slice(0, 500) : "unknown quote error";
 const directDirection = (direction: Direction) => direction === "cex_buy_dex_sell" ? "asset_to_quote" as const : "quote_to_asset" as const;
@@ -33,6 +42,7 @@ export class DirectPoolCollector {
   private readonly observeRoutes = new Map<string, ObserveRoute>();
   private readonly adapters = new Map<string, AdapterState>();
   private readonly wrappers = new Map<string, WrapperState>();
+  private readonly lastSimulationAt = new Map<string, number>();
 
   constructor(private readonly options: ScanOptions) {
     for (const pool of solveDirectPoolCandidates(options.registry, options.assets)) {
@@ -42,7 +52,7 @@ export class DirectPoolCollector {
       if (!asset) continue;
       const key = routeKey(asset);
       let route = this.routes.get(key);
-      if (!route) { route = { asset, pools: [], sizeIndex: 0, dueAt: Date.now() + options.coalesceWindowMs, running: false }; this.routes.set(key, route); }
+      if (!route) { route = { asset, pools: [], sizeIndex: 0, dueAt: Date.now() + options.coalesceWindowMs, lastScanAt: Number.NEGATIVE_INFINITY, running: false }; this.routes.set(key, route); }
       route.pools.push(pool);
       this.adapters.set(pool.id, { adapter: createPoolAdapter(pool, options.registry), verified: false, identityMismatch: false, retryAt: 0, retryDelayMs: 1_000 });
     }
@@ -60,7 +70,7 @@ export class DirectPoolCollector {
         try { this.wrappers.set(pool.id, { adapter: createXLayerWrapperAdapter(pool, options.registry), verified: false, identityMismatch: false, retryAt: 0, retryDelayMs: 1_000 }); }
         catch (error) { options.onHealth(`${pool.id}_wrapper`, "unavailable", messageOf(error)); }
       }
-      this.observeRoutes.set(pool.id, { asset, pool, sizeIndex: 0, dueAt: Date.now() + options.coalesceWindowMs, running: false });
+      this.observeRoutes.set(pool.id, { asset, pool, sizeIndex: 0, dueAt: Date.now() + options.coalesceWindowMs, lastScanAt: Number.NEGATIVE_INFINITY, running: false });
     }
   }
 
@@ -69,12 +79,12 @@ export class DirectPoolCollector {
     for (const route of this.routes.values()) {
       if (instId && route.asset.instId !== instId) continue;
       if (chainIndex && route.asset.chainIndex !== chainIndex) continue;
-      route.dueAt = now + this.options.coalesceWindowMs;
+      route.dueAt = Math.min(route.dueAt, Math.max(now + this.options.coalesceWindowMs, route.lastScanAt + route.asset.dexQuoteIntervalMs));
     }
     for (const route of this.observeRoutes.values()) {
       if (instId && route.asset.instId !== instId) continue;
       if (chainIndex && route.asset.chainIndex !== chainIndex) continue;
-      route.dueAt = now + this.options.coalesceWindowMs;
+      route.dueAt = Math.min(route.dueAt, Math.max(now + this.options.coalesceWindowMs, route.lastScanAt + route.asset.dexQuoteIntervalMs));
     }
   }
 
@@ -83,6 +93,7 @@ export class DirectPoolCollector {
       ...[...this.routes.values()].map(async (route) => {
       if (route.running || route.dueAt > now) return;
       route.running = true;
+      route.lastScanAt = now;
       route.dueAt = Number.POSITIVE_INFINITY;
       try { await this.scan(route); }
       finally { route.running = false; }
@@ -90,6 +101,7 @@ export class DirectPoolCollector {
       ...[...this.observeRoutes.values()].map(async (route) => {
         if (route.running || route.dueAt > now) return;
         route.running = true;
+        route.lastScanAt = now;
         route.dueAt = Number.POSITIVE_INFINITY;
         try { await this.scanObserveOnly(route); }
         finally { route.running = false; }
@@ -128,16 +140,15 @@ export class DirectPoolCollector {
       let intendedAssetAmountRaw: bigint | null = null;
       const book = state.book;
       const instrument = state.instrument;
-      const multiplier = state.multiplier;
-      // Solana Token-2022's scaled UI amount already carries Backed's multiplier.
+      // Solana supplies its scaled UI multiplier with the quote; EVM balances are already adjusted.
       const cexAssetMultiplier = pool.chain === "solana"
         ? assetUiMultiplier
-        : multiplier?.isFinite() && multiplier.gt(0) ? assetUiMultiplier.mul(multiplier) : null;
+        : new Decimal(1);
       const targetShares = book?.ready && !bookStale(book) && instrument
         && book.asks[0] && book.bids[0]
         ? floorToStep(quoteAmount.div(new Decimal(book.asks[0]!.price).plus(book.bids[0]!.price).div(2)), instrument.lotSz)
         : null;
-      if (targetShares?.gt(0) && cexAssetMultiplier?.gt(0)) {
+      if (targetShares?.gt(0) && cexAssetMultiplier.gt(0)) {
         const underlyingRaw = rawAmount(targetShares.div(cexAssetMultiplier), asset.tokenDecimals);
         if (pool.reason === "wrapper_required") {
           try { intendedAssetAmountRaw = await this.previewWrapper(pool, "previewDeposit", underlyingRaw); }
@@ -146,7 +157,7 @@ export class DirectPoolCollector {
       }
       if (intendedAssetAmountRaw !== null) {
         amountByDirection.push({ direction: "asset_to_quote", amountInRaw: intendedAssetAmountRaw, expectedAssetUiMultiplier: assetUiMultiplier.toString() });
-      } else if (marginalPrice?.isFinite() && marginalPrice.gt(0) && cexAssetMultiplier?.gt(0)) {
+      } else if (marginalPrice?.isFinite() && marginalPrice.gt(0) && cexAssetMultiplier.gt(0)) {
         amountByDirection.push({ direction: "asset_to_quote", amountInRaw: rawAmount(quoteAmount.div(marginalPrice).div(cexAssetMultiplier), pool.token_in_out.asset_decimals), expectedAssetUiMultiplier: assetUiMultiplier.toString() });
       }
       for (const input of amountByDirection) {
@@ -183,7 +194,7 @@ export class DirectPoolCollector {
           })) return;
           if (identityMismatch || unsupportedToken) break;
         }
-        if (observed) await this.recordObserveDecision(route, scanId, size, direction, observed.quoteId, observed.quote, state);
+        if (observed) await this.recordObserveDecision(route, scanId, size, direction, observed.quoteId, observed.quote, state, targetShares);
       }
     } catch (error) {
       const identityMismatch = error instanceof PoolIdentityMismatchError;
@@ -206,7 +217,9 @@ export class DirectPoolCollector {
     }
   }
 
-  private async previewWrapper(pool: RegisteredPool, method: "previewDeposit" | "previewRedeem", amountRaw: bigint): Promise<bigint> {
+  private async previewWrapper(
+    pool: RegisteredPool, method: "previewDeposit" | "previewMint" | "previewRedeem", amountRaw: bigint, blockNumber?: bigint,
+  ): Promise<bigint> {
     const wrapper = this.wrappers.get(pool.id);
     if (!wrapper) throw new Error("X Layer wrapper adapter is unavailable");
     if (wrapper.identityMismatch) throw new PoolIdentityMismatchError("X Layer wrapper identity failed; restart after registry review");
@@ -216,7 +229,7 @@ export class DirectPoolCollector {
         await wrapper.adapter.verify();
         wrapper.verified = true;
       }
-      const result = await wrapper.adapter[method](amountRaw);
+      const result = await wrapper.adapter[method](amountRaw, blockNumber);
       wrapper.retryDelayMs = 1_000;
       this.options.onHealth(`${pool.id}_wrapper`, "healthy");
       return result;
@@ -231,7 +244,7 @@ export class DirectPoolCollector {
     }
   }
 
-  private async recordObserveDecision(route: ObserveRoute, scanId: string, size: number, direction: Direction, quoteId: number, quote: ExactInQuote, initial: MarketSnapshot): Promise<void> {
+  private async recordObserveDecision(route: ObserveRoute, scanId: string, size: number, direction: Direction, quoteId: number, quote: ExactInQuote, initial: MarketSnapshot, intendedCexShares: Decimal | null): Promise<void> {
     const { asset, pool } = route;
     let cexShares: Decimal | null = null;
     let cexFill: ReturnType<typeof vwap> = null;
@@ -246,9 +259,10 @@ export class DirectPoolCollector {
     let reason: string | null = null;
     const poolAssetRaw = underlyingRaw;
     if (pool.reason === "wrapper_required") {
+      const wrapperMethod = direction === "cex_buy_dex_sell" ? "previewMint" : "previewRedeem";
       try {
-        underlyingRaw = await this.previewWrapper(pool, "previewRedeem", poolAssetRaw);
-        conversion = { wrapperAmountRaw: poolAssetRaw.toString(), underlyingAmountRaw: underlyingRaw.toString() };
+        underlyingRaw = await this.previewWrapper(pool, wrapperMethod, poolAssetRaw, quote.version.blockNumber);
+        conversion = { method: wrapperMethod, wrapperAmountRaw: poolAssetRaw.toString(), underlyingAmountRaw: underlyingRaw.toString() };
       } catch (error) { reason = `WRAPPER_CONVERSION_UNAVAILABLE: ${messageOf(error)}`; }
     } else conversion = {
       assetAmountRaw: underlyingRaw.toString(), assetUiMultiplier: quote.assetUiMultiplier,
@@ -260,20 +274,24 @@ export class DirectPoolCollector {
     const book = current.book;
     const instrument = current.instrument;
     const feeRate = current.feeRate;
-    const multiplier = current.multiplier;
-    const needsBackedMultiplier = pool.chain !== "solana";
-    const cexShareMultiplier = needsBackedMultiplier ? multiplier : new Decimal(1);
-    if (!reason) reason = !book?.ready ? "CEX_BOOK_UNAVAILABLE"
-      : bookStale(book) ? "CEX_BOOK_STALE"
-        : !instrument ? "CEX_INSTRUMENT_UNAVAILABLE"
-          : !feeRate?.isFinite() || feeRate.lt(0) ? "CEX_FEE_UNAVAILABLE"
-            : !cexShareMultiplier?.isFinite() || !cexShareMultiplier.gt(0) ? "MULTIPLIER_UNAVAILABLE"
-              : initial.instrument && (current.instrument?.instId !== initial.instrument.instId || current.instrument.lotSz !== initial.instrument.lotSz || current.instrument.minSz !== initial.instrument.minSz) ? "CEX_INSTRUMENT_CHANGED"
-                : initial.feeRate && !current.feeRate?.eq(initial.feeRate) ? "CEX_FEE_CHANGED"
-                  : needsBackedMultiplier && initial.multiplier && !current.multiplier?.eq(initial.multiplier) ? "MULTIPLIER_CHANGED"
-                    : null;
     if (!reason) {
-      cexShares = floorToStep(new Decimal(underlyingRaw.toString()).div(new Decimal(10).pow(asset.tokenDecimals)).mul(quote.assetUiMultiplier).mul(cexShareMultiplier!), instrument!.lotSz);
+      if (!book?.ready) reason = "CEX_BOOK_UNAVAILABLE";
+      else if (bookStale(book)) reason = "CEX_BOOK_STALE";
+      else if (!instrument) reason = "CEX_INSTRUMENT_UNAVAILABLE";
+      else if (!feeRate?.isFinite() || feeRate.lt(0)) reason = "CEX_FEE_UNAVAILABLE";
+      else if (initial.instrument && (current.instrument?.instId !== initial.instrument.instId || current.instrument.lotSz !== initial.instrument.lotSz || current.instrument.minSz !== initial.instrument.minSz)) reason = "CEX_INSTRUMENT_CHANGED";
+      else if (initial.feeRate && !current.feeRate?.eq(initial.feeRate)) reason = "CEX_FEE_CHANGED";
+    }
+    if (!reason) {
+      const convertedCexShares = new Decimal(underlyingRaw.toString()).div(new Decimal(10).pow(asset.tokenDecimals)).mul(quote.assetUiMultiplier);
+      if (pool.reason === "wrapper_required" && direction === "cex_buy_dex_sell") {
+        if (!intendedCexShares) reason = "CEX_SIZE_UNAVAILABLE";
+        else if (convertedCexShares.gt(intendedCexShares)) reason = "WRAPPER_MINT_EXCEEDS_CEX_INPUT";
+        else cexShares = intendedCexShares;
+      } else cexShares = floorToStep(convertedCexShares, instrument!.lotSz);
+    }
+    if (!reason && !cexShares) reason = "CEX_SIZE_UNAVAILABLE";
+    if (!reason && cexShares) {
       if (cexShares.lt(instrument!.minSz)) reason = "CEX_MINIMUM_SIZE";
       else {
         cexFill = vwap(direction === "cex_buy_dex_sell" ? book!.asks : book!.bids, cexShares);
@@ -291,19 +309,77 @@ export class DirectPoolCollector {
       }
     }
     const highImpact = new Decimal(quote.priceImpactPercent).abs().gt(this.options.guardrails.maxDexPriceImpactPercent);
+    const simulation = await this.simulateObservedSwap(route, direction, size, quote, net, invested, reason, highImpact);
+    const cexSnapshot = cexFill && cexShares ? {
+      side: direction === "cex_buy_dex_sell" ? "asks" : "bids",
+      quantity: cexShares.toString(),
+      feeRate: feeRate!.toString(),
+      consumedLevels: consumedBookLevels(direction === "cex_buy_dex_sell" ? book!.asks : book!.bids, cexShares),
+    } : null;
     await saveDirectPoolDecision({
       scanId, instrumentId: pool.instrument_id, chainIndex: asset.chainIndex, poolId: pool.id, direction, sizeUsdt: String(size),
       selectedQuoteId: quoteId, cexBookAt: book ? new Date(book.exchangeTime) : null, cexReceivedAt: book ? new Date(book.receivedAt) : null,
       cexSeqId: book?.seqId ?? null, cexBid: book?.bids[0]?.price ?? null, cexAsk: book?.asks[0]?.price ?? null,
       cexVwap: cexFill?.vwap.toString() ?? null, cexFeeUsdt: cexFee?.toString() ?? null,
       dexNetworkFeeUsdt: null, gasBudgetUsdt: gasBudget.toString(),
-      valuationInputs: { valuation: "USDG_USDC_ASSUMED_1_TO_1_USDT", wrapper: conversion, assetUiMultiplier: quote.assetUiMultiplier, backedMultiplierApplied: cexShareMultiplier?.toString() ?? null, gasBudgetUsdt: gasBudget.toString(), gasSource: "config.direct_pool_observation", priceImpactPercent: quote.priceImpactPercent },
+      valuationInputs: { quoteMint: pool.token_in_out.quote_address, quoteToUsdt: "ASSUMED_1_TO_1", wrapper: conversion, cex: cexSnapshot, assetUiMultiplier: quote.assetUiMultiplier, backedMultiplierApplied: pool.chain === "xlayer" ? null : "1", gasBudgetUsdt: gasBudget.toString(), gasSource: "config.direct_pool_observation", priceImpactPercent: quote.priceImpactPercent },
       grossProfitUsdt: gross?.toString() ?? null, netProfitUsdt: net?.toString() ?? null,
       roi: net && invested?.gt(0) ? net.div(invested).toString() : null,
       valuationStatus: net === null ? "UNKNOWN" : "ASSUMED_1_TO_1",
       decisionStatus: reason ? "BLOCKED" : highImpact ? "HIGH_PRICE_IMPACT" : "OBSERVED",
       blockReason: reason ?? (highImpact ? "PRICE_IMPACT_OVER_LIMIT_OBSERVATION_ONLY" : null),
+      simulationStatus: simulation.status, simulationReason: simulation.reason,
+      simulationAt: simulation.at, simulationInputDebitedRaw: simulation.inputDebitedRaw ?? null,
+      simulationOutputCreditedRaw: simulation.outputCreditedRaw ?? null,
+      simulationNetworkFeeNativeRaw: simulation.networkFeeNativeRaw ?? null,
+      simulationComputeUnits: simulation.computeUnits ?? null,
     }).catch((error) => { this.options.onDatabaseError(error); });
+  }
+
+  private async simulateObservedSwap(
+    route: ObserveRoute, direction: Direction, size: number, quote: ExactInQuote, net: Decimal | null, invested: Decimal | null,
+    blockReason: string | null, highImpact: boolean,
+  ): Promise<SimulationOutcome> {
+    const { pool, asset } = route;
+    if (pool.chain !== "solana" || pool.dex !== "raydium-clmm" || pool.mode !== "observe_only") {
+      return { status: "NOT_APPLICABLE", reason: null, at: null };
+    }
+    if (!this.options.observationGas.simulationEnabled) return { status: "DISABLED", reason: null, at: null };
+    if (blockReason) return { status: "NOT_QUALIFIED", reason: blockReason, at: null };
+    if (highImpact) return { status: "NOT_QUALIFIED", reason: "PRICE_IMPACT_OVER_LIMIT", at: null };
+    if (!net || !invested || !netMarginOk(net, invested)) {
+      return { status: "NOT_QUALIFIED", reason: "NET_MARGIN_BELOW_1_PERCENT", at: null };
+    }
+    if (Date.now() - quote.quotedAt > asset.dexQuoteIntervalMs) {
+      return { status: "SKIPPED", reason: "QUOTE_STALE", at: null };
+    }
+    const cooldownKey = `${pool.id}:${direction}:${new Decimal(size).toString()}`;
+    const now = Date.now();
+    if (now - (this.lastSimulationAt.get(cooldownKey) ?? Number.NEGATIVE_INFINITY) < 30_000) {
+      return { status: "COOLDOWN", reason: "SIMULATION_COOLDOWN_30_SECONDS", at: null };
+    }
+    this.lastSimulationAt.set(cooldownKey, now);
+    let signer: Keypair;
+    try { signer = parseSolanaSimulationSigner(this.options.solanaSimulationPrivateKey); }
+    catch { return { status: "SKIPPED", reason: "SOLANA_SIGNER_UNAVAILABLE", at: null };
+    }
+    const adapter = this.adapters.get(pool.id)?.adapter;
+    if (!adapter) return { status: "SKIPPED", reason: "POOL_ADAPTER_UNAVAILABLE", at: null };
+    const at = new Date();
+    try {
+      const swap = await adapter.buildSwap(pool, { quote, wallet: signer.publicKey.toBase58(), simulationOnly: true });
+      const result = await adapter.simulateSwap(pool, swap, signer);
+      return {
+        status: result.ok ? "PASSED" : result.skipped ? "SKIPPED" : "FAILED",
+        reason: result.ok ? null : result.error ?? "SIMULATION_FAILED", at,
+        inputDebitedRaw: result.amountInDebitedRaw,
+        outputCreditedRaw: result.amountOutCreditedRaw,
+        networkFeeNativeRaw: result.networkFeeNativeRaw,
+        computeUnits: result.computeUnits,
+      };
+    } catch (error) {
+      return { status: "FAILED", reason: messageOf(error), at };
+    }
   }
 
   private async scan(route: Route): Promise<void> {
@@ -454,6 +530,26 @@ export class DirectPoolCollector {
       }).catch((error) => { this.options.onDatabaseError(error); throw error; });
     }
   }
+}
+
+function parseSolanaSimulationSigner(secret: string): Keypair {
+  const value = secret.trim();
+  if (!value) throw new Error("Solana simulation signer is not configured");
+  const bytes = value.startsWith("[") ? Uint8Array.from(JSON.parse(value) as number[]) : bs58.decode(value);
+  return bytes.length === 32 ? Keypair.fromSeed(bytes) : Keypair.fromSecretKey(bytes);
+}
+
+function consumedBookLevels(levels: Book["asks"], quantity: Decimal): Array<{ price: string; size: string }> {
+  let remaining = quantity;
+  const consumed: Array<{ price: string; size: string }> = [];
+  for (const level of levels) {
+    if (remaining.lte(0)) break;
+    const size = Decimal.min(remaining, new Decimal(level.size));
+    if (size.lte(0)) continue;
+    consumed.push({ price: level.price, size: size.toString() });
+    remaining = remaining.minus(size);
+  }
+  return consumed;
 }
 
 function routeKey(asset: AssetConfig): string { return `${asset.instId}:${asset.chainIndex}`; }

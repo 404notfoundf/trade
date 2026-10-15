@@ -6,7 +6,8 @@ import { logger } from "./logger.js";
 
 async function main(): Promise<void> {
   const config = await loadConfig();
-  const pool = mysql.createPool({ ...config.mysql, waitForConnections: true, connectionLimit: 1, multipleStatements: true });
+  // Keep JS Date values aligned with the application pool; CURRENT_TIMESTAMP remains the server's configured clock.
+  const pool = mysql.createPool({ ...config.mysql, waitForConnections: true, connectionLimit: 1, multipleStatements: true, timezone: "Z" });
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
       version VARCHAR(128) NOT NULL PRIMARY KEY,

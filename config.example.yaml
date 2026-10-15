@@ -1,5 +1,17 @@
 # Dashboard HTTP 监听端口。
 port: 3000
+# 报价源切换必须人工配置；direct_pool 不会在故障时回退到 Aggregator。
+marketdata:
+  quote_provider: aggregator # aggregator | direct_pool
+  aggregator_shadow: false # direct_pool only; compares OKX Aggregator quotes for verified trade candidates
+  coalesce_window_ms: 250
+  direct_quote_retention_days: 7
+  direct_decision_retention_days: 180
+# Fixed USDT gas budgets for read-only direct-pool profit observations.
+direct_pool_observation:
+  xlayer_wrap_then_swap_gas_usdt: 0.05
+  xlayer_swap_then_unwrap_gas_usdt: 0.05
+  solana_swap_gas_usdt: 0.01
 # 自动交易总闸。默认关闭。打开后仍要在 /trade 手动启动；进程重启后页面开关恢复关闭。
 # 私钥只从 .env 读取。每轮下单额不得超过 maxTradeSizeUsdt。
 trading:
@@ -139,3 +151,38 @@ assets:
         quoteTokenAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
         quoteTokenDecimals: 6
         quoteTokenSymbol: USDT
+
+# 独立只读固定池 allowlist；与 assets/routes 及交易开关分开。
+# USDG、USDC、USDT 的 1:1 仅用于监控展示，固定池观察不会进入收益或下单。
+fixedPools:
+  - enabled: true
+    id: xnvda-xlayer-uniswap-v3
+    instId: XNVDA-USDT
+    chainIndex: "196"
+    dex: uniswap-v3
+    address: "0x2a2b11730c2b6d99a58034a869dd810d7300a7b2"
+    # wNVDAx / USDG；比例是池 base token 到 XNVDA 的配置值。
+    baseTokenSymbol: wNVDAx
+    baseTokenAddress: "0xa8ddb5cd96b5222afe198316e9a57caa642850d5"
+    baseTokenDecimals: 18
+    quoteTokenSymbol: USDG
+    quoteTokenAddress: "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8"
+    quoteTokenDecimals: 6
+    baseTokenToCexAssetRatio: "1"
+    expectedFee: 500
+    expectedFactory: "0x4b2ab38dbf28d31d467aa8993f6c2585981d6804"
+  - enabled: true
+    id: xnvda-solana-raydium-clmm
+    instId: XNVDA-USDT
+    chainIndex: "501"
+    dex: raydium-clmm
+    address: "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+    # XNVDA / USDC
+    baseTokenSymbol: XNVDA
+    baseTokenAddress: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+    baseTokenDecimals: 8
+    quoteTokenSymbol: USDC
+    quoteTokenAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    quoteTokenDecimals: 6
+    baseTokenToCexAssetRatio: "1"
+    expectedProgramId: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"

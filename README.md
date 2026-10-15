@@ -6,6 +6,8 @@ TypeScript 本机服务：读取配置中 OKX 现货交易对的盘口、X Layer
 
 - `src/main.ts`：加载配置、启动依赖探测、WebSocket、HTTP 服务和定时任务。
 - `src/collector.ts`：计算双向观察规模、请求 DEX 报价并生成观察记录。
+- `src/fixed-pools.ts`：按 allowlist 监听 X Layer Uniswap V3 和 Solana Raydium CLMM 固定池，计算边际价并维护链状态版本。
+- `src/trading/market-registry.ts`、`direct-pool-collector.ts`、`pool-adapters.ts`：求解已审核的直接池路线、执行定额 exact-in 报价，并将独立决策写入 direct-pool 表。
 - `src/valuation.ts`：OKX Index Price 缓存、USDT/USDT0 偏离判断和折算决策。
 - `src/market.ts`、`src/okx.ts`：订单簿计算与 OKX/DEX API、WebSocket 适配。
 - `src/observations.ts`、`src/risk.ts`、`src/db.ts`：原始观察/机会事务写入、拦截记录、MySQL 初始化与查询。
@@ -23,10 +25,18 @@ TypeScript 本机服务：读取配置中 OKX 现货交易对的盘口、X Layer
 
 1. 安装 Node.js 20+、MySQL 8+，创建本地数据库和仅供本程序使用的 MySQL 用户。
 2. 复制 `config.example.yaml` 为本机 `config.yaml`，填写 MySQL 连接信息；复制 `.env.example` 为 `.env` 并填写 API 凭证。CEX API Key 需要 Read + Trade 权限，关闭 Withdraw 并绑定 IP；分别把专用低余额钱包私钥放入 `XLAYER_PRIVATE_KEY` 或 `SOLANA_PRIVATE_KEY`。Solana 私钥支持 base58 或 JSON 字节数组。私钥不会写入 YAML、数据库、页面或日志。
-3. 在 `config.yaml` 的 `assets` 中配置资产共用参数，在 `routes` 下分别配置链上地址和精度。资产总开关和单链路线开关都打开后，该路线才会启用；全部关闭时仍可启动只读页面，若打开自动交易则至少需要一条启用路线。程序启动和每 5 分钟读取 OKX 账户网络状态并核对固定地址；地址不符时该路线进入 `BLOCKED`，状态接口不可用或网络不可充提时保留报价并标记 `MONITOR_ONLY`。报价币必须是配置校验接受的官方地址：X Layer USDT0 或 Solana 原生 USDT。不要改成其他稳定币。
-4. 运行 `npm ci` 后执行 `npm run db:migrate`，按编号应用 `migrations/*.sql` 中尚未执行的迁移；数据库用户需要该数据库的建表权限。`005_trade_execution.sql` 增加交易周期和链上交易记录，`006_dashboard_state.sql` 保存看板最近状态。
+3. 在 `config.yaml` 的 `assets` 中配置资产共用参数，在 `routes` 下分别配置交易路线。固定池监控在独立的 `fixedPools` allowlist 中配置；直接池路线在 `market-registry.yaml` 中登记，并由 `marketdata.quote_provider` 显式切换，故障时不会回退到 Aggregator。`.env.example` 提供公开 X Layer/Solana RPC；Uniswap/Raydium 的协议部署地址固定登记在 `market-registry.yaml`。长时间观察建议换成自己的专用 RPC。候选池的地址、token、精度、fee/factory 或 program ID 会在启动时与链上数据核对。
+4. 运行 `npm ci` 后执行 `npm run db:migrate`，按编号应用 `migrations/*.sql` 中尚未执行的迁移；数据库用户需要该数据库的建表权限。`005_trade_execution.sql` 增加交易周期和链上交易记录，`006_dashboard_state.sql` 保存看板最近状态，`008_fixed_pool_monitor.sql` 保存固定池状态采样，`009_fixed_pool_history_gap.sql` 记录监控历史缺口，`010_direct_pool_observation.sql` 保存 direct-pool 报价和决策，`011_aggregator_shadow_quote.sql` 保存独立 shadow 报价，`013_direct_pool_gas_budget.sql` 增加观察 Gas 预算字段。
 5. 一体启动仍可运行 `npm run dev`，生产构建后运行 `npm start`。需要采集和前端分开时，在两个终端分别运行 `npm run dev:collector` 与 `npm run dev:dashboard`；生产环境先 `npm run build`，再分别运行 `npm run start:collector` 与 `npm run start:dashboard`。
 6. 打开 `http://127.0.0.1:3000`。独立看板从 MySQL 读取历史数据和最近一次状态；采集器停止后，页面仍可访问，但新观察不会产生，路线状态会显示为未知。独立看板只读，交易开关仍由一体启动方式提供。
+
+### 用新方法开始只读观察
+
+1. 将 `.env.example` 中的 direct-pool RPC 配置（`XLAYER_RPC_HTTP/WS`、`SOLANA_RPC_URL/WS`）补齐或更新到现有 `.env`，保留已有 API 密钥并避免重复定义变量；也可替换为自己的 RPC。协议部署地址已固定登记在 `market-registry.yaml`。只读观察不需要填写私钥。当前公开端点适合开始观察，持续运行时可能限流；对应项缺失时该链会显示 `not_configured`。
+2. 在 `config.yaml` 设置 `marketdata.quote_provider: direct_pool`。不要打开交易；direct-pool 模式会强制关闭旧 Executor。
+3. 运行 `npm run db:migrate` 应用尚未执行的迁移，再运行 `npm run dev`。
+4. `market-registry.yaml` 当前的池仍是 `observe_only`：X Layer 使用 wNVDAx/USDG，Solana 使用 XNVDA/USDC。每个池可单独设 `enabled: false` 暂停报价和监控；省略时默认为 `true`，修改后重启采集器生效。采集器把 Exact-In 与同规模 OKX VWAP 对比，记录毛收益、CEX 手续费、固定 Gas 预算、观察净收益和 ROI；USDG/USDC 明确按 1:1 假设估值。X Layer Wrapper 只读读取 `asset()`、`previewDeposit`、`previewRedeem` 换算 token 数量，异常时只阻断 X Layer 收益估算。Solana 使用池中的 XNVDA 直接对比。所有结果继续固定为 `NOT_EXECUTABLE`。
+5. 打开 `/direct-pools` 查看报价和收益拆分。当前 Gas 预算在 `config.yaml` 的 `direct_pool_observation`：X Layer 每方向 0.05 USDT（Wrapper + Swap），Solana 每次 Swap 0.01 USDT。后续待办会把固定预算替换为实时 OKB/SOL Gas 折算。观察净收益使用稳定币 1:1 假设，不代表真实兑换、充值提现成本或可成交净收益。
 
 运行日志会同时输出到终端和 `logs/`：`info-YYYY-MM-DD.log`、`warn-YYYY-MM-DD.log`、`error-YYYY-MM-DD.log` 按 UTC 日期和级别切分；日志目录已加入 `.gitignore`。健康状态变化和错误会记录一次，相同状态的重复错误会去重；详细依赖状态仍可在 `/health` 查看。
 

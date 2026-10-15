@@ -1,7 +1,7 @@
 import Decimal from "decimal.js";
 import type { AssetConfig, Config } from "../config.js";
 import { bookStale, floorToStep, vwap, type Instrument } from "../market.js";
-import { dexSwap, type Book, type Credentials } from "../okx.js";
+import { dexApproveTransaction, dexSwap, type Book, type Credentials } from "../okx.js";
 import { decideValuation, XLAYER_CHAIN } from "../valuation.js";
 import { netMarginOk, selectCall, swapTxError, type SwapTx, type UnsignedCall } from "./gates.js";
 
@@ -18,6 +18,7 @@ type RouterResult = {
   dexRouterList?: unknown[];
 };
 type SwapItem = { routerResult?: RouterResult; tx?: SwapTx };
+type ApprovalItem = { dexContractAddress?: string; data?: string };
 
 export type TradeState = {
   routeStatus: "ENABLED" | "MONITOR_ONLY" | "BLOCKED";
@@ -40,6 +41,7 @@ export type PrepareResult = { ok: true; call: UnsignedCall; summary: string } | 
 
 export type PrepareServices = {
   dexSwap: typeof dexSwap;
+  dexApproveTransaction: typeof dexApproveTransaction;
   decideValuation: typeof decideValuation;
   readAllowance: typeof readAllowance;
 };
@@ -47,7 +49,7 @@ export type PrepareServices = {
 let busy = false;
 const fail = (reason: string): PrepareResult => ({ ok: false, reason });
 const same = (left: string | undefined, right: string) => left?.toLowerCase() === right.toLowerCase();
-const defaultServices: PrepareServices = { dexSwap, decideValuation, readAllowance };
+const defaultServices: PrepareServices = { dexSwap, dexApproveTransaction, decideValuation, readAllowance };
 
 export async function prepareBuy(input: PrepareInput, services: PrepareServices = defaultServices): Promise<PrepareResult> {
   if (busy) return fail("已有一笔正在生成，请等它结束再点");
@@ -109,7 +111,14 @@ async function run(input: PrepareInput, services: PrepareServices): Promise<Prep
   if (txError || !item?.tx?.to || !item.tx.data) return fail(txError ?? "swap tx 无效");
   const quoteAmount = new Decimal(router.fromTokenAmount!).div(new Decimal(10).pow(asset.quoteTokenDecimals));
   const maxAgeMs = guardrails.indexPriceMaxAgeSeconds * 1000;
-  const allowance = await services.readAllowance(asset.quoteTokenAddress, input.wallet, item.tx.to);
+  const approvalRows = await services.dexApproveTransaction<ApprovalItem[]>(new URLSearchParams({
+    chainIndex: asset.chainIndex, tokenContractAddress: asset.quoteTokenAddress, approveAmount: "1",
+  }), input.dex);
+  const approval = approvalRows[0];
+  if (!approval || !/^0x[\da-f]{40}$/i.test(approval.dexContractAddress ?? "") || !/^0x095ea7b3[\da-f]{128}$/i.test(approval.data ?? "")
+    || !same(`0x${approval.data!.slice(34, 74)}`, approval.dexContractAddress!)) return fail("OKX returned an invalid approval spender or calldata");
+  const approvalSpender = approval.dexContractAddress!;
+  const allowance = await services.readAllowance(asset.quoteTokenAddress, input.wallet, approvalSpender);
   if (!allowance) return fail("USDT0 allowance 查询失败，拒绝生成");
 
   const latest = input.getState();
@@ -130,7 +139,7 @@ async function run(input: PrepareInput, services: PrepareServices): Promise<Prep
   const net = new Decimal(decision.netProfitUsdt);
   const invested = new Decimal(decision.usdtLeg);
   if (!netMarginOk(net, invested)) return fail(`扣完费用后净边际 ${net.div(invested).mul(100).toFixed(4)}% 低于 1% 入账缓冲`);
-  const picked = selectCall({ allowance, required: amount, quoteToken: asset.quoteTokenAddress, swapTo: item.tx.to, swapData: item.tx.data });
+  const picked = selectCall({ allowance, required: amount, quoteToken: asset.quoteTokenAddress, spender: approvalSpender, swapTo: item.tx.to, swapData: item.tx.data });
   const call: UnsignedCall = { ...picked, chainId: "196", amount: amount.toFixed(0), slippagePercent: slippage, receiver: input.wallet };
   return { ok: true, call, summary: `净边际 ${net.div(invested).mul(100).toFixed(4)}%；CEX 可卖 ${shares.toString()} 股等值。1% 是入账等待缓冲，不含充值费和再平衡。${decision.quoteSummary ?? ""}` };
 }

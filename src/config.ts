@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { parse } from "yaml";
 import { addressesMatch, pinnedQuote } from "./valuation.js";
 import { parseTrading, type TradingConfig } from "./trading/config.js";
+import { loadMarketRegistry, type MarketRegistry } from "./trading/market-registry.js";
 
 export type AssetConfig = {
   enabled: boolean;
@@ -24,6 +25,25 @@ export type AssetConfig = {
   dexQuoteIntervalMs: number;
 };
 
+export type FixedPoolConfig = {
+  enabled: boolean;
+  id: string;
+  instId: string;
+  chainIndex: "196" | "501";
+  dex: "uniswap-v3" | "raydium-clmm";
+  address: string;
+  baseTokenSymbol: string;
+  baseTokenAddress: string;
+  baseTokenDecimals: number;
+  quoteTokenSymbol: string;
+  quoteTokenAddress: string;
+  quoteTokenDecimals: number;
+  baseTokenToCexAssetRatio: string;
+  expectedFee?: number;
+  expectedFactory?: string;
+  expectedProgramId?: string;
+};
+
 type AssetDefinition = Omit<AssetConfig, "enabled" | "network" | "chainIndex" | "okxChain" | "tokenAddress" | "tokenDecimals" | "quoteTokenAddress" | "quoteTokenDecimals" | "quoteTokenSymbol" | "approvedMultiplier" | "rebalanceCostUsdtPerTrade"> & {
   enabled?: boolean;
   routes: Array<Pick<AssetConfig, "enabled" | "network" | "chainIndex" | "okxChain" | "tokenAddress" | "tokenDecimals" | "quoteTokenAddress" | "quoteTokenDecimals" | "quoteTokenSymbol" | "approvedMultiplier" | "rebalanceCostUsdtPerTrade">>;
@@ -31,12 +51,16 @@ type AssetDefinition = Omit<AssetConfig, "enabled" | "network" | "chainIndex" | 
 
 export type Config = {
   port: number;
+  marketdata: { quoteProvider: "aggregator" | "direct_pool"; aggregatorShadow: boolean; coalesceWindowMs: number; directQuoteRetentionDays: number; directDecisionRetentionDays: number };
+  directPoolObservation: { xlayerWrapThenSwapGasUsdt: number; xlayerSwapThenUnwrapGasUsdt: number; solanaSwapGasUsdt: number };
   runtime: { healthProbeIntervalSeconds: number; dashboardRefreshSeconds: number; guardrails: { maxUsdtUsdDeviationPercent: number; maxUsdt0UsdtDeviationPercent: number; indexPriceRefreshSeconds: number; indexPriceMaxAgeSeconds: number; maxDexPriceImpactPercent: number; maxMultiplierChangePercent: number } };
   mysql: { host: string; port: number; user: string; password: string; database: string };
   okx: { key: string; secret: string; passphrase: string };
   dex: { key: string; secret: string; passphrase: string };
   signers: { xlayerPrivateKey: string; solanaPrivateKey: string; solanaRpcUrl: string };
   assets: AssetConfig[];
+  fixedPools: FixedPoolConfig[];
+  marketRegistry: MarketRegistry;
   trading: TradingConfig;
 };
 
@@ -44,15 +68,53 @@ export async function loadConfig(): Promise<Config> {
   const settings = parse(await readFile(new URL("../config.yaml", import.meta.url), "utf8")) as {
     port?: number;
     runtime?: Partial<Config["runtime"]>;
+    marketdata?: {
+      quote_provider?: "aggregator" | "direct_pool";
+      aggregator_shadow?: boolean;
+      coalesce_window_ms?: number;
+      direct_quote_retention_days?: number;
+      direct_decision_retention_days?: number;
+    };
+    direct_pool_observation?: {
+      xlayer_wrap_then_swap_gas_usdt?: number;
+      xlayer_swap_then_unwrap_gas_usdt?: number;
+      solana_swap_gas_usdt?: number;
+    };
     mysql?: Config["mysql"];
     assets?: AssetDefinition[];
     trading?: unknown;
+    fixedPools?: FixedPoolConfig[];
   };
   if (!Array.isArray(settings.assets)) throw new Error("config.yaml must contain an assets list");
   if (settings.assets.some((asset) => asset.enabled !== undefined && typeof asset.enabled !== "boolean")) throw new Error("Each asset enabled flag must be a boolean");
   if (settings.assets.some((asset) => !Array.isArray(asset.routes) || asset.routes.length === 0)) throw new Error("Each asset must contain at least one route");
   if (settings.assets.some((asset) => asset.routes.some((route) => typeof route.enabled !== "boolean"))) throw new Error("Each asset route enabled flag must be a boolean");
   if (!settings.mysql) throw new Error("config.yaml must contain MySQL settings");
+  const marketdata = {
+    quoteProvider: settings.marketdata?.quote_provider ?? "aggregator",
+    aggregatorShadow: settings.marketdata?.aggregator_shadow ?? false,
+    coalesceWindowMs: settings.marketdata?.coalesce_window_ms ?? 250,
+    directQuoteRetentionDays: settings.marketdata?.direct_quote_retention_days ?? 7,
+    directDecisionRetentionDays: settings.marketdata?.direct_decision_retention_days ?? 180,
+  };
+  if ((marketdata.quoteProvider !== "aggregator" && marketdata.quoteProvider !== "direct_pool")
+    || typeof marketdata.aggregatorShadow !== "boolean"
+    || !Number.isSafeInteger(marketdata.coalesceWindowMs) || Number(marketdata.coalesceWindowMs) < 200 || Number(marketdata.coalesceWindowMs) > 250
+    || !Number.isSafeInteger(marketdata.directQuoteRetentionDays) || Number(marketdata.directQuoteRetentionDays) < 1 || Number(marketdata.directQuoteRetentionDays) > 3650
+    || !Number.isSafeInteger(marketdata.directDecisionRetentionDays) || Number(marketdata.directDecisionRetentionDays) < 1 || Number(marketdata.directDecisionRetentionDays) > 36500) {
+    throw new Error("Invalid marketdata settings");
+  }
+  if (marketdata.aggregatorShadow && marketdata.quoteProvider !== "direct_pool") {
+    throw new Error("marketdata.aggregator_shadow requires quote_provider: direct_pool");
+  }
+  const observation = {
+    xlayerWrapThenSwapGasUsdt: settings.direct_pool_observation?.xlayer_wrap_then_swap_gas_usdt ?? 0.05,
+    xlayerSwapThenUnwrapGasUsdt: settings.direct_pool_observation?.xlayer_swap_then_unwrap_gas_usdt ?? 0.05,
+    solanaSwapGasUsdt: settings.direct_pool_observation?.solana_swap_gas_usdt ?? 0.01,
+  };
+  if (Object.values(observation).some((value) => !Number.isFinite(value) || value < 0 || value > 1_000)) {
+    throw new Error("direct_pool_observation gas budgets must be between 0 and 1000 USDT");
+  }
   const healthProbeIntervalSeconds = settings.runtime?.healthProbeIntervalSeconds ?? 300;
   const dashboardRefreshSeconds = settings.runtime?.dashboardRefreshSeconds ?? 15;
   const guardrails = {
@@ -87,6 +149,27 @@ export async function loadConfig(): Promise<Config> {
     ...route,
     enabled: definition.enabled !== false && route.enabled,
   })));
+  const fixedPools = settings.fixedPools ?? [];
+  if (!Array.isArray(fixedPools)) throw new Error("fixedPools must be a list");
+  const poolIds = new Set<string>();
+  const poolAddresses = new Set<string>();
+  for (const pool of fixedPools) {
+    const addressPattern = pool.chainIndex === "196" ? /^0x[\da-f]{40}$/i : /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+    const familyMetadataValid = pool.chainIndex === "196"
+      ? Number.isSafeInteger(pool.expectedFee) && !!pool.expectedFactory && /^0x[\da-f]{40}$/i.test(pool.expectedFactory)
+      : !!pool.expectedProgramId && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(pool.expectedProgramId);
+    const addressKey = `${pool.chainIndex}:${pool.chainIndex === "196" ? pool.address?.toLowerCase() : pool.address}`;
+    if (typeof pool.enabled !== "boolean" || !pool.id || pool.id.length > 27 || poolIds.has(pool.id) || poolAddresses.has(addressKey) || !pool.instId
+      || !settings.assets.some((asset) => asset.instId === pool.instId) || !pool.baseTokenSymbol || !pool.quoteTokenSymbol
+      || (pool.chainIndex !== "196" && pool.chainIndex !== "501")
+      || pool.baseTokenAddress === pool.quoteTokenAddress
+      || !addressPattern.test(pool.address) || !addressPattern.test(pool.baseTokenAddress) || !addressPattern.test(pool.quoteTokenAddress)
+      || (pool.chainIndex === "196" && pool.dex !== "uniswap-v3") || (pool.chainIndex === "501" && pool.dex !== "raydium-clmm")
+      || !familyMetadataValid || !Number.isSafeInteger(pool.baseTokenDecimals) || !Number.isSafeInteger(pool.quoteTokenDecimals) || pool.baseTokenDecimals < 0 || pool.baseTokenDecimals > 255 || pool.quoteTokenDecimals < 0 || pool.quoteTokenDecimals > 255
+      || !/^(?:\d+\.?\d*|\.\d+)$/.test(pool.baseTokenToCexAssetRatio) || !Number.isFinite(Number(pool.baseTokenToCexAssetRatio)) || Number(pool.baseTokenToCexAssetRatio) <= 0) throw new Error(`Invalid fixed pool ${pool.id || "(missing id)"}`);
+    poolIds.add(pool.id);
+    poolAddresses.add(addressKey);
+  }
   const routeKeys = new Set<string>();
   for (const asset of assets) {
     const addressPattern = asset.chainIndex === "196" ? /^0x[\da-f]{40}$/i : asset.chainIndex === "501" ? /^[1-9A-HJ-NP-Za-km-z]{32,44}$/ : null;
@@ -113,6 +196,14 @@ export async function loadConfig(): Promise<Config> {
   }
   return {
     port: settings.port ?? 3000,
+    marketdata: {
+      quoteProvider: marketdata.quoteProvider as Config["marketdata"]["quoteProvider"],
+      aggregatorShadow: marketdata.aggregatorShadow as boolean,
+      coalesceWindowMs: marketdata.coalesceWindowMs as number,
+      directQuoteRetentionDays: marketdata.directQuoteRetentionDays as number,
+      directDecisionRetentionDays: marketdata.directDecisionRetentionDays as number,
+    },
+    directPoolObservation: observation,
     runtime: { healthProbeIntervalSeconds, dashboardRefreshSeconds, guardrails },
     mysql: settings.mysql,
     okx: { key: process.env.OKX_API_KEY || "", secret: process.env.OKX_API_SECRET || "", passphrase: process.env.OKX_API_PASSPHRASE || "" },
@@ -123,6 +214,8 @@ export async function loadConfig(): Promise<Config> {
       solanaRpcUrl: process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
     },
     assets,
+    fixedPools,
+    marketRegistry: await loadMarketRegistry(),
     trading: parseTrading(settings.trading, assets),
   };
 }

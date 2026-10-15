@@ -1,7 +1,7 @@
 import Decimal from "decimal.js";
 import type { AssetConfig, Config } from "./config.js";
 import { bookMidpoint, bookStale, floorToStep, MAX_BOOK_AGE_MS, vwap, type Instrument } from "./market.js";
-import { dexQuote, type Book, type Credentials, type DexQuoteTiming } from "./okx.js";
+import { dexQuote, reserveDexRequestSlot, type Book, type Credentials, type DexQuoteTiming } from "./okx.js";
 import { decideValuation, XLAYER_CHAIN } from "./valuation.js";
 import { closeOpportunityWindow, saveQuoteObservations, type QuoteObservation } from "./observations.js";
 import { recordBlockedObservation, type BlockedObservation } from "./risk.js";
@@ -107,7 +107,7 @@ export class OpportunityCollector {
         const common = { chainIndex: asset.chainIndex, swapMode: "exactIn" };
         const rawQuotes: unknown[] = [];
         const observations: QuoteObservation[] = [];
-        const capture = async (direction: string, from: string, to: string, amount: string, build: (quote: DexQuote, currentBook: Book, timing: DexQuoteTiming) => Promise<QuoteObservation>) => {
+        const capture = async (direction: string, from: string, to: string, amount: string, reserved: Promise<void>, build: (quote: DexQuote, currentBook: Book, timing: DexQuoteTiming) => Promise<QuoteObservation>) => {
           try {
             if (multiplierChanged) { observations.length = 0; return; }
             const currentState = () => {
@@ -117,7 +117,7 @@ export class OpportunityCollector {
               return current;
             };
             if (!currentState()) return;
-            const { data: response, ...timing } = await dexQuote<DexQuote[]>(new URLSearchParams({ ...common, fromTokenAddress: from, toTokenAddress: to, amount }), dexCredentials);
+            const { data: response, ...timing } = await dexQuote<DexQuote[]>(new URLSearchParams({ ...common, fromTokenAddress: from, toTokenAddress: to, amount }), dexCredentials, reserved);
             const { requestMs } = timing;
             const quote = response[0]; rawQuotes.push({ quote: quote ?? response, ...timing });
             if (requestMs > 2000) throw new BlockedScanError("DEX_QUOTE_SLOW", `DEX ${direction} quote took ${requestMs.toFixed(0)} ms`);
@@ -184,13 +184,16 @@ export class OpportunityCollector {
           }
         };
         const sellAmount = decimals(tokenAmount, asset.tokenDecimals);
-        await capture("cex_buy_dex_sell", asset.tokenAddress, asset.quoteTokenAddress, sellAmount, (quote, currentBook, timing) => {
+        const buyAmount = decimals(new Decimal(size), asset.quoteTokenDecimals);
+        // Both legs claim slots before either request, so index price or the other route cannot cut in.
+        const sellSlot = reserveDexRequestSlot();
+        const buySlot = reserveDexRequestSlot();
+        await capture("cex_buy_dex_sell", asset.tokenAddress, asset.quoteTokenAddress, sellAmount, sellSlot, (quote, currentBook, timing) => {
           const fill = vwap(currentBook.asks, desiredShares);
           if (!fill) throw new BlockedScanError("CEX_DEPTH_INSUFFICIENT", `Insufficient CEX depth to buy ${size} USDT`);
           return makeObservation(asset, "cex_buy_dex_sell", size, desiredShares, fill.vwap, fill.notional, fill.notional.mul(feeRate), feeRate, quote, timing, false, multiplier, multiplierRaw, currentBook, state.routeStatus, guardrails);
         });
-        const buyAmount = decimals(new Decimal(size), asset.quoteTokenDecimals);
-        await capture("dex_buy_cex_sell", asset.quoteTokenAddress, asset.tokenAddress, buyAmount, (quote, currentBook, timing) => {
+        await capture("dex_buy_cex_sell", asset.quoteTokenAddress, asset.tokenAddress, buyAmount, buySlot, (quote, currentBook, timing) => {
           const boughtToken = new Decimal(quote.toTokenAmount).div(new Decimal(10).pow(asset.tokenDecimals));
           const cexShares = floorToStep(boughtToken.mul(multiplier), instrument.lotSz);
           const fill = vwap(currentBook.bids, cexShares);

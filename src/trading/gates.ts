@@ -81,8 +81,8 @@ export function encodeApprove(spender: string, amount: Decimal): string {
   return `0x095ea7b3${spender.slice(2).toLowerCase().padStart(64, "0")}${BigInt(amount.toFixed(0)).toString(16).padStart(64, "0")}`;
 }
 
-export function selectCall(input: { allowance: Decimal; required: Decimal; quoteToken: string; swapTo: string; swapData: string }): Pick<UnsignedCall, "kind" | "to" | "data" | "value"> {
+export function selectCall(input: { allowance: Decimal; required: Decimal; quoteToken: string; spender: string; swapTo: string; swapData: string }): Pick<UnsignedCall, "kind" | "to" | "data" | "value"> {
   if (input.allowance.gte(input.required)) return { kind: "swap", to: input.swapTo, data: input.swapData, value: "0" };
-  // shortcut: spender is swap tx.to; USDT0 that needs approve(0) first is not handled. Upgrade if OKX uses Permit2 or the token rejects a non-zero allowance change.
-  return { kind: "approve", to: input.quoteToken, data: encodeApprove(input.swapTo, input.required), value: "0" };
+  // shortcut: tokens requiring approve(0) still need a separate reset transaction; add it after confirming the token's behavior.
+  return { kind: "approve", to: input.quoteToken, data: encodeApprove(input.spender, input.required), value: "0" };
 }

@@ -1,0 +1,1 @@
+ALTER TABLE health_event MODIFY COLUMN dependency VARCHAR(64) NOT NULL;

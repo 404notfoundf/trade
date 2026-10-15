@@ -18,6 +18,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@raydium-io/raydium-sdk-v2": "0.2.74-alpha",
+    "@solana/spl-token": "^0.4.8",
     "@solana/web3.js": "^1.99.0",
     "bs58": "^6.0.0",
     "decimal.js": "^10.5.0",

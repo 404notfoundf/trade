@@ -45,12 +45,13 @@ test("invalid or missing slippage metadata is refused", () => {
   assert.notEqual(swapTxError(tx({ slippagePercent: "2.1" }), wallet, 2, expected), null);
 });
 
-test("equal allowance selects swap; shortfall approves the exact input to tx.to", () => {
+test("equal allowance selects swap; shortfall approves the exact input to the supplied spender", () => {
   const required = new Decimal("1000000");
-  const swap = selectCall({ allowance: required, required, quoteToken: token, swapTo: router, swapData: "0xabcdef12" });
+  const swap = selectCall({ allowance: required, required, quoteToken: token, spender: router, swapTo: router, swapData: "0xabcdef12" });
   assert.equal(swap.kind, "swap");
-  const approve = selectCall({ allowance: required.minus(1), required, quoteToken: token, swapTo: router, swapData: "0xabcdef12" });
-  assert.deepEqual(approve, { kind: "approve", to: token, data: encodeApprove(router, required), value: "0" });
-  assert.ok(approve.data.includes(router.slice(2).toLowerCase()));
+  const spender = "0x3333333333333333333333333333333333333333";
+  const approve = selectCall({ allowance: required.minus(1), required, quoteToken: token, spender, swapTo: router, swapData: "0xabcdef12" });
+  assert.deepEqual(approve, { kind: "approve", to: token, data: encodeApprove(spender, required), value: "0" });
+  assert.ok(approve.data.includes(spender.slice(2).toLowerCase()));
   assert.ok(approve.data.endsWith(BigInt(1000000).toString(16).padStart(64, "0")));
 });

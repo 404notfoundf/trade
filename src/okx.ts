@@ -9,21 +9,21 @@ const OKX = "https://www.okx.com";
 const DEX = "https://web3.okx.com";
 // Stay below the DEX Trial tier's default limit of 1 request per second.
 const DEX_MIN_REQUEST_INTERVAL_MS = 1100;
-let lastDexRequestAt = 0;
+let nextDexRequestAt = 0;
 let dexRequestQueue = Promise.resolve();
 
-async function waitForDexRequestSlot(): Promise<void> {
-  let release!: () => void;
-  const previous = dexRequestQueue;
-  dexRequestQueue = new Promise<void>((resolve) => { release = resolve; });
-  await previous;
-  try {
-    const delay = DEX_MIN_REQUEST_INTERVAL_MS - (Date.now() - lastDexRequestAt);
+// Claim the start time before sleeping, so a later caller cannot take a slot between two already reserved legs.
+export function reserveDexRequestSlot(): Promise<void> {
+  const claimed = dexRequestQueue.then(() => {
+    const startAt = Math.max(Date.now(), nextDexRequestAt);
+    nextDexRequestAt = startAt + DEX_MIN_REQUEST_INTERVAL_MS;
+    return startAt;
+  });
+  dexRequestQueue = claimed.then(() => {}, () => {});
+  return claimed.then(async (startAt) => {
+    const delay = startAt - Date.now();
     if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
-    lastDexRequestAt = Date.now();
-  } finally {
-    release();
-  }
+  });
 }
 
 function sign(secret: string, timestamp: string, method: string, path: string, body = ""): string {
@@ -68,9 +68,9 @@ export async function okxPublicGet<T>(path: string): Promise<T> {
   return json.data;
 }
 
-async function dexSignedGet<T>(path: string, credentials: Credentials, label: string, onResponse?: (timing: DexQuoteTiming) => void): Promise<T> {
+async function dexSignedGet<T>(path: string, credentials: Credentials, label: string, onResponse?: (timing: DexQuoteTiming) => void, reserved?: Promise<void>): Promise<T> {
   const queuedAt = performance.now();
-  await waitForDexRequestSlot();
+  await (reserved ?? reserveDexRequestSlot());
   const queueWaitMs = performance.now() - queuedAt;
   const requestStartedAt = new Date();
   const timestamp = new Date().toISOString();
@@ -89,9 +89,9 @@ async function dexSignedGet<T>(path: string, credentials: Credentials, label: st
   return json.data;
 }
 
-export async function dexQuote<T>(query: URLSearchParams, credentials: Credentials): Promise<{ data: T } & DexQuoteTiming> {
+export async function dexQuote<T>(query: URLSearchParams, credentials: Credentials, reserved?: Promise<void>): Promise<{ data: T } & DexQuoteTiming> {
   let timing!: DexQuoteTiming;
-  const data = await dexSignedGet<T>(`/api/v6/dex/aggregator/quote?${query.toString()}`, credentials, "DEX Quote", (result) => { timing = result; });
+  const data = await dexSignedGet<T>(`/api/v6/dex/aggregator/quote?${query.toString()}`, credentials, "DEX Quote", (result) => { timing = result; }, reserved);
   return { data, ...timing };
 }
 
@@ -108,7 +108,7 @@ export async function dexSolanaSwapInstructions<T>(query: URLSearchParams, crede
 }
 
 export async function dexPost<T>(path: string, body: unknown, credentials: Credentials): Promise<T> {
-  await waitForDexRequestSlot();
+  await reserveDexRequestSlot();
   const payload = JSON.stringify(body);
   const timestamp = new Date().toISOString();
   const response = await fetch(`${DEX}${path}`, { method: "POST", headers: {

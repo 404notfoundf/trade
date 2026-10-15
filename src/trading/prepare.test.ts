@@ -7,6 +7,7 @@ import { prepareBuy, type PrepareServices, type TradeState } from "./prepare.js"
 import { XLAYER_DEX_ROUTER } from "./gates.js";
 
 const wallet = "0x1111111111111111111111111111111111111111";
+const approvalSpender = "0x4444444444444444444444444444444444444444";
 const asset: AssetConfig = {
   enabled: true,
   instId: "XAAPL-USDT",
@@ -72,6 +73,8 @@ const valuation: ReturnType<PrepareServices["decideValuation"]> = {
 const fakeDexSwap: PrepareServices["dexSwap"] = async <T>() => [swapItem] as unknown as T;
 const baseServices: PrepareServices = {
   dexSwap: fakeDexSwap,
+  dexApproveTransaction: async <T>() => [{ dexContractAddress: approvalSpender,
+    data: `0x095ea7b3${approvalSpender.slice(2).padStart(64, "0")}${"0".repeat(64)}` }] as unknown as T,
   decideValuation: (() => valuation) as PrepareServices["decideValuation"],
   readAllowance: async () => new Decimal(0),
 };
@@ -105,17 +108,33 @@ function fixture() {
   };
 }
 
-test("prepareBuy returns an exact approval after checking the final fresh book", async () => {
+test("prepareBuy approves the OKX spender even when it differs from swap tx.to", async () => {
   const { input } = fixture();
-  const result = await prepareBuy(input, baseServices);
+  let checkedSpender: string | undefined;
+  const result = await prepareBuy(input, { ...baseServices, readAllowance: async (_token, _owner, spender) => {
+    checkedSpender = spender;
+    return new Decimal(0);
+  } });
   assert.equal(result.ok, true);
   if (result.ok) {
     assert.equal(result.call.kind, "approve");
     assert.equal(result.call.to, asset.quoteTokenAddress);
     assert.equal(result.call.chainId, "196");
     assert.equal(result.call.amount, "100000000");
+    assert.equal(result.call.data.slice(34, 74).toLowerCase(), approvalSpender.slice(2).toLowerCase());
     assert.ok(result.call.data.endsWith(BigInt("100000000").toString(16).padStart(64, "0")));
   }
+  assert.equal(checkedSpender, approvalSpender);
+});
+
+test("prepareBuy refuses when OKX approval data disagrees with the returned spender", async () => {
+  const { input } = fixture();
+  const result = await prepareBuy(input, { ...baseServices, dexApproveTransaction: async <T>() => [{
+    dexContractAddress: approvalSpender,
+    data: `0x095ea7b3${wallet.slice(2).padStart(64, "0")}${"0".repeat(64)}`,
+  }] as unknown as T });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /approval spender/);
 });
 
 test("prepareBuy refuses when the book expires during the allowance request", async () => {

@@ -1,3 +1,4 @@
 # Repository instructions
 
-- Record in `docs/TODO.md` only work that has been discussed or identified but intentionally deferred for later, including ideas to revisit when time permits. Update it when those items are added, changed, or completed; do not keep separate lists of such items elsewhere.
+- Design documents that describe completed implementations must be moved to `docs/archive/`. Keep active architecture, operational, and future-phase design documents in `docs/`.
+- When archiving a design document, update `docs/archive/README.md` with its filename, completion status, and a short reason for preservation.

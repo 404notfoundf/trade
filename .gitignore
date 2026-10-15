@@ -9,3 +9,4 @@ npm-debug.log*
 .harness/*
 /tmp_*.py
 .idea/
+test/

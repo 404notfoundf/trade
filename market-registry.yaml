@@ -1,0 +1,105 @@
+schema_version: 1
+
+chains:
+  xlayer:
+    chain_id: 196
+    kind: evm
+    rpc_http: env:XLAYER_RPC_HTTP
+    rpc_ws: env:XLAYER_RPC_WS
+    native_symbol: OKB
+  solana:
+    chain_id: 501
+    kind: svm
+    rpc_http: env:SOLANA_RPC_URL
+    rpc_ws: env:SOLANA_RPC_WS
+    native_symbol: SOL
+
+cexes:
+  okx:
+    kind: cex
+    enabled: true
+    book_source: websocket
+
+dexes:
+  uniswap_v3_xlayer:
+    chain: xlayer
+    adapter: uniswap_v3
+    quote_source: onchain_quoter
+    enabled: true
+    quoter_v2: "0xd1b797d92d87b688193a2b976efc8d577d204343"
+    swap_router: "0x4f0c28f5926afda16bf2506d5d9e57ea190f9bca"
+    factory: "0x4B2ab38DBF28D31D467aA8993f6c2585981D6804"
+  raydium_clmm_solana:
+    chain: solana
+    adapter: raydium_clmm
+    quote_source: local_math
+    enabled: true
+    program_id: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+
+instruments:
+  - instrument_id: XAAPL
+    cex_listings:
+      - venue: okx
+        symbol: XAAPL-USDT
+        currency: XAAPL
+    chain_assets:
+      - chain: xlayer
+        address: "0x9d275685dc284c8eb1c79f6aba7a63dc75ec890a"
+        decimals: 18
+        quote_asset: { symbol: USDT0, address: "0x779ded0c9e1022225f8e0630b35a9b54be713736", decimals: 6 }
+      - chain: solana
+        address: "XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp"
+        decimals: 8
+        quote_asset: { symbol: USDT, address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 }
+  - instrument_id: XSPCX
+    cex_listings:
+      - venue: okx
+        symbol: XSPCX-USDT
+        currency: XSPCX
+    chain_assets:
+      - chain: xlayer
+        address: "0x68fa48b1c2fe52b3d776e1953e0e782b5044ce28"
+        decimals: 18
+        quote_asset: { symbol: USDT0, address: "0x779ded0c9e1022225f8e0630b35a9b54be713736", decimals: 6 }
+      - chain: solana
+        address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8"
+        decimals: 8
+        quote_asset: { symbol: USDT, address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 }
+  - instrument_id: XNVDA
+    cex_listings:
+      - venue: okx
+        symbol: XNVDA-USDT
+        currency: XNVDA
+    chain_assets:
+      - chain: xlayer
+        address: "0xc845b2894dbddd03858fd2d643b4ef725fe0849d"
+        decimals: 18
+        quote_asset: { symbol: USDT0, address: "0x779ded0c9e1022225f8e0630b35a9b54be713736", decimals: 6 }
+      - chain: solana
+        address: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+        decimals: 8
+        quote_asset: { symbol: USDT, address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 }
+
+# These manually monitored pools are deliberately ineligible for direct-pool decisions.
+pools:
+  - id: xnvda-xlayer-uniswap-v3
+    enabled: false
+    instrument_id: XNVDA
+    chain: xlayer
+    dex: uniswap_v3_xlayer
+    mode: observe_only
+    reason: wrapper_required
+    verified: true
+    address: "0x2a2b11730c2b6d99a58034a869dd810d7300a7b2"
+    token_in_out: { asset_address: "0xa8ddb5cd96b5222afe198316e9a57caa642850d5", asset_decimals: 18, quote_address: "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8", quote_decimals: 6 }
+    expected_fee_tier: 500
+  - id: xnvda-solana-raydium-clmm
+    enabled: true
+    instrument_id: XNVDA
+    chain: solana
+    dex: raydium_clmm_solana
+    mode: observe_only
+    reason: quote_asset_not_pinned
+    verified: true
+    address: "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+    token_in_out: { asset_address: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }

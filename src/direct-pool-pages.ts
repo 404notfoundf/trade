@@ -57,19 +57,35 @@ const actualTime = (stored: Date, offsetSeconds: number) => new Date(stored.getT
 const storedTime = (utc: Date, offsetSeconds: number) => new Date(utc.getTime() + offsetSeconds * 1000);
 const isInvalidated = (status: string | null) => status?.startsWith("INVALIDATED_") ?? false;
 
-function subNav(path: string, range: DirectPoolRange): string {
+type DecisionFilters = { positiveOnly: boolean; assetPool: string; direction: string };
+
+function decisionFilterParams(filters?: DecisionFilters): Record<string, string> {
+  return filters ? {
+    ...(filters.positiveOnly ? { profit: "positive" } : {}),
+    ...(filters.assetPool ? { assetPool: filters.assetPool } : {}),
+    ...(filters.direction ? { direction: filters.direction } : {}),
+  } : {};
+}
+
+function subNav(path: string, range: DirectPoolRange, filters?: DecisionFilters): string {
   const items: Array<[string, string]> = [["/direct-pools", "收益总览"], ["/direct-pools/quotes", "报价记录"], ["/direct-pools/decisions", "收益明细"]];
-  return `<nav class="direct-subnav" aria-label="指定池收益页面">${items.map(([href, label]) => `<a href="${directPoolHref(href, range)}"${path === href ? ' aria-current="page"' : ""}>${label}</a>`).join("")}</nav>`;
+  return `<nav class="direct-subnav" aria-label="指定池收益页面">${items.map(([href, label]) => `<a href="${directPoolHref(href, range, href === path ? decisionFilterParams(filters) : undefined)}"${path === href ? ' aria-current="page"' : ""}>${label}</a>`).join("")}</nav>`;
 }
 
-function rangeControl(path: string, range: DirectPoolRange, escapeHtml: Helpers["escapeHtml"]): string {
-  return `<form class="direct-range" action="${path}" method="get"><label>时间范围 <select name="range"><option value="5m"${range.preset === "5m" ? " selected" : ""}>最近 5 分钟</option><option value="1h"${range.preset === "1h" ? " selected" : ""}>最近 1 小时</option><option value="24h"${range.preset === "24h" ? " selected" : ""}>最近 24 小时</option><option value="custom"${range.preset === "custom" ? " selected" : ""}>自定义范围</option></select></label><details class="direct-custom-range"${range.preset === "custom" ? " open" : ""}><summary>自定义起止时间</summary><div><label>开始（UTC+8）<input type="datetime-local" name="from" value="${escapeHtml(formatUtc8Input(range.from))}"></label><label>结束（UTC+8）<input type="datetime-local" name="to" value="${escapeHtml(formatUtc8Input(range.to))}"></label></div></details><button type="submit">应用</button></form>`;
+function rangeControl(path: string, range: DirectPoolRange, escapeHtml: Helpers["escapeHtml"], filters?: DecisionFilters): string {
+  const positiveOnly = filters?.positiveOnly ?? false;
+  const decisionFields = filters ? `<label>资产 / 池地址<input type="search" name="assetPool" value="${escapeHtml(filters.assetPool)}" maxlength="128" placeholder="输入资产代码或池地址片段"></label><label>交易方向<select name="direction"><option value="">全部方向</option><option value="cex_buy_dex_sell"${filters.direction === "cex_buy_dex_sell" ? " selected" : ""}>CEX 买入 · DEX 卖出</option><option value="dex_buy_cex_sell"${filters.direction === "dex_buy_cex_sell" ? " selected" : ""}>DEX 买入 · CEX 卖出</option></select></label>` : "";
+  return `<form class="direct-range direct-range-improved" action="${path}" method="get">${positiveOnly ? '<input type="hidden" name="profit" value="positive">' : ""}<label class="direct-range-preset">时间范围<select name="range"><option value="5m"${range.preset === "5m" ? " selected" : ""}>最近 5 分钟</option><option value="1h"${range.preset === "1h" ? " selected" : ""}>最近 1 小时</option><option value="24h"${range.preset === "24h" ? " selected" : ""}>最近 24 小时</option><option value="custom"${range.preset === "custom" ? " selected" : ""}>自定义时间</option></select></label><div class="direct-custom-range"${range.preset === "custom" ? "" : " hidden"}><label>开始时间（UTC+8）<input type="datetime-local" name="from" value="${escapeHtml(formatUtc8Input(range.from))}"></label><span aria-hidden="true">至</span><label>结束时间（UTC+8）<input type="datetime-local" name="to" value="${escapeHtml(formatUtc8Input(range.to))}"></label></div>${decisionFields}<button type="submit">应用筛选</button></form><script>(()=>{const form=document.currentScript.previousElementSibling;const preset=form.querySelector('[name="range"]');const panel=form.querySelector('.direct-custom-range');const sync=()=>{const active=preset.value==="custom";panel.hidden=!active;panel.querySelectorAll('input').forEach(input=>input.required=active)};preset.addEventListener('change',sync);sync()})();</script><style>.direct-range.direct-range-improved{align-items:flex-end;flex-wrap:wrap;gap:12px;margin:0 0 16px}.direct-range.direct-range-improved label{display:grid;gap:6px;color:#53627a;font-size:12px;font-weight:600}.direct-range.direct-range-improved select,.direct-range.direct-range-improved input{box-sizing:border-box;height:40px;padding:0 11px;border:1px solid #d5deeb;border-radius:8px;background:#fff;color:#26364f;font:inherit}.direct-range.direct-range-improved select{min-width:180px;cursor:pointer}.direct-range.direct-range-improved input{width:100%;min-width:0;font-variant-numeric:tabular-nums}.direct-range.direct-range-improved .direct-custom-range{display:grid;grid-template-columns:minmax(220px,1fr) auto minmax(220px,1fr);align-items:end;gap:10px;flex:1 1 520px;padding:12px;border:1px solid #e2e8f1;border-radius:10px;background:#f7f9fc}.direct-range.direct-range-improved .direct-custom-range[hidden]{display:none}.direct-range.direct-range-improved .direct-custom-range>span{padding:0 2px 12px;color:#758198}.direct-range.direct-range-improved button{height:40px;padding:0 18px;border:0;border-radius:8px;background:#315fba;color:#fff;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer}.direct-range.direct-range-improved button:hover{background:#274f9f}.direct-range.direct-range-improved select:focus-visible,.direct-range.direct-range-improved input:focus-visible,.direct-range.direct-range-improved button:focus-visible{outline:3px solid #9bb9f4;outline-offset:2px}@media(max-width:700px){.direct-range.direct-range-improved{align-items:stretch;flex-direction:column}.direct-range.direct-range-improved select{width:100%}.direct-range.direct-range-improved .direct-custom-range{grid-template-columns:1fr;gap:8px;flex:auto}.direct-range.direct-range-improved .direct-custom-range>span{display:none}.direct-range.direct-range-improved button{width:100%}}</style>`;
 }
 
-function pagination(path: string, range: DirectPoolRange, page: number, hasNext: boolean, label: string): string {
-  const previous = page > 1 ? `<a href="${directPoolHref(path, range, { page: String(page - 1) })}">上一页</a>` : "";
-  const next = hasNext ? `<a href="${directPoolHref(path, range, { page: String(page + 1) })}">下一页</a>` : "";
-  return `<nav class="direct-pagination" aria-label="${label}"><span>第 ${page} 页 · 每页 ${pageSize} 条</span><div>${previous}${next}</div></nav>`;
+function pagination(path: string, range: DirectPoolRange, page: number, hasNext: boolean, label: string, extra?: Record<string, string>): string {
+  const previous = page > 1 ? `<a href="${directPoolHref(path, range, { ...extra, page: String(page - 1) })}">上一页</a>` : "";
+  const next = hasNext ? `<a href="${directPoolHref(path, range, { ...extra, page: String(page + 1) })}">下一页</a>` : "";
+  const params = rangeSearchParams(range);
+  for (const [key, value] of Object.entries(extra ?? {})) params.set(key, value);
+  const hidden = [...params].map(([key, value]) => `<input type="hidden" name="${key}" value="${value}">`).join("");
+  const jump = `<form class="pagination-jump" action="${path}" method="get" style="display:flex;align-items:center;gap:6px;margin:0">${hidden}<label>跳至第 <input type="number" name="page" value="${page}" min="1" step="1" required aria-label="跳转到页码" style="width:68px;padding:5px 7px"> 页</label><button type="submit">跳转</button></form>`;
+  return `<nav class="direct-pagination" aria-label="${label}"><span>第 ${page} 页 · 每页 ${pageSize} 条</span><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${previous}${next}${jump}</div></nav>`;
 }
 
 function pageStyle(): string {
@@ -97,8 +113,17 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
   const { escapeHtml, formatUtc8, formatReportDecimal, formatRawTokenAmount, directQuoteAssetUiMultiplier, fixedPoolPanel } = helpers;
   const path = url.pathname;
   const range = parseDirectPoolRange(url.searchParams);
+  const requestedDirection = url.searchParams.get("direction");
+  const filters: DecisionFilters | undefined = path === "/direct-pools/decisions" ? {
+    positiveOnly: url.searchParams.get("profit") === "positive",
+    assetPool: (url.searchParams.get("assetPool") ?? "").trim().slice(0, 128),
+    direction: requestedDirection === "cex_buy_dex_sell" || requestedDirection === "dex_buy_cex_sell" ? requestedDirection : "",
+  } : undefined;
+  const positiveOnly = filters?.positiveOnly ?? false;
+  const filterParams = decisionFilterParams(filters);
   const invalidRange = range.invalid ? '<p class="guard-alert">时间范围无效，已回退为最近 1 小时。</p>' : "";
-  const header = `<h2>${path === "/direct-pools/quotes" ? "Exact-In 报价记录" : path === "/direct-pools/decisions" ? "收益明细" : "指定池收益总览"}</h2>${subNav(path, range)}${rangeControl(path, range, escapeHtml)}${invalidRange}`;
+  const positiveShortcut = path === "/direct-pools" ? `<p><a href="${directPoolHref("/direct-pools/decisions", range, { profit: "positive" })}">查看所选时间范围内全部正收益记录 →</a></p>` : "";
+  const header = `<h2>${path === "/direct-pools/quotes" ? "Exact-In 报价记录" : path === "/direct-pools/decisions" ? "收益明细" : "指定池收益总览"}</h2>${subNav(path, range, filters)}${rangeControl(path, range, escapeHtml, filters)}${positiveShortcut}${invalidRange}`;
   if (!dbOnline) return `${header}<p class="guard-alert">数据库不可用，暂时无法读取 Direct Pool 观察数据。</p>${pageStyle()}`;
 
   let offsetSeconds: number;
@@ -130,15 +155,30 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
 
     if (path === "/direct-pools/decisions") {
       const page = parsePageNumber(url.searchParams.get("page"));
-      const rows = await query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,created_at FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, [fromStored, toStored, pageSize + 1, (page - 1) * pageSize]);
+      const decisionPredicates: string[] = [];
+      const decisionParameters: Array<string | number | Date> = [fromStored, toStored];
+      if (filters!.assetPool) {
+        decisionPredicates.push("(instrument_id LIKE ? ESCAPE '!' OR pool_id LIKE ? ESCAPE '!')");
+        const search = `%${filters!.assetPool.replace(/[!%_]/g, (character) => `!${character}`)}%`;
+        decisionParameters.push(search, search);
+      }
+      if (filters!.direction) {
+        decisionPredicates.push("direction = ?");
+        decisionParameters.push(filters!.direction);
+      }
+      if (positiveOnly) decisionPredicates.push(`${validEstimateSql} AND net_profit_usdt > 0`);
+      const filterSql = decisionPredicates.map((predicate) => ` AND ${predicate}`).join("");
+      const rows = await query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,created_at FROM direct_pool_decision WHERE created_at >= ? AND created_at < ?${filterSql} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, [...decisionParameters, pageSize + 1, (page - 1) * pageSize]);
       const recordRows = rows.slice(0, pageSize).map((raw) => {
         const row = correctedDecision(raw, offsetSeconds);
         const profit = decisionProfit(row, helpers);
-        const quote = row.selected_quote_id === null ? (row.net_profit_usdt === null && !isInvalidated(row.valuation_status) ? "无关联报价" : "原始报价已过保留期") : `<a href="${directPoolHref("/direct-pools/quote", range, { id: String(row.selected_quote_id) })}">报价详情 →</a>`;
+        const quote = row.selected_quote_id === null ? (row.net_profit_usdt === null && !isInvalidated(row.valuation_status) ? "无关联报价" : "原始报价已过保留期") : `<a href="${directPoolHref("/direct-pools/quote", range, { id: String(row.selected_quote_id), back: "decisions", ...filterParams, ...(page > 1 ? { page: String(page) } : {}) })}">报价详情 →</a>`;
         const direction = row.direction === "dex_buy_cex_sell" ? "DEX 买入 · CEX 卖出" : "CEX 买入 · DEX 卖出";
         return `<tr><td>${escapeHtml(formatUtc8(row.created_at))}</td><td><strong>${escapeHtml(row.instrument_id)}</strong><small>${escapeHtml(row.chain_index)} · ${escapeHtml(row.pool_id ?? "池 ID 不可用")}</small></td><td>${escapeHtml(direction)}</td><td class="numeric">${escapeHtml(formatReportDecimal(row.size_usdt, 8))} USDT</td><td class="numeric ${profit.className}"><strong>${escapeHtml(profit.text)}</strong></td><td>${quote}</td></tr>`;
       }).join("");
-      return `${header}<p class="direct-record-note">仅保留判断时最重要的信息；CEX VWAP、毛收益、手续费、Gas 与估值口径可在“报价详情”查看。全部记录均为观察估算，固定为 NOT_EXECUTABLE；决策保留 ${config.marketdata.directDecisionRetentionDays} 天。</p><section class="overview"><div class="table-wrap"><table class="direct-record-table direct-decision-table"><thead><tr><th>时间 <small>(UTC+8)</small></th><th>资产 / 链 / 池</th><th>方向</th><th>规模</th><th>净收益 / ROI</th><th>详情</th></tr></thead><tbody>${recordRows || '<tr><td colspan="6">当前范围没有观察决策。</td></tr>'}</tbody></table></div>${pagination(path, range, page, rows.length > pageSize, "收益明细分页")}</section>${pageStyle()}`;
+      const profitFilter = `<nav class="direct-subnav direct-profit-filter" aria-label="收益筛选"><a href="${directPoolHref(path, range, decisionFilterParams({ ...filters!, positiveOnly: false }))}"${positiveOnly ? "" : ' aria-current="page"'}>全部收益</a><a href="${directPoolHref(path, range, decisionFilterParams({ ...filters!, positiveOnly: true }))}"${positiveOnly ? ' aria-current="page"' : ""}>净收益大于 0</a></nav>`;
+      const emptyMessage = positiveOnly ? "当前时间范围没有净收益大于 0 的有效观察记录。" : "当前范围没有观察决策。";
+      return `${header}${profitFilter}<p class="direct-record-note">${positiveOnly ? "仅显示净收益大于 0 且估值有效的观察记录。" : "仅保留判断时最重要的信息。"}CEX VWAP、毛收益、手续费、Gas 与估值口径可在“报价详情”查看。全部记录均为观察估算，固定为 NOT_EXECUTABLE；决策保留 ${config.marketdata.directDecisionRetentionDays} 天。所选时间范围内每页显示 20 条。</p><section class="overview"><div class="table-wrap"><table class="direct-record-table direct-decision-table"><thead><tr><th>时间 <small>(UTC+8)</small></th><th>资产 / 链 / 池</th><th>方向</th><th>规模</th><th>净收益 / ROI</th><th>详情</th></tr></thead><tbody>${recordRows || `<tr><td colspan="6">${emptyMessage}</td></tr>`}</tbody></table></div>${pagination(path, range, page, rows.length > pageSize, "收益明细分页", filterParams)}</section>${pageStyle()}`;
     }
 
     const [statsRows, positiveRows, migrationRows] = await Promise.all([

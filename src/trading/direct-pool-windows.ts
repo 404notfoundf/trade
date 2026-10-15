@@ -99,7 +99,19 @@ export function directPoolHref(path: string, range: DirectPoolRange, extra?: Rec
 
 export function directPoolQuoteBackUrl(params: URLSearchParams): string {
   const page = parsePageNumber(params.get("page") ?? params.get("quote_page"));
-  return directPoolHref("/direct-pools/quotes", parseDirectPoolRange(params), page > 1 ? { page: String(page) } : undefined);
+  const backToDecisions = params.get("back") === "decisions";
+  const direction = params.get("direction");
+  const assetPool = params.get("assetPool")?.trim().slice(0, 128);
+  return directPoolHref(
+    backToDecisions ? "/direct-pools/decisions" : "/direct-pools/quotes",
+    parseDirectPoolRange(params),
+    {
+      ...(page > 1 ? { page: String(page) } : {}),
+      ...(backToDecisions && params.get("profit") === "positive" ? { profit: "positive" } : {}),
+      ...(backToDecisions && assetPool ? { assetPool } : {}),
+      ...(backToDecisions && (direction === "cex_buy_dex_sell" || direction === "dex_buy_cex_sell") ? { direction } : {}),
+    },
+  );
 }
 
 export function isWindowCoverageComplete(rangeFrom: Date, coverageStart: Date | null): boolean {

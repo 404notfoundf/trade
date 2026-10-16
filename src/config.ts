@@ -30,7 +30,7 @@ export type FixedPoolConfig = {
   id: string;
   instId: string;
   chainIndex: "196" | "501";
-  dex: "uniswap-v3" | "raydium-clmm";
+  dex: "uniswap-v3" | "raydium-clmm" | "orca-whirlpool" | "meteora-dlmm";
   address: string;
   baseTokenSymbol: string;
   baseTokenAddress: string;

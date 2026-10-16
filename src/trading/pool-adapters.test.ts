@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import Decimal from "decimal.js";
 import { Interface } from "ethers";
 import { Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
-import { createSolanaSimulationTransaction, encodeUniswapV3Swap, impactFromSqrtPrice, minimumOut } from "./pool-adapters.js";
-import type { RegisteredPool } from "./market-registry.js";
+import { WebSocketServer } from "ws";
+import { assertMeteoraFullFill, createSolanaSimulationTransaction, encodeUniswapV3Swap, impactFromMarginalPrice, impactFromOrcaSqrtPrice, impactFromSqrtPrice, isScopedToken2022Pool, meteoraSwapForY, minimumOut, orcaInputMint, startSolanaAccountWatch } from "./pool-adapters.js";
+import { METEORA_DLMM_PROGRAM_ADDRESS, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, type RegisteredPool } from "./market-registry.js";
 
 const pool = {
   id: "pool", token_in_out: {
@@ -23,6 +26,81 @@ test("Uniswap spot comparison reports exact-in impact in both directions", () =>
 test("minimum output applies integer basis-point slippage without rounding up", () => {
   assert.equal(minimumOut(10_001n, 50), 9_950n);
   assert.equal(minimumOut(999n, 0), 999n);
+});
+
+test("Orca directions use the pinned raw mint pair and spot-price decimal normalization", () => {
+  const orca = { ...pool, id: ORCA_XSPCX_USDC_POOL.id, instrument_id: "XSPCX", chain: "solana", mode: "observe_only", verified: true,
+    address: ORCA_XSPCX_USDC_POOL.address, token_in_out: { asset_address: ORCA_XSPCX_USDC_POOL.assetMint, asset_decimals: 8,
+      quote_address: ORCA_XSPCX_USDC_POOL.quoteMint, quote_decimals: 6 } } as RegisteredPool;
+  assert.equal(orcaInputMint(orca, "asset_to_quote"), ORCA_XSPCX_USDC_POOL.assetMint);
+  assert.equal(orcaInputMint(orca, "quote_to_asset"), ORCA_XSPCX_USDC_POOL.quoteMint);
+  assert.equal(impactFromOrcaSqrtPrice(2n ** 64n, "asset_to_quote", 100_000_000n, 100_000_000n, 8, 6, true), "0");
+  assert.equal(impactFromOrcaSqrtPrice(2n ** 64n, "quote_to_asset", 100_000_000n, 100_000_000n, 8, 6, true), "0");
+  assert.throws(() => impactFromOrcaSqrtPrice(0n, "asset_to_quote", 1n, 1n, 8, 6, true), /must be positive/);
+});
+
+test("Token-2022 review exception is scoped to the exact protocol, pool and mint pair", () => {
+  const orca = { ...pool, id: ORCA_XSPCX_USDC_POOL.id, instrument_id: "XSPCX", chain: "solana", mode: "observe_only", verified: true,
+    address: ORCA_XSPCX_USDC_POOL.address, token_in_out: { asset_address: ORCA_XSPCX_USDC_POOL.assetMint, asset_decimals: 8,
+      quote_address: ORCA_XSPCX_USDC_POOL.quoteMint, quote_decimals: 6 } } as RegisteredPool;
+  assert.equal(isScopedToken2022Pool(orca, "orca_whirlpool", "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"), true);
+  assert.equal(isScopedToken2022Pool(orca, "raydium_clmm", "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"), false);
+  assert.equal(isScopedToken2022Pool({ ...orca, verified: false }, "orca_whirlpool", "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"), false);
+  const meteora = { ...orca, id: METEORA_XSPCX_USDC_POOL.id, address: METEORA_XSPCX_USDC_POOL.address };
+  assert.equal(isScopedToken2022Pool(meteora, "meteora_dlmm", METEORA_DLMM_PROGRAM_ADDRESS), true);
+  assert.equal(isScopedToken2022Pool({ ...meteora, token_in_out: { ...meteora.token_in_out, quote_address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" } }, "meteora_dlmm", METEORA_DLMM_PROGRAM_ADDRESS), false);
+});
+
+test("Meteora direction follows the pool's token X mint and rejects partial exact-in consumption", () => {
+  const meteora = { ...pool, id: METEORA_XSPCX_USDC_POOL.id, instrument_id: "XSPCX", chain: "solana", mode: "observe_only", verified: true,
+    address: METEORA_XSPCX_USDC_POOL.address, token_in_out: { asset_address: METEORA_XSPCX_USDC_POOL.assetMint, asset_decimals: 8,
+      quote_address: METEORA_XSPCX_USDC_POOL.quoteMint, quote_decimals: 6 } } as RegisteredPool;
+  assert.equal(meteoraSwapForY(meteora, "asset_to_quote", METEORA_XSPCX_USDC_POOL.assetMint), true);
+  assert.equal(meteoraSwapForY(meteora, "quote_to_asset", METEORA_XSPCX_USDC_POOL.assetMint), false);
+  assert.equal(meteoraSwapForY(meteora, "asset_to_quote", METEORA_XSPCX_USDC_POOL.quoteMint), false);
+  assert.equal(meteoraSwapForY(meteora, "quote_to_asset", METEORA_XSPCX_USDC_POOL.quoteMint), true);
+  assert.throws(() => assertMeteoraFullFill(99n, 100n), /exact-in quote is partial/);
+  assert.doesNotThrow(() => assertMeteoraFullFill(100n, 100n));
+  assert.equal(impactFromMarginalPrice(new Decimal(2), "asset_to_quote", 100_000_000n, 2_000_000n, 8, 6), "0");
+  assert.equal(impactFromMarginalPrice(new Decimal(2), "quote_to_asset", 2_000_000n, 100_000_000n, 8, 6), "0");
+});
+
+test("adapter account watch fails closed on disconnect and resnapshots after reconnect", async () => {
+  const server = createServer();
+  const sockets = new WebSocketServer({ server });
+  const states: Array<{ slot: bigint; stateFingerprint: string }> = [];
+  const unavailable: string[] = [];
+  let connections = 0;
+  let stop: (() => Promise<void>) | undefined;
+  sockets.on("connection", (socket) => {
+    const connectionNumber = ++connections;
+    socket.on("message", (raw) => {
+      const request = JSON.parse(raw.toString()) as { id: number; method: string };
+      if (request.method !== "accountSubscribe") return;
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: connectionNumber }));
+      if (connectionNumber === 1) setTimeout(() => socket.close(), 100);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    const account = { owner: new PublicKey(METEORA_DLMM_PROGRAM_ADDRESS), data: Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]) };
+    const connection = { getAccountInfoAndContext: async () => ({ context: { slot: 10 }, value: account }) } as any;
+    stop = await startSolanaAccountWatch(connection, `ws://127.0.0.1:${port}`, METEORA_XSPCX_USDC_POOL.address, METEORA_DLMM_PROGRAM_ADDRESS,
+      async (reverify) => { assert.equal(reverify, true); return "1.5"; }, {
+        onState: (state) => states.push(state), onUnavailable: (reason) => unavailable.push(reason),
+      });
+    const deadline = Date.now() + 5_000;
+    while ((connections < 2 || states.length < 2 || !unavailable.some((reason) => reason.includes("disconnected"))) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(connections >= 2, "watch did not reconnect");
+    assert.equal(states.length, 2, "fresh snapshot was not emitted on reconnect");
+    assert.ok(unavailable.some((reason) => reason.includes("disconnected")));
+  } finally {
+    await stop?.();
+    await new Promise<void>((resolve) => sockets.close(() => server.close(() => resolve())));
+  }
 });
 
 test("Uniswap unsigned transaction encodes the pinned single pool, recipient, deadline and minimum output", () => {

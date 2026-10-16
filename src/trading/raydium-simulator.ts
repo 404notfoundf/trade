@@ -3,21 +3,21 @@ import { PublicKey, Transaction, TransactionMessage, VersionedTransaction, type 
 import type { RegisteredPool } from "./market-registry.js";
 import type { SwapSimulationResult, UnsignedSwap } from "./pool-adapters.js";
 
-type RaydiumSimulationInput = {
+type SolanaSimulationInput = {
   pool: RegisteredPool; swap: UnsignedSwap; signer?: Keypair; connection: Connection;
   verifyPool: () => Promise<void>; currentStateFingerprint: () => Promise<string>;
 };
 type WalletTokenSnapshot = { address: PublicKey; mint: PublicKey; tokenProgram: PublicKey; account: Buffer | null; amount: bigint };
 
-export async function simulateRaydiumSwap({ pool, swap, signer, connection, verifyPool, currentStateFingerprint }: RaydiumSimulationInput): Promise<SwapSimulationResult> {
+export async function simulateSolanaSwap({ pool, swap, signer, connection, verifyPool, currentStateFingerprint }: SolanaSimulationInput): Promise<SwapSimulationResult> {
   if (swap.chain !== "solana" || swap.poolId !== pool.id) throw new Error("Unsigned Solana swap does not match the registered pool");
   try {
-    if (!pool.verified || (pool.mode !== "trade_candidate" && !(pool.mode === "observe_only" && swap.simulationOnly))) {
+    if (!pool.verified || (pool.mode !== "trade_candidate" && !(pool.mode === "observe_only" && swap.simulationOnly === true))) {
       throw new Error("This Solana pool is not eligible for swap simulation");
     }
     if (!signer || signer.publicKey.toBase58() !== swap.wallet) throw new Error("Simulation signer does not match the swap wallet");
     await verifyPool();
-    if (await currentStateFingerprint() !== swap.stateFingerprint) throw new Error("Raydium pool state changed since the quote; requote before simulation");
+    if (await currentStateFingerprint() !== swap.stateFingerprint) throw new Error("Solana pool state changed since the quote; requote before simulation");
     const latestBlockhash = await connection.getLatestBlockhash("confirmed");
     const transaction = createSolanaSimulationTransaction(swap.transactionBase64, swap.wallet, latestBlockhash.blockhash);
     transaction.sign([signer]);
@@ -103,7 +103,7 @@ function simulatedTokenAmount(account: SimulatedTransactionAccountInfo | null, s
 
 function tokenAmount(data: Buffer, program: PublicKey, mint: PublicKey, owner: PublicKey, tokenProgram: PublicKey): bigint {
   if (!program.equals(tokenProgram) || data.length < 165 || !data.subarray(0, 32).equals(mint.toBuffer())
-    || !data.subarray(32, 64).equals(owner.toBuffer())) throw new Error("Raydium swap token account does not match the expected wallet, mint, or token program");
+    || !data.subarray(32, 64).equals(owner.toBuffer())) throw new Error("Solana swap token account does not match the expected wallet, mint, or token program");
   return data.readBigUInt64LE(64);
 }
 

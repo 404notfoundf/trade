@@ -15,9 +15,11 @@ import { recordBlockedObservation } from "./risk.js";
 import { INDEX_TARGETS, noteIndexFailure, applyIndexTicks, snapshotRows, valuationRiskEvents, valuationView, type ValuationView } from "./valuation.js";
 import { initialPoolState, startFixedPoolMonitors, type PoolMonitorState } from "./fixed-pools.js";
 import { solveDirectPoolCandidates } from "./trading/market-registry.js";
+import { createPoolAdapter } from "./trading/pool-adapter-factory.js";
 import { DirectPoolCollector } from "./trading/direct-pool-collector.js";
 import { AggregatorShadowCollector } from "./trading/aggregator-shadow.js";
 import type { RegisteredPool } from "./trading/market-registry.js";
+import { recordAdapterPoolState } from "./trading/pool-state.js";
 
 Decimal.set({ precision: 60, rounding: Decimal.ROUND_DOWN });
 
@@ -63,9 +65,10 @@ function poolMonitorConfig(pool: RegisteredPool, config: Awaited<ReturnType<type
   const configuredAsset = config.assets.find((item) => item.instId === listing.symbol && item.chainIndex === config.marketRegistry.chains[pool.chain].chain_id.toString());
   const dex = config.marketRegistry.dexes[pool.dex]!;
   const chainIndex = config.marketRegistry.chains[pool.chain].chain_id.toString() as "196" | "501";
+  const dexName = ({ uniswap_v3: "uniswap-v3", raydium_clmm: "raydium-clmm", orca_whirlpool: "orca-whirlpool", meteora_dlmm: "meteora-dlmm" } as const)[dex.adapter];
   return {
     enabled: pool.enabled, id: pool.id, instId: listing.symbol, chainIndex,
-    dex: pool.chain === "xlayer" ? "uniswap-v3" : "raydium-clmm", address: pool.address,
+    dex: dexName, address: pool.address,
     baseTokenSymbol: pool.mode === "trade_candidate" ? pool.instrument_id : configuredAsset?.tokenSymbol ?? pool.token_in_out.asset_address, baseTokenAddress: pool.token_in_out.asset_address,
     baseTokenDecimals: pool.token_in_out.asset_decimals, quoteTokenSymbol: pool.mode === "trade_candidate" ? chainAsset.quote_asset.symbol : pool.token_in_out.quote_address === SOLANA_USDC_MINT ? "USDC" : pool.token_in_out.quote_address,
     quoteTokenAddress: pool.token_in_out.quote_address, quoteTokenDecimals: pool.token_in_out.quote_decimals,
@@ -86,16 +89,24 @@ async function main(): Promise<void> {
   const disabledRegistryPoolIds = new Set(config.marketRegistry.pools.filter((pool) => !pool.enabled).map((pool) => pool.id));
   const observeOnlyPools = config.marketdata.quoteProvider === "direct_pool"
     ? config.marketRegistry.pools.filter((pool) => pool.enabled && pool.mode === "observe_only" && pool.verified) : [];
-  const registryPoolsToMonitor = [...new Map([...directPoolCandidates, ...observeOnlyPools].map((pool) => [pool.id, pool] as const)).values()];
+  const registeredPools = [...new Map([...directPoolCandidates, ...observeOnlyPools].map((pool) => [pool.id, pool] as const)).values()];
+  const adapterWatchPools = registeredPools.filter((pool) => createPoolAdapter(pool, config.marketRegistry).stateSource === "adapter_watch");
+  const adapterWatchPoolIds = new Set(adapterWatchPools.map((pool) => pool.id));
+  const registryPoolsToMonitor = registeredPools
+    .filter((pool) => !adapterWatchPoolIds.has(pool.id));
   const registryMonitorConfigs = registryPoolsToMonitor.map((pool) => {
     const configured = config.fixedPools.find((item) => item.id === pool.id);
     return configured ? { ...configured, enabled: pool.enabled } : poolMonitorConfig(pool, config);
   });
-  const monitorPools = [...new Map([...config.fixedPools.filter((pool) => !disabledRegistryPoolIds.has(pool.id)), ...registryMonitorConfigs].map((pool) => [pool.id, pool] as const)).values()];
+  const monitorPools = [...new Map([...config.fixedPools.filter((pool) => !disabledRegistryPoolIds.has(pool.id) && !adapterWatchPoolIds.has(pool.id)), ...registryMonitorConfigs].map((pool) => [pool.id, pool] as const)).values()];
+  const adapterWatchStateConfigs = adapterWatchPools.map((pool) => poolMonitorConfig(pool, config));
   const directRpcEndpoints = new Map(registryPoolsToMonitor.map((pool) => [pool.id, {
     http: config.marketRegistry.chains[pool.chain].rpc_http, ws: config.marketRegistry.chains[pool.chain].rpc_ws,
   }] as const));
-  const poolMonitorStates = new Map(monitorPools.map((pool) => [pool.id, initialPoolState(pool)]));
+  const poolMonitorStates = new Map([
+    ...monitorPools.map((pool) => [pool.id, initialPoolState(pool)] as const),
+    ...adapterWatchStateConfigs.map((pool) => [pool.id, initialPoolState(pool, "unavailable", "Waiting for adapter-owned pool watch")] as const),
+  ]);
   const poolStateWrites = new Map<string, Promise<void>>();
   const poolStateTimers = new Map<string, NodeJS.Timeout>();
   const poolStateDirty = new Set<string>();
@@ -109,6 +120,7 @@ async function main(): Promise<void> {
   const poolStateWriteIntervalMs = 5000;
   const poolEventSampleIntervalMs = 10_000;
   let directPoolCollector: DirectPoolCollector | undefined;
+  let stopAdapterWatches: () => Promise<void> = async () => undefined;
   let aggregatorShadowCollector: AggregatorShadowCollector | undefined;
   const markDatabaseUnavailable = (error: unknown) => {
     dbOnline = false;
@@ -435,24 +447,32 @@ async function main(): Promise<void> {
     } else if (config.marketdata.aggregatorShadow) {
       setHealth("aggregator_shadow", "not_configured", "No verified direct-pool route is available to trigger shadow quotes");
     }
-    directPoolCollector = new DirectPoolCollector({
-      registry: config.marketRegistry, assets: config.assets, guardrails: config.runtime.guardrails,
-      coalesceWindowMs: config.marketdata.coalesceWindowMs,
-      observationGas: config.directPoolObservation,
-      solanaSimulationPrivateKey: config.signers.solanaSimulationPrivateKey,
-      getState: (asset, pool) => {
-        const market = markets.get(asset.instId) ?? {};
-        const route = routes.get(routeKey(asset));
-        return {
-          ...market, multiplier: route?.multiplier, pool: poolMonitorStates.get(pool.id), dbOnline,
-          // The peg gate is not a conversion quote or a verified inventory exit path.
-          quoteValuationStatus: "UNKNOWN",
-        };
-      },
-      onHealth: (poolId, status, reason) => setHealth(`direct_pool_${poolId}`, status, reason ?? null),
-      onDatabaseError: markDatabaseUnavailable,
-      onAggregatorShadow: (request) => aggregatorShadowCollector?.request(request),
-    });
+  }
+  directPoolCollector = new DirectPoolCollector({
+    registry: config.marketRegistry, assets: config.assets, guardrails: config.runtime.guardrails,
+    observeOnlyPoolIds: observeOnlyPools.map((pool) => pool.id),
+    coalesceWindowMs: config.marketdata.coalesceWindowMs,
+    observationGas: config.directPoolObservation,
+    solanaSimulationPrivateKey: config.signers.solanaSimulationPrivateKey,
+    getState: (asset, pool) => {
+      const market = markets.get(asset.instId) ?? {};
+      const route = routes.get(routeKey(asset));
+      return {
+        ...market, multiplier: route?.multiplier, pool: poolMonitorStates.get(pool.id), dbOnline,
+        // The peg gate is not a conversion quote or a verified inventory exit path.
+        quoteValuationStatus: "UNKNOWN",
+      };
+    },
+    onHealth: (poolId, status, reason) => setHealth(`direct_pool_${poolId}`, status, reason ?? null),
+    onPoolState: (poolId, event) => {
+      const state = poolMonitorStates.get(poolId);
+      if (state) enqueuePoolState(recordAdapterPoolState(state, event));
+    },
+    onDatabaseError: markDatabaseUnavailable,
+    onAggregatorShadow: (request) => aggregatorShadowCollector?.request(request),
+  });
+  stopAdapterWatches = await directPoolCollector.startAdapterWatches();
+  if (config.marketdata.quoteProvider === "direct_pool") {
     if (directPoolCandidates.length) setHealth("quote_provider", "healthy", null);
     if (observeOnlyPools.length) setHealth("direct_pool_observer", "observing", "Observe-only pools record Exact-In quotes and assumed 1:1 profit estimates; results remain NOT_EXECUTABLE");
   }
@@ -518,7 +538,7 @@ async function main(): Promise<void> {
       .catch(markDatabaseUnavailable);
   });
   const getDashboardState = (): DashboardState => ({
-    health, dbOnline, valuation, fixedPools: monitorPools.map((pool) => poolMonitorStates.get(pool.id) ?? initialPoolState(pool)),
+    health, dbOnline, valuation, fixedPools: [...monitorPools, ...adapterWatchStateConfigs].map((pool) => poolMonitorStates.get(pool.id) ?? initialPoolState(pool)),
     collection: { running: !stopping, updatedAt: Date.now() },
     routes: configuredAssets.map((asset) => {
       if (!asset.enabled) return { asset, status: "DISABLED", reason: "资产或链路线在配置中关闭", instrumentReady: false, feeReady: false, bookReady: false };
@@ -600,11 +620,11 @@ async function main(): Promise<void> {
   setInterval(() => void refreshValuation().catch((error) => setHealth("index_price", "unavailable", messageOf(error))), config.runtime.guardrails.indexPriceRefreshSeconds * 1000);
   setInterval(() => {
     for (const collector of collectors) void collector.collect().catch((error) => setHealth("collector", "unavailable", messageOf(error)));
-    void directPoolCollector?.runDue().catch((error) => setHealth("direct_pool", "unavailable", messageOf(error)));
+    if (config.marketdata.quoteProvider === "direct_pool") void directPoolCollector.runDue().catch((error) => setHealth("direct_pool", "unavailable", messageOf(error)));
   }, 250);
   setInterval(() => void tradeExecutor.tick(), 1000);
   const shutdown = async () => {
-    if (stopping) return; stopping = true; logger.info("Stopping opportunity observer"); clearInterval(dashboardStateTimer); clearInterval(poolRetentionTimer); books.forEach((book) => book.stop()); await stopFixedPoolMonitors(); await Promise.all([...poolMonitorStates.keys()].map((poolId) => flushPoolStateWrites(poolId, true))); await persistDashboardState(); if (server) server.close(); await closeDatabase().catch((error) => logger.error("Failed to close MySQL connection", error)); process.exit(0);
+    if (stopping) return; stopping = true; logger.info("Stopping opportunity observer"); clearInterval(dashboardStateTimer); clearInterval(poolRetentionTimer); books.forEach((book) => book.stop()); await stopAdapterWatches(); await stopFixedPoolMonitors(); await Promise.all([...poolMonitorStates.keys()].map((poolId) => flushPoolStateWrites(poolId, true))); await persistDashboardState(); if (server) server.close(); await closeDatabase().catch((error) => logger.error("Failed to close MySQL connection", error)); process.exit(0);
   };
   process.on("SIGINT", () => void shutdown()); process.on("SIGTERM", () => void shutdown());
 }

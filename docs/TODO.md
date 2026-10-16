@@ -23,17 +23,20 @@
 - [ ] 若固定池数量增长或历史分析负载明显增加，再评估按分钟/小时聚合或分区；当前每池最多每 10 秒采样并保留 7 天。
 - [x] 实现 X Layer QuoterV2 固定金额 `Exact-In`，结果携带 block/hash 与池状态指纹；报价使用指定 token 对和 fee tier。
 - [x] 实现 Raydium CLMM SDK 逐 Tick 固定金额 `Exact-In`；报价保存读取完成时的 slot 和状态指纹，构建/模拟时复核指纹；仅为已登记的 XNVDA 与 SPCXx observe-only 池按扩展白名单开放 Token-2022 报价，并将链上生效的 Scaled UI multiplier 用于收益比较，raw 报价仍按链上数量保存。
+- [x] 接入注册表固定的 XSPCX/USDC Orca Whirlpool observe-only 池：核对 pool/program/mints/decimals/vault/fee/tick spacing；使用官方 SDK exact-in、tick-array 状态指纹与仅模拟 unsigned swap；Token-2022 例外限定到该 Orca pool/program/mint 组合，执行状态保持 `NOT_EXECUTABLE`。
+- [x] 接入注册表固定的 XSPCX/USDC Meteora DLMM observe-only 池：锁定 LbPair/program/mints/decimals/bin step；使用官方 SDK bin-array exact-in、拒绝 partial fill、校验 unsigned swap 并仅模拟；Token-2022 例外精确限定到该 pool/program/mint 组合。Orca 与 Meteora 现由各自 Adapter 订阅池账户，断线 fail-closed，重连先快照/复核再触发报价。
+- [ ] 在已配置主网 RPC/WS 环境完成人工 Meteora 双向 quote、断线恢复和 simulation-only 验收；CI 单测不依赖主网或密钥。
 - [ ] 将 Raydium Pool State、配置、bitmap 和 Tick Array 改为单一 RPC context 校验；当前 SDK 多次 RPC 读取期间 slot 会正常推进，因此 slot 仅作读取完成标记，报价/构建/模拟通过状态指纹检查变化。
 - [x] 在 `direct_pool` 模式观察已登记的 `observe_only` 池：记录 raw Exact-In、状态版本、同规模 CEX VWAP、毛收益、CEX 手续费、固定 Gas 预算、正负观察净收益与 ROI；X Layer 按存入/赎回方向校验 ERC-4626 `asset()` 并调用 `previewDeposit`、`previewMint` 或 `previewRedeem`，不重复应用 EVM multiplier；结果写入独立决策表且保持 `NOT_EXECUTABLE`。
-- [ ] 对两链 exact-in 与独立链上只读报价执行同池、同规模交叉验证；目前没有活跃的资产/固定报价币候选，Solana Raydium 稳定币池发现结果也尚未与本地 CLMM 数学报价完成对账。完成前观察收益保持 1:1 假设标签，不作为可实现净收益，数据不写入旧 Aggregator `quote_observation` / `opportunity` 表。
+- [ ] 对两链 exact-in 与独立链上只读报价执行同池、同规模交叉验证；目前没有活跃的资产/固定报价币候选，Solana Raydium 与 Meteora 稳定币池仍需人工核验报价对账。完成前观察收益保持 1:1 假设标签，不作为可实现净收益，数据不写入旧 Aggregator `quote_observation` / `opportunity` 表。
 - [x] 固定池决策写入独立 direct-pool 表并固定为 `NOT_EXECUTABLE`；两链 unsigned swap 构造和不广播模拟接口已实现。Solana observe-only 模拟由 `config.yaml` 开关控制，并用独立 `SOLANA_SIMULATION_PRIVATE_KEY` 签名。
 
 ## 指定池架构后续阶段
 
-- [ ] 人工核验并登记其余有活跃流动性的候选直接池及真实地址、token/mint、精度、报价币和协议端点。XNVDA/USDT0 Uniswap V3 fee 100/500 池当前 `liquidity() = 0`；XAAPL 仍待后续发现。Raydium 已登记 XNVDA/USDC 和 SPCXx/USDC 为 observe-only 池；SPCXx 池为 `AHNN6JmvaGG6XUoSg7sEr38gRYDB2jTbUvqXVuqaRHpq`，启动时仍须核对链上池、mint、精度、Program ID 与 Token-2022 扩展。所有池继续保持 `NOT_EXECUTABLE`。
+- [ ] 人工核验并登记其余有活跃流动性的候选直接池及真实地址、token/mint、精度、报价币和协议端点。XNVDA/USDT0 Uniswap V3 fee 100/500 池当前 `liquidity() = 0`；XAAPL 仍待后续发现。Raydium 已登记 XNVDA/USDC 和 SPCXx/USDC、Orca 与 Meteora 已登记 XSPCX/USDC 为 observe-only 池；新增池需分别启动核验身份与 Token-2022 扩展。所有池继续保持 `NOT_EXECUTABLE`。
 - [ ] 若需扩大 Token-2022 支持范围，先逐扩展类型核验 Raydium 数学报价及真实转账语义；其他 Token-2022 mint、未知扩展与所有 Token-2022 执行仍被拒绝。
 - [ ] 若以后执行包装资产池，实现并核验 ERC-4626 deposit/redeem unsigned transaction、授权、实际费用和失败补偿；当前只实现只读 `asset()` / preview 换算，包装池继续 `observe_only` 且理由为 `wrapper_required`。
-- [ ] 需要支持 Orca、Sushi 或其他 DEX 时，按 `PoolAdapter` 的 verify/watch/quoteExactIn/buildSwap/simulateSwap 契约逐协议接入；不得在 Collector/Executor 中直接新增协议分支。
+- [ ] 需要支持 Sushi 或其他 DEX 时，按 `PoolAdapter` 的 verify/watch/quoteExactIn/buildSwap/simulateSwap 契约逐协议接入；不得在 Collector/Executor 中直接新增协议分支。
 - [ ] 如需自动充值、提币、跨链、补货或再平衡，作为指定池实时套利之外的独立结算系统设计和审核；第一期仅使用预置库存。
 - [ ] 对已人工审核的两链交易候选执行真实 build/simulate RPC smoke test；当前没有候选池和公开模拟钱包，`NOT_EXECUTABLE` 保持不变。
 - [x] 实现独立的 `aggregator_shadow` 记录和 `/direct-pools` 对照展示；按路线合并异步工作，不阻塞或替代 direct-pool 决策。

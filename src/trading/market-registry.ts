@@ -4,10 +4,31 @@ import { parse } from "yaml";
 import { pinnedQuote } from "../valuation.js";
 
 export type RegistryChainName = "xlayer" | "solana";
+export const ORCA_WHIRLPOOL_PROGRAM_ADDRESS = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+export const METEORA_DLMM_PROGRAM_ADDRESS = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+export const ORCA_XSPCX_USDC_POOL = {
+  id: "xspcx-solana-orca-whirlpool-usdc",
+  instrumentId: "XSPCX",
+  address: "ASAxmEaTT1HFe3mVC3zbKDE4tuB28W7732XQrEMBM5W2",
+  assetMint: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8",
+  quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  assetDecimals: 8,
+  quoteDecimals: 6,
+} as const;
+export const METEORA_XSPCX_USDC_POOL = {
+  id: "xspcx-solana-meteora-dlmm-usdc",
+  instrumentId: "XSPCX",
+  address: "5whNk71ua6aRtNKazDqEeAimmfzuX9epJcjh4isQKprn",
+  assetMint: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8",
+  quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  assetDecimals: 8,
+  quoteDecimals: 6,
+  binStep: 8,
+} as const;
 export type RegisteredChain = { chain_id: 196 | 501; kind: "evm" | "svm"; rpc_http: string | null; rpc_ws: string | null; native_symbol: "OKB" | "SOL" };
 export type RegisteredDex = {
   chain: RegistryChainName;
-  adapter: "uniswap_v3" | "raydium_clmm";
+  adapter: "uniswap_v3" | "raydium_clmm" | "orca_whirlpool" | "meteora_dlmm";
   quote_source: "onchain_quoter" | "local_math";
   quoter_v2?: string;
   swap_router?: string;
@@ -39,6 +60,9 @@ export type RegisteredPool = {
   address: string;
   token_in_out: { asset_address: string; asset_decimals: number; quote_address: string; quote_decimals: number };
   expected_fee_tier?: number;
+  expected_fee_rate?: number;
+  expected_tick_spacing?: number;
+  expected_bin_step?: number;
 };
 export type MarketRegistry = {
   schema_version: 1;
@@ -107,7 +131,7 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
     if (!record(raw) || (raw.chain !== "xlayer" && raw.chain !== "solana")) throw new Error(`Invalid DEX registration ${id}`);
     const expected = raw.chain === "xlayer"
       ? raw.adapter === "uniswap_v3" && raw.quote_source === "onchain_quoter"
-      : raw.adapter === "raydium_clmm" && raw.quote_source === "local_math";
+      : (raw.adapter === "raydium_clmm" || raw.adapter === "orca_whirlpool" || raw.adapter === "meteora_dlmm") && raw.quote_source === "local_math";
     if (!expected || (raw.enabled !== undefined && typeof raw.enabled !== "boolean")) throw new Error(`Unknown adapter or quote source for ${id}`);
     const dex: RegisteredDex = { chain: raw.chain, adapter: raw.adapter as RegisteredDex["adapter"], quote_source: raw.quote_source as RegisteredDex["quote_source"], enabled: raw.enabled as boolean | undefined };
     if (raw.chain === "xlayer") {
@@ -116,6 +140,12 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
       dex.factory = address(raw.factory, "xlayer", `dexes.${id}.factory`);
     } else {
       dex.program_id = address(raw.program_id, "solana", `dexes.${id}.program_id`);
+      if (raw.adapter === "orca_whirlpool" && (id !== "orca_whirlpool_solana" || dex.program_id !== ORCA_WHIRLPOOL_PROGRAM_ADDRESS)) {
+        throw new Error(`Orca Whirlpool DEX ${id} must use the pinned Solana program`);
+      }
+      if (raw.adapter === "meteora_dlmm" && (id !== "meteora_dlmm_solana" || dex.program_id !== METEORA_DLMM_PROGRAM_ADDRESS)) {
+        throw new Error(`Meteora DLMM DEX ${id} must use the pinned Solana program`);
+      }
     }
     dexes[id] = dex;
   }
@@ -172,6 +202,34 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
     if (poolKeys.has(poolKey)) throw new Error(`Duplicate instrument/chain/pool address ${poolKey}`);
     poolIds.add(id); poolKeys.add(poolKey);
     const reason = raw.reason;
+    let expected_fee_rate: number | undefined;
+    let expected_tick_spacing: number | undefined;
+    let expected_bin_step: number | undefined;
+    if (dex.adapter === "orca_whirlpool") {
+      if (id !== ORCA_XSPCX_USDC_POOL.id || instrument_id !== ORCA_XSPCX_USDC_POOL.instrumentId || chain !== "solana"
+        || poolAddress !== ORCA_XSPCX_USDC_POOL.address || assetAddress !== ORCA_XSPCX_USDC_POOL.assetMint
+        || quoteAddress !== ORCA_XSPCX_USDC_POOL.quoteMint || assetDecimals !== ORCA_XSPCX_USDC_POOL.assetDecimals
+        || quoteDecimals !== ORCA_XSPCX_USDC_POOL.quoteDecimals || raw.mode !== "observe_only" || raw.verified !== true
+        || reason !== "quote_asset_not_pinned") throw new Error(`Orca Whirlpool pool ${id} does not match the pinned XSPCX/USDC observe-only registration`);
+      if (!Number.isSafeInteger(raw.expected_fee_rate) || Number(raw.expected_fee_rate) < 1 || Number(raw.expected_fee_rate) > 65_535
+        || !Number.isSafeInteger(raw.expected_tick_spacing) || Number(raw.expected_tick_spacing) < 1 || Number(raw.expected_tick_spacing) > 65_535
+        || raw.expected_fee_tier !== undefined || raw.expected_bin_step !== undefined) throw new Error(`Pool ${id} must declare valid expected_fee_rate and expected_tick_spacing`);
+      expected_fee_rate = Number(raw.expected_fee_rate);
+      expected_tick_spacing = Number(raw.expected_tick_spacing);
+    } else if (dex.adapter === "meteora_dlmm") {
+      if (id !== METEORA_XSPCX_USDC_POOL.id || instrument_id !== METEORA_XSPCX_USDC_POOL.instrumentId || chain !== "solana"
+        || poolAddress !== METEORA_XSPCX_USDC_POOL.address || assetAddress !== METEORA_XSPCX_USDC_POOL.assetMint
+        || quoteAddress !== METEORA_XSPCX_USDC_POOL.quoteMint || assetDecimals !== METEORA_XSPCX_USDC_POOL.assetDecimals
+        || quoteDecimals !== METEORA_XSPCX_USDC_POOL.quoteDecimals || raw.mode !== "observe_only" || raw.verified !== true
+        || reason !== "quote_asset_not_pinned") throw new Error(`Meteora DLMM pool ${id} does not match the pinned XSPCX/USDC observe-only registration`);
+      if (raw.expected_bin_step !== METEORA_XSPCX_USDC_POOL.binStep || raw.expected_fee_rate !== undefined
+        || raw.expected_tick_spacing !== undefined || raw.expected_fee_tier !== undefined) {
+        throw new Error(`Pool ${id} must declare the pinned Meteora DLMM bin step only`);
+      }
+      expected_bin_step = METEORA_XSPCX_USDC_POOL.binStep;
+    } else if (raw.expected_fee_rate !== undefined || raw.expected_tick_spacing !== undefined || raw.expected_bin_step !== undefined) {
+      throw new Error(`Pool ${id} uses protocol-specific fee or bin-step fields`);
+    }
     if (raw.mode === "trade_candidate") {
       if (!raw.verified || !Number.isSafeInteger(raw.priority) || Number(raw.priority) < 0
         || typeof raw.max_notional_usdt !== "string" || !positiveDecimal.test(raw.max_notional_usdt) || Number(raw.max_notional_usdt) <= 0
@@ -191,7 +249,8 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
     }
     pools.push({ id, enabled: raw.enabled !== false, instrument_id, chain, dex: dexId, mode: raw.mode, reason: reason as RegisteredPool["reason"], verified: raw.verified,
       priority: raw.priority as number | undefined, max_notional_usdt: raw.max_notional_usdt as string | undefined,
-      address: poolAddress, token_in_out: { asset_address: assetAddress, asset_decimals: assetDecimals, quote_address: quoteAddress, quote_decimals: quoteDecimals }, expected_fee_tier });
+      address: poolAddress, token_in_out: { asset_address: assetAddress, asset_decimals: assetDecimals, quote_address: quoteAddress, quote_decimals: quoteDecimals },
+      expected_fee_tier, expected_fee_rate, expected_tick_spacing, expected_bin_step });
   }
   return { schema_version: 1, chains, cexes: { okx: { kind: "cex", enabled: okx.enabled, book_source: "websocket" } }, dexes, instruments, pools };
 }

@@ -35,6 +35,18 @@ dexes:
     quote_source: local_math
     enabled: true
     program_id: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+  orca_whirlpool_solana:
+    chain: solana
+    adapter: orca_whirlpool
+    quote_source: local_math
+    enabled: true
+    program_id: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+  meteora_dlmm_solana:
+    chain: solana
+    adapter: meteora_dlmm
+    quote_source: local_math
+    enabled: true
+    program_id: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
 
 instruments:
   - instrument_id: XAAPL
@@ -113,3 +125,26 @@ pools:
     verified: true
     address: "AHNN6JmvaGG6XUoSg7sEr38gRYDB2jTbUvqXVuqaRHpq"
     token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
+  - id: xspcx-solana-orca-whirlpool-usdc
+    enabled: true
+    instrument_id: XSPCX
+    chain: solana
+    dex: orca_whirlpool_solana
+    mode: observe_only
+    reason: quote_asset_not_pinned
+    verified: true
+    address: "ASAxmEaTT1HFe3mVC3zbKDE4tuB28W7732XQrEMBM5W2"
+    token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
+    expected_fee_rate: 500
+    expected_tick_spacing: 8
+  - id: xspcx-solana-meteora-dlmm-usdc
+    enabled: true
+    instrument_id: XSPCX
+    chain: solana
+    dex: meteora_dlmm_solana
+    mode: observe_only
+    reason: quote_asset_not_pinned
+    verified: true
+    address: "5whNk71ua6aRtNKazDqEeAimmfzuX9epJcjh4isQKprn"
+    token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
+    expected_bin_step: 8

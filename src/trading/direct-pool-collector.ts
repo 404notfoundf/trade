@@ -7,21 +7,25 @@ import { bookStale, floorToStep, vwap, type Instrument } from "../market.js";
 import type { Book } from "../okx.js";
 import type { PoolMonitorState } from "../fixed-pools.js";
 import { saveDirectPoolDecision, saveDirectPoolQuote } from "./direct-pool-storage.js";
-import { createPoolAdapter, createXLayerWrapperAdapter, PoolIdentityMismatchError, UnsupportedTokenError, type ExactInQuote, type PoolAdapter, type XLayerWrapperAdapter } from "./pool-adapters.js";
+import { createPoolAdapter } from "./pool-adapter-factory.js";
+import { createXLayerWrapperAdapter, PoolIdentityMismatchError, UnsupportedTokenError, type ExactInQuote, type PoolAdapter, type XLayerWrapperAdapter } from "./pool-adapters.js";
 import type { AggregatorShadowRequest } from "./aggregator-shadow.js";
 import { netMarginOk } from "./gates.js";
 import { solveDirectPoolCandidates, type MarketRegistry, type RegisteredPool } from "./market-registry.js";
+import { poolStateView, type AdapterPoolStateEvent } from "./pool-state.js";
 
 type MarketSnapshot = { instrument?: Instrument; feeRate?: Decimal; multiplier?: Decimal; book?: Book; pool?: PoolMonitorState; dbOnline: boolean; quoteValuationStatus: "VERIFIED" | "UNKNOWN" };
 type Route = { asset: AssetConfig; pools: RegisteredPool[]; sizeIndex: number; dueAt: number; lastScanAt: number; running: boolean };
-type AdapterState = { adapter: PoolAdapter; verified: boolean; identityMismatch: boolean; retryAt: number; retryDelayMs: number };
+type AdapterState = { adapter: PoolAdapter; verified: boolean; identityMismatch: boolean; retryAt: number; retryDelayMs: number; watchStatus: "not_required" | "healthy" | "unavailable"; watchGeneration: number; marginalPrice?: string; watchError?: string };
 type WrapperState = { adapter: XLayerWrapperAdapter; verified: boolean; identityMismatch: boolean; retryAt: number; retryDelayMs: number };
 type ScanOptions = {
   registry: MarketRegistry; assets: AssetConfig[]; guardrails: Config["runtime"]["guardrails"]; coalesceWindowMs: number;
+  observeOnlyPoolIds: string[];
   observationGas: Config["directPoolObservation"];
   solanaSimulationPrivateKey: string;
   slippageBps?: number; getState: (asset: AssetConfig, pool: RegisteredPool) => MarketSnapshot;
   onHealth: (poolId: string, status: string, reason?: string | null) => void;
+  onPoolState: (poolId: string, event: AdapterPoolStateEvent) => void;
   onDatabaseError: (error: unknown) => void;
   onAggregatorShadow?: (request: AggregatorShadowRequest) => void;
 };
@@ -41,6 +45,7 @@ export class DirectPoolCollector {
   private readonly routes = new Map<string, Route>();
   private readonly observeRoutes = new Map<string, ObserveRoute>();
   private readonly adapters = new Map<string, AdapterState>();
+  private readonly watchRoutes = new Map<string, { asset: AssetConfig; pool: RegisteredPool }>();
   private readonly wrappers = new Map<string, WrapperState>();
   private readonly lastSimulationAt = new Map<string, number>();
 
@@ -54,18 +59,25 @@ export class DirectPoolCollector {
       let route = this.routes.get(key);
       if (!route) { route = { asset, pools: [], sizeIndex: 0, dueAt: Date.now() + options.coalesceWindowMs, lastScanAt: Number.NEGATIVE_INFINITY, running: false }; this.routes.set(key, route); }
       route.pools.push(pool);
-      this.adapters.set(pool.id, { adapter: createPoolAdapter(pool, options.registry), verified: false, identityMismatch: false, retryAt: 0, retryDelayMs: 1_000 });
+      const adapter = createPoolAdapter(pool, options.registry);
+      this.adapters.set(pool.id, { adapter, verified: false, identityMismatch: false, retryAt: 0, retryDelayMs: 1_000, watchStatus: adapter.stateSource === "adapter_watch" ? "unavailable" : "not_required", watchGeneration: 0 });
+      if (adapter.stateSource === "adapter_watch") this.watchRoutes.set(pool.id, { asset, pool });
     }
     for (const route of this.routes.values()) route.pools.sort((a, b) => a.priority! - b.priority!);
-    for (const pool of options.registry.pools.filter((item) => item.enabled !== false && item.mode === "observe_only" && item.verified)) {
+    const observeOnlyPoolIds = new Set(options.observeOnlyPoolIds);
+    for (const pool of options.registry.pools.filter((item) => observeOnlyPoolIds.has(item.id) && item.enabled !== false && item.mode === "observe_only" && item.verified)) {
       const instrument = options.registry.instruments.find((item) => item.instrument_id === pool.instrument_id);
       const listing = instrument?.cex_listings.find((item) => item.venue === "okx");
       const asset = listing && options.assets.find((item) => item.instId === listing.symbol && item.okxCurrency === listing.currency && item.chainIndex === options.registry.chains[pool.chain].chain_id.toString());
       if (!asset) { options.onHealth(pool.id, "not_configured", "No matching configured asset route for this observe_only pool"); continue; }
       if (!this.adapters.has(pool.id)) {
-        try { this.adapters.set(pool.id, { adapter: createPoolAdapter(pool, options.registry), verified: false, identityMismatch: false, retryAt: 0, retryDelayMs: 1_000 }); }
+        try {
+          const adapter = createPoolAdapter(pool, options.registry);
+          this.adapters.set(pool.id, { adapter, verified: false, identityMismatch: false, retryAt: 0, retryDelayMs: 1_000, watchStatus: adapter.stateSource === "adapter_watch" ? "unavailable" : "not_required", watchGeneration: 0 });
+        }
         catch (error) { options.onHealth(pool.id, "not_configured", messageOf(error)); continue; }
       }
+      if (this.adapters.get(pool.id)!.adapter.stateSource === "adapter_watch") this.watchRoutes.set(pool.id, { asset, pool });
       if (pool.reason === "wrapper_required") {
         try { this.wrappers.set(pool.id, { adapter: createXLayerWrapperAdapter(pool, options.registry), verified: false, identityMismatch: false, retryAt: 0, retryDelayMs: 1_000 }); }
         catch (error) { options.onHealth(`${pool.id}_wrapper`, "unavailable", messageOf(error)); }
@@ -86,6 +98,49 @@ export class DirectPoolCollector {
       if (chainIndex && route.asset.chainIndex !== chainIndex) continue;
       route.dueAt = Math.min(route.dueAt, Math.max(now + this.options.coalesceWindowMs, route.lastScanAt + route.asset.dexQuoteIntervalMs));
     }
+  }
+
+  async startAdapterWatches(): Promise<() => Promise<void>> {
+    const stops: Array<() => Promise<void>> = [];
+    for (const route of this.watchRoutes.values()) {
+      const state = this.adapters.get(route.pool.id)!;
+      if (state.adapter.stateSource !== "adapter_watch" || !state.adapter.watch) throw new Error(`Pool ${route.pool.id} requires an adapter-owned watch`);
+      try {
+        stops.push(await state.adapter.watch(route.pool, {
+          onState: (snapshot) => {
+            state.watchGeneration++;
+            state.watchStatus = "healthy";
+            state.verified = true;
+            state.identityMismatch = false;
+            state.retryAt = 0;
+            state.retryDelayMs = 1_000;
+            state.marginalPrice = snapshot.marginalPrice;
+            state.watchError = undefined;
+            this.options.onPoolState(route.pool.id, { kind: "snapshot", snapshot });
+            this.options.onHealth(route.pool.id, "healthy");
+            this.markDirty(route.asset.instId, route.asset.chainIndex);
+          },
+          onUnavailable: (reason, identityMismatch = false) => {
+            state.watchGeneration++;
+            state.watchStatus = "unavailable";
+            state.marginalPrice = undefined;
+            state.watchError = reason;
+            if (identityMismatch) state.identityMismatch = true;
+            this.options.onPoolState(route.pool.id, { kind: "unavailable", reason, identityMismatch });
+            this.options.onHealth(route.pool.id, identityMismatch ? "invalid" : "unavailable", reason);
+          },
+        }));
+      } catch (error) {
+        const identityMismatch = error instanceof PoolIdentityMismatchError;
+        state.watchStatus = "unavailable";
+        state.marginalPrice = undefined;
+        state.watchError = messageOf(error);
+        state.identityMismatch = identityMismatch;
+        this.options.onPoolState(route.pool.id, { kind: "unavailable", reason: state.watchError, identityMismatch });
+        this.options.onHealth(route.pool.id, identityMismatch ? "invalid" : "unavailable", messageOf(error));
+      }
+    }
+    return async () => { await Promise.all(stops.map((stop) => stop())); };
   }
 
   async runDue(now = Date.now()): Promise<void> {
@@ -112,9 +167,12 @@ export class DirectPoolCollector {
   private async scanObserveOnly(route: ObserveRoute): Promise<void> {
     const { asset, pool } = route;
     const state = this.options.getState(asset, pool);
-    if (!state.dbOnline || state.pool?.status !== "healthy" || state.pool.connectionStatus !== "connected" || state.pool.rpcSnapshotStatus !== "healthy") return;
     const adapterState = this.adapters.get(pool.id)!;
+    const poolStatus = poolStateView(adapterState, state.pool);
+    const adapterOwnsPoolState = poolStatus.source === "adapter_watch";
+    if (!state.dbOnline || !poolStatus.healthy) return;
     if (adapterState.identityMismatch || adapterState.retryAt > Date.now()) return;
+    const watchGeneration = adapterState.watchGeneration;
     const size = asset.observationSizesUsdt[route.sizeIndex]!;
     route.sizeIndex = (route.sizeIndex + 1) % asset.observationSizesUsdt.length;
     const scanId = randomUUID();
@@ -136,7 +194,7 @@ export class DirectPoolCollector {
       const amountByDirection: Array<{ direction: ExactInQuote["direction"]; amountInRaw: bigint; expectedAssetUiMultiplier?: string }> = [
         { direction: "quote_to_asset", amountInRaw: rawAmount(quoteAmount, pool.token_in_out.quote_decimals) },
       ];
-      const marginalPrice = state.pool.marginalPrice ? new Decimal(state.pool.marginalPrice) : null;
+      const marginalPrice = poolStatus.marginalPrice ? new Decimal(poolStatus.marginalPrice) : null;
       let intendedAssetAmountRaw: bigint | null = null;
       const book = state.book;
       const instrument = state.instrument;
@@ -165,6 +223,9 @@ export class DirectPoolCollector {
         let observed: { quote: ExactInQuote; quoteId: number } | null = null;
         try {
           const quote = await adapterState.adapter.quoteExactIn(pool, { ...input, slippageBps: this.options.slippageBps ?? 50 });
+          if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) {
+            return;
+          }
           let quoteId: number;
           try { quoteId = await saveDirectPoolQuote({
             scanId, instrumentId: pool.instrument_id, chainIndex: asset.chainIndex, poolId: pool.id, dex: pool.dex, direction,
@@ -194,7 +255,9 @@ export class DirectPoolCollector {
           })) return;
           if (identityMismatch || unsupportedToken) break;
         }
-        if (observed) await this.recordObserveDecision(route, scanId, size, direction, observed.quoteId, observed.quote, state, targetShares);
+        if (observed && (!adapterOwnsPoolState || (adapterState.watchStatus === "healthy" && adapterState.watchGeneration === watchGeneration))) {
+          await this.recordObserveDecision(route, scanId, size, direction, observed.quoteId, observed.quote, state, targetShares, watchGeneration);
+        }
       }
     } catch (error) {
       const identityMismatch = error instanceof PoolIdentityMismatchError;
@@ -206,7 +269,8 @@ export class DirectPoolCollector {
         adapterState.retryDelayMs = Math.min(adapterState.retryDelayMs * 2, 30_000);
       }
       this.options.onHealth(pool.id, identityMismatch ? "invalid" : "unavailable", failureReason);
-      const directions: Direction[] = ["dex_buy_cex_sell", ...(state.pool.marginalPrice ? ["cex_buy_dex_sell" as const] : [])];
+      const hasMarginalPrice = !!poolStatus.marginalPrice;
+      const directions: Direction[] = ["dex_buy_cex_sell", ...(hasMarginalPrice ? ["cex_buy_dex_sell" as const] : [])];
       await Promise.all(directions.map((direction) => persist({
         scanId, instrumentId: pool.instrument_id, chainIndex: asset.chainIndex, poolId: pool.id, dex: pool.dex, direction,
         amountInRaw: null, amountOutRaw: null, minimumAmountOutRaw: null, priceImpactPercent: null,
@@ -244,8 +308,11 @@ export class DirectPoolCollector {
     }
   }
 
-  private async recordObserveDecision(route: ObserveRoute, scanId: string, size: number, direction: Direction, quoteId: number, quote: ExactInQuote, initial: MarketSnapshot, intendedCexShares: Decimal | null): Promise<void> {
+  private async recordObserveDecision(route: ObserveRoute, scanId: string, size: number, direction: Direction, quoteId: number, quote: ExactInQuote, initial: MarketSnapshot, intendedCexShares: Decimal | null, watchGeneration: number): Promise<void> {
     const { asset, pool } = route;
+    const adapterState = this.adapters.get(pool.id)!;
+    const adapterOwnsPoolState = adapterState.adapter.stateSource === "adapter_watch";
+    if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) return;
     let cexShares: Decimal | null = null;
     let cexFill: ReturnType<typeof vwap> = null;
     let cexFee: Decimal | null = null;
@@ -310,6 +377,7 @@ export class DirectPoolCollector {
     }
     const highImpact = new Decimal(quote.priceImpactPercent).abs().gt(this.options.guardrails.maxDexPriceImpactPercent);
     const simulation = await this.simulateObservedSwap(route, direction, size, quote, net, invested, reason, highImpact);
+    if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) return;
     const cexSnapshot = cexFill && cexShares ? {
       side: direction === "cex_buy_dex_sell" ? "asks" : "bids",
       quantity: cexShares.toString(),
@@ -341,7 +409,10 @@ export class DirectPoolCollector {
     blockReason: string | null, highImpact: boolean,
   ): Promise<SimulationOutcome> {
     const { pool, asset } = route;
-    if (pool.chain !== "solana" || pool.dex !== "raydium-clmm" || pool.mode !== "observe_only") {
+    const adapterState = this.adapters.get(pool.id)!;
+    if (adapterState.adapter.stateSource === "adapter_watch" && adapterState.watchStatus !== "healthy") return { status: "SKIPPED", reason: "POOL_WATCH_UNAVAILABLE", at: null };
+    if (pool.chain !== "solana" || pool.mode !== "observe_only" || !pool.verified
+      || this.options.registry.dexes[pool.dex]?.chain !== "solana" || !this.adapters.has(pool.id)) {
       return { status: "NOT_APPLICABLE", reason: null, at: null };
     }
     if (!this.options.observationGas.simulationEnabled) return { status: "DISABLED", reason: null, at: null };
@@ -368,6 +439,7 @@ export class DirectPoolCollector {
     const at = new Date();
     try {
       const swap = await adapter.buildSwap(pool, { quote, wallet: signer.publicKey.toBase58(), simulationOnly: true });
+      if (adapterState.adapter.stateSource === "adapter_watch" && adapterState.watchStatus !== "healthy") return { status: "SKIPPED", reason: "POOL_WATCH_UNAVAILABLE", at: null };
       const result = await adapter.simulateSwap(pool, swap, signer);
       return {
         status: result.ok ? "PASSED" : result.skipped ? "SKIPPED" : "FAILED",
@@ -423,9 +495,12 @@ export class DirectPoolCollector {
       for (const pool of route.pools) {
         const adapterState = this.adapters.get(pool.id)!;
         const state = this.options.getState(asset, pool);
-        const poolHealthy = state.pool?.status === "healthy" && state.pool.connectionStatus === "connected" && state.pool.rpcSnapshotStatus === "healthy";
+        const poolStatus = poolStateView(adapterState, state.pool);
+        const adapterOwnsPoolState = adapterState.adapter.stateSource === "adapter_watch";
+        const watchGeneration = adapterState.watchGeneration;
+        const poolHealthy = poolStatus.healthy;
         if (adapterState.identityMismatch) { blockReason = "POOL_IDENTITY_MISMATCH_REARM_REQUIRED"; attempts.push(`${pool.id}:identity_mismatch`); continue; }
-        if (!poolHealthy) { blockReason = state.pool?.lastError ? "POOL_STATE_UNHEALTHY" : "POOL_NOT_READY"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }
+        if (!poolHealthy) { blockReason = poolStatus.error ? "POOL_STATE_UNHEALTHY" : "POOL_NOT_READY"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }
         const currentBook = state.book;
         if (!currentBook?.ready || bookStale(currentBook) || currentBook.seqId !== book.seqId) { blockReason = "CEX_BOOK_CHANGED_OR_STALE"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }
         const notional = direction === "cex_buy_dex_sell" ? askFill.notional : new Decimal(size);
@@ -455,6 +530,11 @@ export class DirectPoolCollector {
               failureCode: null, failureReason: null, rawResponse: quote.raw,
             });
           } catch (error) { this.options.onDatabaseError(error); throw error; }
+          if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) {
+            blockReason = "POOL_STATE_CHANGED";
+            attempts.push(`${pool.id}:pool_state_changed`);
+            continue;
+          }
           const latest = this.options.getState(asset, pool);
           if (!latest.book?.ready || bookStale(latest.book) || latest.book.seqId !== book.seqId) { blockReason = "CEX_BOOK_CHANGED_OR_STALE"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }
           if (latest.quoteValuationStatus !== "VERIFIED") { blockReason = "QUOTE_VALUATION_UNKNOWN"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }

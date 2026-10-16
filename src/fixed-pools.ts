@@ -71,7 +71,7 @@ export async function startFixedPoolMonitors(pools: FixedPoolConfig[], options: 
     let stopCurrent: (() => Promise<void>) | undefined;
     const attempt = async () => {
     try {
-        stopCurrent = pool.chainIndex === "196" ? await startEvmPool(pool, options) : await startSolanaPool(pool, options);
+        stopCurrent = pool.chainIndex === "196" ? await startEvmPool(pool, options) : await startRaydiumClmmPool(pool, options);
         retryDelay = 1000;
       } catch (error) {
         const invalid = error instanceof PoolIdentityError;
@@ -312,7 +312,7 @@ async function validateEvmPool(pool: FixedPoolConfig, url: string, blockNumber: 
   return token0 === base;
 }
 
-async function startSolanaPool(pool: FixedPoolConfig, options: MonitorOptions): Promise<() => Promise<void>> {
+async function startRaydiumClmmPool(pool: FixedPoolConfig, options: MonitorOptions): Promise<() => Promise<void>> {
   const endpoint = options.rpcEndpoints?.get(pool.id);
   const wsUrl = endpoint ? endpoint.ws : process.env.SOLANA_RPC_WS;
   const httpUrl = endpoint ? endpoint.http ?? "" : process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
@@ -322,7 +322,7 @@ async function startSolanaPool(pool: FixedPoolConfig, options: MonitorOptions): 
   }
   let address: string;
   try { address = new PublicKey(pool.address).toBase58(); }
-  catch { throw new PoolIdentityError("Solana pool address is not a valid public key"); }
+  catch { throw new PoolIdentityError("Raydium CLMM pool address is not a valid public key"); }
   let socket: WebSocket | undefined;
   let subscriptionId: number | undefined;
   let stopped = false;
@@ -358,7 +358,7 @@ async function startSolanaPool(pool: FixedPoolConfig, options: MonitorOptions): 
   const processAccount = (data: Buffer, owner: string, slot: number, source: string): boolean => {
     // shortcut: Solana account notifications expose slots but not same-slot ordering; rely on ordered WebSocket delivery unless transaction-level history is required.
     if (slot < lastSlot) return false;
-    if (owner !== pool.expectedProgramId) throw new PoolIdentityError("Solana pool owner program does not match the fixed-pool allowlist");
+    if (owner !== pool.expectedProgramId) throw new PoolIdentityError("Raydium CLMM pool owner program does not match the fixed-pool allowlist");
     if (!isRaydiumPoolStateLayout(data)) throw new PoolIdentityError("Raydium CLMM pool account length or discriminator does not match the pinned PoolState layout (" + data.length + " bytes)");
     const mint0 = new PublicKey(data.subarray(73, 105)).toBase58();
     const mint1 = new PublicKey(data.subarray(105, 137)).toBase58();
@@ -366,10 +366,10 @@ async function startSolanaPool(pool: FixedPoolConfig, options: MonitorOptions): 
     const decimals1 = data[234]!;
     const baseIsToken0 = mint0 === pool.baseTokenAddress;
     const matches = (baseIsToken0 && mint1 === pool.quoteTokenAddress) || (mint0 === pool.quoteTokenAddress && mint1 === pool.baseTokenAddress);
-    if (!matches) throw new PoolIdentityError("Solana pool mint addresses do not match the fixed-pool allowlist");
+    if (!matches) throw new PoolIdentityError("Raydium CLMM pool mint addresses do not match the fixed-pool allowlist");
     const baseDecimals = baseIsToken0 ? decimals0 : decimals1;
     const quoteDecimals = baseIsToken0 ? decimals1 : decimals0;
-    if (baseDecimals !== pool.baseTokenDecimals || quoteDecimals !== pool.quoteTokenDecimals) throw new PoolIdentityError("Solana pool mint decimals do not match the fixed-pool allowlist");
+    if (baseDecimals !== pool.baseTokenDecimals || quoteDecimals !== pool.quoteTokenDecimals) throw new PoolIdentityError("Raydium CLMM pool mint decimals do not match the fixed-pool allowlist");
     const liquidity = readU128LE(data, 237);
     const sqrtPrice = readU128LE(data, 253);
     const hash = createHash("sha256").update(data).digest("hex");

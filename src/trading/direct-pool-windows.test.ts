@@ -6,6 +6,7 @@ import {
   countPositiveWindows,
   DIRECT_POOL_MAX_CUSTOM_RANGE_MS,
   DIRECT_POOL_WINDOW_GAP_MS,
+  directPoolQuoteBackUrl,
   isWindowCoverageComplete,
   parseDirectPoolRange,
   parsePageNumber,
@@ -84,6 +85,17 @@ test("UTC+8 custom range parsing validates calendar dates, bounds, and safe page
   assert.equal(parseDirectPoolRange(new URLSearchParams({ range: "custom", from: "2026-10-15T08:00", to: "2026-10-15T08:00" }), now).invalid, true);
   assert.equal(parsePageNumber("9007199254740993"), 1);
   assert.equal(parsePageNumber("02"), 1);
+});
+
+test("quote detail back links retain the selected pool", () => {
+  assert.equal(
+    directPoolQuoteBackUrl(new URLSearchParams("pool=meteora-pool&page=2&range=24h")),
+    "/direct-pools/quotes?range=24h&page=2&pool=meteora-pool",
+  );
+  assert.equal(
+    directPoolQuoteBackUrl(new URLSearchParams("back=decisions&pool=orca-pool&profit=positive&direction=dex_buy_cex_sell")),
+    "/direct-pools/decisions?range=1h&pool=orca-pool&profit=positive&direction=dex_buy_cex_sell",
+  );
 });
 
 test("015 migration stores and backfills pool_id without deriving it from attempts", async () => {

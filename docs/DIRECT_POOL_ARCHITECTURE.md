@@ -2,7 +2,7 @@
 
 > 状态：已确认设计；实现进度与待办见 [TODO](TODO.md)。  
 > 日期：2026-10-14  
-> 范围：OKX CEX、X Layer Uniswap V3、Solana Raydium CLMM 的指定池观察与报价第一期。
+> 范围：OKX CEX、X Layer Uniswap V3、Solana Raydium CLMM，以及固定 XSPCX/USDC Orca Whirlpool 与 Meteora DLMM 的指定池观察与报价第一期。
 
 ## 1. 背景
 
@@ -20,6 +20,9 @@ Solana 指定 Raydium CLMM 池状态 ─────────┘
                  └─ direct_pool_quote
 ```
 
+Orca Whirlpool 通过独立 Adapter 汇入同一观察链路，不经过 Raydium 池状态解析。
+Meteora DLMM 也由独立 Adapter 订阅固定 LbPair 并用官方 SDK 报价；两个 Adapter 的断线均 fail-closed。
+
 策略只在本地 CEX 簿、池状态和一次指定池 exact-in quote 都有效时做决策。它不依赖 Aggregator 为系统发现路径，也不允许 Aggregator 的限速队列阻塞报价。
 
 ## 2. 已确认决策
@@ -27,7 +30,7 @@ Solana 指定 Raydium CLMM 池状态 ─────────┘
 | 主题 | 决策 |
 | --- | --- |
 | CEX | 第一阶段只实现 OKX；注册表允许未来登记其他 CEX。 |
-| 链与协议 | 同时支持 X Layer Uniswap V3 和 Solana Raydium CLMM；两者独立 Adapter。 |
+| 链与协议 | 支持 X Layer Uniswap V3、Solana Raydium CLMM，以及固定 XSPCX/USDC Orca Whirlpool、Meteora DLMM；各协议使用独立 Adapter。 |
 | DEX 路径 | 单池、单跳、固定 Router/Program、固定 token 对；禁止多跳、拆单和未知 Router 路径。 |
 | 多池 | 每方向按配置中的固定优先级依次尝试。主池不赚钱或不可用时可尝试下一池；不按实时最优收益动态选路。 |
 | X Layer quote | 经已验证 QuoterV2 用 `eth_call` 执行 `quoteExactInputSingle`。 |
@@ -61,7 +64,8 @@ Solana 指定 Raydium CLMM 池状态 ─────────┘
 - 不自动处理 wrap/unwrap、充值、提币、跨链桥、库存补货或再平衡。
 - 不支持多跳、拆单、动态最优路由、自动发现池或自动加入新池。
 - 不把边际价（`slot0`/Pool State 当前价格）当作固定金额成交价。
-- Token-2022 不作为交易候选；仅登记的 XNVDA/USDC 与 SPCXx/USDC Raydium observe-only 池可按明确扩展白名单报价和模拟。其他 Token-2022 mint、未知扩展、转账费、启用中的 transfer hook 和暂停 mint 均拒绝。
+- Token-2022 不作为交易候选；仅登记的 XNVDA/USDC 与 SPCXx/USDC Raydium、固定 XSPCX/USDC Orca 和 Meteora observe-only 池可按各自明确扩展白名单报价和模拟。其他 Token-2022 mint、未知扩展、转账费、启用中的 transfer hook 和暂停 mint 均拒绝。
+- Orca Whirlpool 与 Meteora DLMM 的池健康由各自 Adapter 订阅、校验和重连，不交给只识别 Raydium Pool State 布局的固定池监听器。
 
 ## 4. 配置模型
 
@@ -241,7 +245,10 @@ type ExactInQuote = {
 
 interface PoolAdapter {
   verify(pool: RegisteredPool): Promise<void>;
-  watch(pool: RegisteredPool, onState: (state: PoolState) => void): Promise<() => Promise<void>>;
+  watch?(pool: RegisteredPool, callbacks: {
+    onState(state: { slot: bigint; observedAt: number; stateFingerprint: string; marginalPrice?: string }): void;
+    onUnavailable(reason: string, identityMismatch?: boolean): void;
+  }): Promise<() => Promise<void>>;
   quoteExactIn(input: QuoteInput): Promise<ExactInQuote>;
   buildSwap(input: VerifiedExecutionInput): Promise<UnsignedSwap>;
   simulateSwap(input: UnsignedSwap): Promise<SimulationResult>;
@@ -267,6 +274,12 @@ interface PoolAdapter {
 - 对该池用同批 RPC context 读取 Clock 与 mint，按链上时间选取当前有效 Scaled UI multiplier；池计算、报价存储和最低输出继续使用链上 raw 数量，CEX 股数/收益和 Dashboard 展示换算为 UI 数量。
 - `observe_only` 是硬边界：Token-2022 池只能在模拟开关开启时构造 simulation-only 指令并模拟，不能广播，也不能因只读报价或模拟成功而提升为 `trade_candidate`。
 - 网络费来自构造交易后的 fee 与 priority fee 估算；未知费用不能进入可执行资格。
+
+Raydium 固定监听器只解析 Raydium CLMM `PoolState`；不得复用来读取 Orca Whirlpool 或 Meteora DLMM 账户。
+
+### 5.5 Orca Whirlpool 与 Meteora DLMM Adapter
+
+两个固定 observe-only 池由各自 Adapter 订阅主账户（Orca Whirlpool / Meteora LbPair），健康恢复前先做 RPC 快照和身份复核。账户变化只触发合并报价，不解释为逐笔 swap；exact-in 报价分别由官方协议 SDK 和所需 tick/bin arrays 完成。DLMM 部分消耗、账户 owner 或固定 mint/bin-step 身份不符时关闭报价。两者只构造 simulation-only unsigned swap，不广播。
 
 ## 6. 状态、新鲜度与报价调度
 

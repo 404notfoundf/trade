@@ -33,29 +33,36 @@ TypeScript 本机服务：读取配置中 OKX 现货交易对的盘口、X Layer
 
 ### 在 Ubuntu 上用 Docker 运行
 
-Ubuntu 主机不需要安装 Node.js，但需要安装 Docker Engine；应用镜像内含 Node.js 24。MySQL 仍需单独提供，并允许容器连接。Docker Engine 安装步骤见 [Docker 官方 Ubuntu 文档](https://docs.docker.com/engine/install/ubuntu/)。
+Ubuntu 主机不需要安装 Node.js，但需要安装 Docker Engine；应用镜像内含 Node.js 24。Docker Engine 安装步骤见 [Docker 官方 Ubuntu 文档](https://docs.docker.com/engine/install/ubuntu/)。
 
-在项目根目录构建 Linux 镜像。若 Ubuntu 是 x86-64，使用 `linux/amd64`；若是 ARM64，改成 `linux/arm64`。也可以把源码传到 Ubuntu，在 Ubuntu 上直接运行 `docker build`，无需在主机安装 Node.js。
+仓库的 `compose.yaml` 会在同一个 Compose 网络中启动应用和 MySQL 8.4，应用通过服务名 `mysql` 连接数据库。先准备 `mysql.env`、`.env` 和 `config.yaml`；首次配置时可从示例复制，再填写本机凭证：
 
 ```sh
-docker build --platform linux/amd64 -t trade-observer:latest .
-docker save -o trade-observer.tar trade-observer:latest
+cp -n mysql.env.example mysql.env
+cp -n .env.example .env
+cp -n config.example.yaml config.yaml
 ```
 
-若镜像是在其他机器构建的，将 `trade-observer.tar` 传到 Ubuntu 后运行 `docker load -i trade-observer.tar`；若在 Ubuntu 构建则跳过保存、传输和加载步骤。在应用目录中安全放置本机的 `config.yaml` 和 `.env`（不要把它们打进镜像）。先在数据库尚未应用迁移时运行迁移，再启动服务：
+在 `config.yaml` 中设置 `mysql.host: mysql`、`mysql.port: 3306`、`mysql.user: root` 和对应的 root 密码。MySQL 数据保存在 `mysql_data` 命名卷中；`MYSQL_ROOT_HOST: "%"` 允许 root 远程登录。MySQL 已初始化过的数据卷不会因修改 `mysql.env` 自动更新账号密码。不要运行 `docker compose down -v`，否则会删除数据库卷。
+
+在 Ubuntu 项目目录填写好配置后运行：
 
 ```sh
 mkdir -p logs
-docker run --rm --user "$(id -u):$(id -g)" --env-file .env \
-  -v "$PWD/config.yaml:/app/config.yaml:ro" \
-  trade-observer:latest node dist/migrate.js
-docker run -d --name trade-observer --restart unless-stopped \
-  --user "$(id -u):$(id -g)" --env-file .env -p 3000:3000 \
-  -v "$PWD/config.yaml:/app/config.yaml:ro" -v "$PWD/logs:/app/logs" \
-  trade-observer:latest
+docker compose build app
+docker compose up -d mysql
+docker compose run --rm app node dist/migrate.js
 ```
 
-若 MySQL 运行在 Ubuntu 主机上，`config.yaml` 里的 `mysql.host` 不能写 `127.0.0.1`，因为容器中的回环地址指向容器自身；请改为容器可访问的主机地址。端口映射要与 `config.yaml` 中的服务端口一致。服务会在容器内监听所有网卡，发布到公网的端口请用服务器防火墙限制来源。启动后访问 `http://<Ubuntu服务器地址>:3000`。
+确认迁移成功后，若旧的独立应用容器 `trade-observer` 还在运行，先执行 `docker stop trade-observer` 释放 3000 端口，再启动 Compose 应用：
+
+```sh
+docker compose up -d app
+docker compose ps
+docker compose logs -f app
+```
+
+应用更新后运行 `docker compose up -d --build app`。Compose 会自动把应用和 MySQL 放在同一网络，应用始终使用 `mysql:3306`；MySQL 的 `3306:3306` 和应用的 `3000:3000` 仍发布到宿主机。远程客户端可访问 `<Ubuntu服务器公网IP>:3306`，网页访问 `http://<Ubuntu服务器地址>:3000`。云安全组应限制 3306 的来源 IP；Docker 发布的端口可能绕过 UFW 规则。公网开放 root 登录风险较高。若需保留旧版回滚，验证新服务前不要删除已停止的旧容器。
 
 ### 用新方法开始只读观察
 

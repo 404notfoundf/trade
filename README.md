@@ -31,6 +31,32 @@ TypeScript 本机服务：读取配置中 OKX 现货交易对的盘口、X Layer
 5. 一体启动仍可运行 `npm run dev`，生产构建后运行 `npm start`。需要采集和前端分开时，在两个终端分别运行 `npm run dev:collector` 与 `npm run dev:dashboard`；生产环境先 `npm run build`，再分别运行 `npm run start:collector` 与 `npm run start:dashboard`。
 6. 打开 `http://127.0.0.1:3000`。独立看板从 MySQL 读取历史数据和最近一次状态；采集器停止后，页面仍可访问，但新观察不会产生，路线状态会显示为未知。独立看板只读，交易开关仍由一体启动方式提供。
 
+### 在 Ubuntu 上用 Docker 运行
+
+Ubuntu 主机不需要安装 Node.js，但需要安装 Docker Engine；应用镜像内含 Node.js 24。MySQL 仍需单独提供，并允许容器连接。Docker Engine 安装步骤见 [Docker 官方 Ubuntu 文档](https://docs.docker.com/engine/install/ubuntu/)。
+
+在项目根目录构建 Linux 镜像。若 Ubuntu 是 x86-64，使用 `linux/amd64`；若是 ARM64，改成 `linux/arm64`。也可以把源码传到 Ubuntu，在 Ubuntu 上直接运行 `docker build`，无需在主机安装 Node.js。
+
+```sh
+docker build --platform linux/amd64 -t trade-observer:latest .
+docker save -o trade-observer.tar trade-observer:latest
+```
+
+若镜像是在其他机器构建的，将 `trade-observer.tar` 传到 Ubuntu 后运行 `docker load -i trade-observer.tar`；若在 Ubuntu 构建则跳过保存、传输和加载步骤。在应用目录中安全放置本机的 `config.yaml` 和 `.env`（不要把它们打进镜像）。先在数据库尚未应用迁移时运行迁移，再启动服务：
+
+```sh
+mkdir -p logs
+docker run --rm --user "$(id -u):$(id -g)" --env-file .env \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  trade-observer:latest node dist/migrate.js
+docker run -d --name trade-observer --restart unless-stopped \
+  --user "$(id -u):$(id -g)" --env-file .env -p 3000:3000 \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" -v "$PWD/logs:/app/logs" \
+  trade-observer:latest
+```
+
+若 MySQL 运行在 Ubuntu 主机上，`config.yaml` 里的 `mysql.host` 不能写 `127.0.0.1`，因为容器中的回环地址指向容器自身；请改为容器可访问的主机地址。端口映射要与 `config.yaml` 中的服务端口一致。服务会在容器内监听所有网卡，发布到公网的端口请用服务器防火墙限制来源。启动后访问 `http://<Ubuntu服务器地址>:3000`。
+
 ### 用新方法开始只读观察
 
 1. 将 `.env.example` 中的 direct-pool RPC 配置（`XLAYER_RPC_HTTP/WS`、`SOLANA_RPC_URL/WS`）补齐或更新到现有 `.env`，保留已有 API 密钥并避免重复定义变量；也可替换为自己的 RPC。协议部署地址已固定登记在 `market-registry.yaml`。只读观察不需要私钥；启用 Solana 模拟时才配置 `SOLANA_SIMULATION_PRIVATE_KEY`。当前公开端点适合开始观察，持续运行时可能限流；对应项缺失时该链会显示 `not_configured`。

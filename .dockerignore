@@ -1,0 +1,10 @@
+.git
+.harness
+.idea
+node_modules
+dist
+logs
+test
+.env
+.env.*
+config.yaml

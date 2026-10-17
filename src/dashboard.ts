@@ -599,6 +599,7 @@ body = `<section class="overview"><h2>机会窗口</h2><p>数据库共 ${allCoun
     } catch (error) { logger.error(`Dashboard request failed: ${request.url ?? "/"}`, error); response.writeHead(500, { "content-type": "text/plain; charset=utf-8" }); response.end(error instanceof Error ? error.message : "unknown error"); }
   });
   server.on("error", (error) => { logger.error("Dashboard HTTP server failed", error); if (!server.listening) process.exit(1); });
-  server.listen(config.port, "127.0.0.1", () => logger.info(`Observer UI listening on http://127.0.0.1:${config.port}`));
+  const host = process.env.DASHBOARD_HOST || "127.0.0.1";
+  server.listen(config.port, host, () => logger.info(`Observer UI listening on http://${host}:${config.port}`));
   return server;
 }

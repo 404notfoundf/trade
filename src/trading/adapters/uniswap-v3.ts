@@ -13,9 +13,9 @@ export class UniswapV3Adapter implements PoolAdapter {
   private assetDecimals = 0;
   private quoteDecimals = 0;
 
-  constructor(private readonly registry: MarketRegistry, dexId: string) {
-    const dex = registry.dexes[dexId];
-    const rpc = registry.chains.xlayer.rpc_http;
+  constructor(private readonly registry: MarketRegistry, pool: RegisteredPool) {
+    const dex = registry.dexes[pool.dex];
+    const rpc = pool.rpc_http;
     if (!dex || !rpc) throw new Error("X Layer direct-pool RPC or DEX registration is not configured");
     this.dex = dex;
     this.provider = new JsonRpcProvider(rpc);

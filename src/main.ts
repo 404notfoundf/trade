@@ -101,7 +101,7 @@ async function main(): Promise<void> {
   const monitorPools = [...new Map([...config.fixedPools.filter((pool) => !disabledRegistryPoolIds.has(pool.id) && !adapterWatchPoolIds.has(pool.id)), ...registryMonitorConfigs].map((pool) => [pool.id, pool] as const)).values()];
   const adapterWatchStateConfigs = adapterWatchPools.map((pool) => poolMonitorConfig(pool, config));
   const directRpcEndpoints = new Map(registryPoolsToMonitor.map((pool) => [pool.id, {
-    http: config.marketRegistry.chains[pool.chain].rpc_http, ws: config.marketRegistry.chains[pool.chain].rpc_ws,
+    http: pool.rpc_http, ws: pool.rpc_ws,
   }] as const));
   const poolMonitorStates = new Map([
     ...monitorPools.map((pool) => [pool.id, initialPoolState(pool)] as const),

@@ -96,7 +96,7 @@ export class XLayerWrapperAdapter {
 
   constructor(registry: MarketRegistry, pool: RegisteredPool) {
     if (pool.chain !== "xlayer" || pool.reason !== "wrapper_required") throw new Error(`Pool ${pool.id} is not a configured X Layer wrapper pool`);
-    const rpc = registry.chains.xlayer.rpc_http;
+    const rpc = pool.rpc_http;
     const underlying = registry.instruments.find((item) => item.instrument_id === pool.instrument_id)?.chain_assets.find((item) => item.chain === "xlayer");
     if (!rpc || !underlying) throw new Error("X Layer wrapper RPC or underlying asset registration is missing");
     this.provider = new JsonRpcProvider(rpc);

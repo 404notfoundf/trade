@@ -1,14 +1,72 @@
 import BN from "bn.js";
 import Decimal from "decimal.js";
-import { Percentage, ReadOnlyWallet } from "@orca-so/common-sdk";
+import type { Address } from "@coral-xyz/anchor";
+import { AddressUtil, Percentage, ReadOnlyWallet, type ParsableEntity, type SimpleAccountFetchOptions, type SimpleAccountFetcher } from "@orca-so/common-sdk";
 import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, unpackAccount } from "@solana/spl-token";
-import { Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, SystemProgram, Transaction } from "@solana/web3.js";
-import { buildWhirlpoolClient, IGNORE_CACHE, ORCA_WHIRLPOOL_PROGRAM_ID, swapQuoteByInputToken, UseFallbackTickArray, WhirlpoolContext, type SwapQuote, type WhirlpoolData } from "@orca-so/whirlpools-sdk";
+import { Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, SystemProgram, Transaction, type AccountInfo } from "@solana/web3.js";
+import { buildDefaultAccountFetcher, buildWhirlpoolClient, IGNORE_CACHE, ORCA_WHIRLPOOL_PROGRAM_ID, swapQuoteByInputToken, UseFallbackTickArray, WhirlpoolContext, type SwapQuote, type WhirlpoolData, type WhirlpoolSupportedTypes } from "@orca-so/whirlpools-sdk";
 import { solanaRpcFetch } from "../../solana-rpc-logging.js";
 import { ORCA_WHIRLPOOL_PROGRAM_ADDRESS, ORCA_XSPCX_USDC_POOL, type MarketRegistry, type RegisteredPool } from "../market-registry.js";
 import { simulateSolanaSwap } from "../raydium-simulator.js";
 import { PoolIdentityMismatchError, UnsupportedTokenError, assertExecutionInput, assertOrcaSwapTransaction, createSolanaSimulationTransaction, errorMessage, expectedDecimals, extensionName, fingerprintOrcaState, impactFromOrcaSqrtPrice, isScopedToken2022Pool, minimumOut, orcaInputMint, orcaQuotePerAsset, orcaTickArrayAddresses, readSolanaTokenState, startSolanaAccountWatch, validateSolanaTokenSupport } from "../pool-adapters.js";
 import type { ExactInQuote, PoolAdapter, PoolWatchCallbacks, QuoteInput, SolanaMintState, SwapBuildInput, SwapSimulationResult, UnsignedSwap } from "../pool-adapters.js";
+
+export function createOrcaContext(connection: Connection, wallet: ReadOnlyWallet) {
+  const orcaFetcher = buildDefaultAccountFetcher(connection);
+  const batchFetcher = orcaFetcher.fetcher as SimpleAccountFetcher<WhirlpoolSupportedTypes, SimpleAccountFetchOptions>;
+  // Orca common-sdk 0.7.1 detaches rejected batch RPC calls in an async Promise executor.
+  // shortcut: array batch reads bypass the SDK cache; revisit if this adapter needs cached array reads.
+  const fetchParsedAccounts = async <T extends WhirlpoolSupportedTypes>(
+    addresses: Address[], parser: ParsableEntity<T>, timeoutInSeconds = 10,
+  ) => {
+    const keys = AddressUtil.toPubKeys(addresses);
+    const accounts: Array<AccountInfo<Buffer> | null> = [];
+    for (let index = 0; index < keys.length; index += 100) {
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("connection.getMultipleAccountsInfo timeout")), timeoutInSeconds * 1000);
+        });
+        accounts.push(...await Promise.race([
+          connection.getMultipleAccountsInfo(keys.slice(index, index + 100), "confirmed"), timeoutPromise,
+        ]));
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    }
+    if (accounts.length !== keys.length) throw new Error("Orca batch account read returned an incomplete result");
+    return { keys, parsed: keys.map((key, index) => parser.parse(key, accounts[index])) };
+  };
+  batchFetcher.getAccounts = async <T extends WhirlpoolSupportedTypes>(
+    addresses: Address[], parser: ParsableEntity<T>, opts?: { maxAge?: number; timeoutInSeconds?: number }, now = Date.now(),
+  ) => {
+    const addressStrs = AddressUtil.toStrings(addresses);
+    const maxAge = opts?.maxAge ?? batchFetcher.retentionPolicy.get(parser as ParsableEntity<WhirlpoolSupportedTypes>) ?? Number.POSITIVE_INFINITY;
+    const missing = addressStrs.filter((address) => {
+      const cached = batchFetcher.cache.get(address);
+      return !cached || now - cached.fetchedAt > maxAge;
+    });
+    if (missing.length) {
+      const { keys, parsed } = await fetchParsedAccounts(missing, parser, opts?.timeoutInSeconds);
+      const fetched = new Map<string, T | null>();
+      parsed.forEach((value, index) => fetched.set(keys[index]!.toBase58(), value));
+      batchFetcher.populateAccounts(fetched, parser, now);
+    }
+    const result = new Map<string, T | null>();
+    addressStrs.forEach((address) => result.set(address, batchFetcher.cache.get(address)?.value as T | null | undefined ?? null));
+    return result;
+  };
+  batchFetcher.getAccountsAsArray = async <T extends WhirlpoolSupportedTypes>(
+    addresses: Address[], parser: ParsableEntity<T>, opts?: { maxAge?: number; timeoutInSeconds?: number }, now = Date.now(),
+  ) => {
+    const { keys, parsed } = await fetchParsedAccounts(addresses, parser, opts?.timeoutInSeconds);
+    const parsedMap = new Map<string, T | null>();
+    parsed.forEach((value, index) => parsedMap.set(keys[index]!.toBase58(), value));
+    batchFetcher.populateAccounts(parsedMap, parser, now);
+    return parsed;
+  };
+  return WhirlpoolContext.from(connection, wallet, orcaFetcher, undefined, {}, ORCA_WHIRLPOOL_PROGRAM_ID);
+}
 
 export class OrcaWhirlpoolAdapter implements PoolAdapter {
   readonly stateSource = "adapter_watch" as const;
@@ -18,14 +76,14 @@ export class OrcaWhirlpoolAdapter implements PoolAdapter {
   private readonly dex: NonNullable<MarketRegistry["dexes"][string]>;
   private readonly wsUrl: string | null;
 
-  constructor(registry: MarketRegistry, dexId: string) {
-    const dex = registry.dexes[dexId];
-    const rpc = registry.chains.solana.rpc_http;
+  constructor(registry: MarketRegistry, pool: RegisteredPool) {
+    const dex = registry.dexes[pool.dex];
+    const rpc = pool.rpc_http;
     if (!dex || !rpc || dex.program_id !== ORCA_WHIRLPOOL_PROGRAM_ADDRESS) throw new Error("Solana RPC or pinned Orca Whirlpool Program ID is not configured");
     this.dex = dex;
-    this.wsUrl = registry.chains.solana.rpc_ws;
-    this.connection = new Connection(rpc, { commitment: "confirmed", wsEndpoint: registry.chains.solana.rpc_ws ?? undefined, fetch: solanaRpcFetch, disableRetryOnRateLimit: true });
-    this.context = WhirlpoolContext.from(this.connection, new ReadOnlyWallet(PublicKey.default), undefined, undefined, {}, ORCA_WHIRLPOOL_PROGRAM_ID);
+    this.wsUrl = pool.rpc_ws;
+    this.connection = new Connection(rpc, { commitment: "confirmed", wsEndpoint: pool.rpc_ws ?? undefined, fetch: solanaRpcFetch, disableRetryOnRateLimit: true });
+    this.context = createOrcaContext(this.connection, new ReadOnlyWallet(PublicKey.default));
     this.client = buildWhirlpoolClient(this.context);
   }
 
@@ -149,7 +207,7 @@ export class OrcaWhirlpoolAdapter implements PoolAdapter {
     if (input.simulationOnly !== true) throw new Error("Orca swaps can only be built for simulation");
     await this.verify(pool);
     const wallet = new PublicKey(input.wallet);
-    const context = WhirlpoolContext.from(this.connection, new ReadOnlyWallet(wallet), undefined, undefined, {}, ORCA_WHIRLPOOL_PROGRAM_ID);
+    const context = createOrcaContext(this.connection, new ReadOnlyWallet(wallet));
     const client = buildWhirlpoolClient(context);
     const { whirlpool, data, quote } = await this.exactInQuote(client, context, pool, input.quote.direction, input.quote.amountInRaw);
     const state = await fingerprintOrcaState(this.connection, pool, data, orcaTickArrayAddresses(quote));

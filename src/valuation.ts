@@ -1,4 +1,5 @@
 import Decimal from "decimal.js";
+import { calculateProfit, type ProfitCostBreakdown, type ProfitCostInput, type ProfitDirection, type ProfitValuationStatus } from "./profit-calculation.js";
 
 export const ETH_CHAIN = "1";
 export const XLAYER_CHAIN = "196";
@@ -168,21 +169,49 @@ export type ValuationDecision = {
   nativeAmount: string; nativeSymbol: string; usdtRate: string | null; conversionCostUsdt: string | null; usdtEstimate: string | null;
   grossProfitUsdt: string | null; netProfitUsdt: string | null; valuationStatus: "VERIFIED" | "UNKNOWN"; priceSourceTime: Date | null;
   quoteSummary: string | null; reasonCode: string | null; reason: string | null; usdtLeg: string | null;
+  costBreakdown: ProfitCostBreakdown[]; totalCostsUsdt: string | null; investedUsdt: string | null; capitalAtRiskUsdt: string | null; roi: string | null;
+  calculationReasonCode: string | null;
 };
 
-export function decideValuation(input: {
-  chainIndex: string; quoteTokenAddress: string; direction: "cex_buy_dex_sell" | "dex_buy_cex_sell"; quoteAmount: Decimal;
-  cexCost: Decimal; cexFee: Decimal; gasUsdt: Decimal | null; now: number; maxAgeMs: number;
+type DecisionInput = {
+  chainIndex: string; quoteTokenAddress: string; direction: ProfitDirection; quoteAmount: Decimal;
+  cexCost: Decimal; cexFee: Decimal; gasUsdt: Decimal | null; cexFeeSource?: string; networkFeeSource?: string;
+  additionalCosts?: ProfitCostInput[]; now: number; maxAgeMs: number;
   maxUsdtUsdDeviationPercent: number; maxUsdt0UsdtDeviationPercent: number;
-}): ValuationDecision {
+};
+
+function calculationFor(input: DecisionInput, dexQuoteAmountUsdt: Decimal, valuationStatus: ProfitValuationStatus) {
+  return calculateProfit({
+    direction: input.direction, cexNotionalUsdt: input.cexCost, dexQuoteAmountUsdt, valuationStatus,
+    costs: [
+      { kind: "cex_fee", amountUsdt: input.cexFee, source: input.cexFeeSource ?? "cex_fee_rate" },
+      { kind: "network_fee", amountUsdt: input.gasUsdt, source: input.networkFeeSource ?? "network_fee_estimate" },
+      ...(input.additionalCosts ?? []),
+    ],
+  });
+}
+
+function calculationFields(calculation: ReturnType<typeof calculateProfit>) {
+  return {
+    grossProfitUsdt: calculation.grossProfitUsdt?.toString() ?? null,
+    costBreakdown: calculation.costBreakdown,
+    totalCostsUsdt: calculation.totalCostsUsdt?.toString() ?? null,
+    netProfitUsdt: calculation.netProfitUsdt?.toString() ?? null,
+    investedUsdt: calculation.investedUsdt?.toString() ?? null,
+    capitalAtRiskUsdt: calculation.capitalAtRiskUsdt?.toString() ?? null,
+    roi: calculation.roi?.toString() ?? null,
+    calculationReasonCode: calculation.uncomputableReason,
+  };
+}
+
+export function decideValuation(input: DecisionInput): ValuationDecision {
   const pinned = pinnedQuote(input.chainIndex);
   const nativeSymbol = pinned?.symbol ?? "UNKNOWN";
-  const unknown = (code: string, reason: string, sourceTime: number | null, sameUnit = false): ValuationDecision => {
-    const gross = sameUnit ? (input.direction === "cex_buy_dex_sell" ? input.quoteAmount.minus(input.cexCost) : input.cexCost.minus(input.quoteAmount)) : null;
-    const net = gross === null || input.gasUsdt === null ? null : gross.minus(input.cexFee).minus(input.gasUsdt);
+  const unknown = (code: string, reason: string, sourceTime: number | null): ValuationDecision => {
+    const calculation = calculationFor(input, input.quoteAmount, "UNKNOWN");
     return {
       nativeAmount: input.quoteAmount.toString(), nativeSymbol, usdtRate: null, conversionCostUsdt: null, usdtEstimate: null,
-      grossProfitUsdt: gross?.toString() ?? null, netProfitUsdt: net?.toString() ?? null, valuationStatus: "UNKNOWN",
+      ...calculationFields(calculation), valuationStatus: "UNKNOWN",
       priceSourceTime: sourceTime === null ? null : new Date(sourceTime), quoteSummary: reason.slice(0, 500), reasonCode: code, reason, usdtLeg: null,
     };
   };
@@ -190,10 +219,10 @@ export function decideValuation(input: {
     return unknown(input.chainIndex === XLAYER_CHAIN ? "USDT0_PROTOCOL_MISMATCH" : "USDT_CONVERSION_UNAVAILABLE", input.chainIndex === XLAYER_CHAIN ? "X Layer quote token does not match pinned official USDT0" : "Quote token is not pinned official USDT", null);
   }
   const view = valuationView(input.now, { maxUsdtUsdDeviationPercent: input.maxUsdtUsdDeviationPercent, maxUsdt0UsdtDeviationPercent: input.maxUsdt0UsdtDeviationPercent, indexPriceMaxAgeMs: input.maxAgeMs });
-  if (view.usdtUsd.status !== "healthy") return unknown(view.usdtUsd.code, view.usdtUsd.reason, view.usdtUsd.sourceTime, input.chainIndex === SOLANA_CHAIN);
+  if (view.usdtUsd.status !== "healthy") return unknown(view.usdtUsd.code, view.usdtUsd.reason, view.usdtUsd.sourceTime);
   if (input.chainIndex === SOLANA_CHAIN) {
-    if (view.solUsdt.status !== "healthy") return unknown(view.solUsdt.code, view.solUsdt.reason, view.solUsdt.sourceTime, true);
-    if (!input.quoteAmount.gt(0)) return unknown("USDT_CONVERSION_UNAVAILABLE", "Solana USDT amount is not positive", view.solUsdt.sourceTime, true);
+    if (view.solUsdt.status !== "healthy") return unknown(view.solUsdt.code, view.solUsdt.reason, view.solUsdt.sourceTime);
+    if (!input.quoteAmount.isFinite() || !input.quoteAmount.gt(0)) return unknown("USDT_CONVERSION_UNAVAILABLE", "Solana USDT amount is not positive", view.solUsdt.sourceTime);
     return settle(input, nativeSymbol, input.quoteAmount, new Decimal(0), new Decimal(1), Math.min(view.usdtUsd.sourceTime ?? input.now, view.solUsdt.sourceTime ?? input.now), "Solana native USDT identity; no USDT0 reserve check");
   }
   if (view.parity.status !== "healthy") return unknown(view.parity.code, view.parity.reason, view.parity.sourceTime ?? view.usdtUsd.sourceTime);
@@ -201,12 +230,12 @@ export function decideValuation(input: {
   return settle(input, nativeSymbol, input.quoteAmount, new Decimal(0), new Decimal(1), Math.min(view.usdtUsd.sourceTime ?? input.now, view.usdt0.sourceTime ?? input.now), "USDT0 is valued 1:1 with USDT; cross-chain fees are excluded");
 }
 
-function settle(input: { direction: "cex_buy_dex_sell" | "dex_buy_cex_sell"; quoteAmount: Decimal; cexCost: Decimal; cexFee: Decimal; gasUsdt: Decimal | null }, nativeSymbol: string, usdtAmount: Decimal, conversionCost: Decimal, rate: Decimal, sourceTime: number, summary: string): ValuationDecision {
-  const gross = input.direction === "cex_buy_dex_sell" ? usdtAmount.minus(input.cexCost) : input.cexCost.minus(usdtAmount);
-  const net = input.gasUsdt === null ? null : gross.minus(input.cexFee).minus(input.gasUsdt);
+function settle(input: DecisionInput, nativeSymbol: string, usdtAmount: Decimal, conversionCost: Decimal, rate: Decimal, sourceTime: number, summary: string): ValuationDecision {
+  const calculation = calculationFor(input, usdtAmount, "VERIFIED");
+  const fields = calculationFields(calculation);
   return {
     nativeAmount: input.quoteAmount.toString(), nativeSymbol, usdtRate: rate.toString(), conversionCostUsdt: conversionCost.toString(),
-    usdtEstimate: net?.toString() ?? null, grossProfitUsdt: gross.toString(), netProfitUsdt: net?.toString() ?? null, valuationStatus: "VERIFIED",
+    usdtEstimate: fields.netProfitUsdt, ...fields, valuationStatus: "VERIFIED",
     priceSourceTime: new Date(sourceTime), quoteSummary: summary.slice(0, 500), reasonCode: null, reason: null, usdtLeg: usdtAmount.toString(),
   };
 }

@@ -85,10 +85,10 @@ export async function saveQuoteObservations(rows: QuoteObservation[]): Promise<v
         } else {
           await connection.execute(`INSERT INTO opportunity
             (quote_observation_id,inst_id,chain_index,observed_at,direction,size_usdt,net_profit_usdt,roi,peak_profit_usdt,executable_status,execution_buffer_usdt,executable_profit_usdt,execution_reason,ever_executable)
-            VALUES (?,?,?,UTC_TIMESTAMP(3),?,?,?,?,?,?,?,?,?,?)`, [
+            SELECT ?,?,?,q.observed_at,?,?,?,?,?,?,?,?,?,? FROM quote_observation q WHERE q.id=?`, [
             result.insertId, row.instId, row.chainIndex, row.direction, String(row.sizeUsdt), profit, row.roi, profit,
             row.executableStatus, row.executionBufferUsdt, row.executableProfitUsdt, row.executionReason,
-            row.executableStatus === "EXECUTABLE" ? 1 : 0,
+            row.executableStatus === "EXECUTABLE" ? 1 : 0, result.insertId,
           ]);
         }
       } else if (row.valuationStatus !== "VERIFIED" || row.status !== "OK") {

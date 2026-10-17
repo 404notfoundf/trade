@@ -1,6 +1,6 @@
 # Meteora DLMM SPCXx/USDC 接入设计
 
-> 状态：代码实现与离线测试已完成，待主网手工验收。  
+> 状态：代码实现与离线测试已完成；主网手工验收待完成。本文已归档。
 > 日期：2026-10-16  
 > 范围：将一个固定的 Meteora DLMM SPCXx/USDC 池接入 direct-pool 观察、exact-in 报价和 Solana simulation-only 验证；同时将现有 Orca Whirlpool 的池状态订阅迁入 Adapter 边界。  
 > 非目标：真实交易、自动选池、自动发现池、多跳路由、历史 swap 回放。
@@ -238,6 +238,6 @@ SPCXx 是 Token-2022 mint。修改 `src/trading/pool-adapters.ts` 时：
 - 不广播、不授权、不转账、不补充库存；
 - 不在本期补历史事件或构建通用跨协议账户解码框架。
 
-## 10. 实现后文档归档
+## 10. 文档归档
 
-实现、自动化验收和主网手工验证均完成后，将本文移动到 `docs/archive/`，并在 `docs/archive/README.md` 写入文件名、完成状态和保留原因，遵守仓库的文档归档规则。
+代码实现与离线验收完成后，本文按仓库规则移至 `docs/archive/`。主网手工验收仍待完成，后续进度记在 [归档索引](README.md)。

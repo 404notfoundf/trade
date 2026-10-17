@@ -16,12 +16,12 @@ export class RaydiumClmmAdapter implements PoolAdapter {
   private readonly raydium = new Map<string, Promise<Raydium>>();
   private readonly dex: NonNullable<MarketRegistry["dexes"][string]>;
 
-  constructor(private readonly registry: MarketRegistry, dexId: string) {
-    const dex = registry.dexes[dexId];
-    const rpc = registry.chains.solana.rpc_http;
+  constructor(private readonly registry: MarketRegistry, pool: RegisteredPool) {
+    const dex = registry.dexes[pool.dex];
+    const rpc = pool.rpc_http;
     if (!dex || !dex.program_id || !rpc) throw new Error("Solana RPC or Raydium CLMM Program ID is not configured");
     this.dex = dex;
-    this.connection = new Connection(rpc, { commitment: "confirmed", wsEndpoint: registry.chains.solana.rpc_ws ?? undefined, fetch: solanaRpcFetch, disableRetryOnRateLimit: true });
+    this.connection = new Connection(rpc, { commitment: "confirmed", wsEndpoint: pool.rpc_ws ?? undefined, fetch: solanaRpcFetch, disableRetryOnRateLimit: true });
   }
 
   private sdk(owner = PublicKey.default): Promise<Raydium> {

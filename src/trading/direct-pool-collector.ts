@@ -3,9 +3,11 @@ import bs58 from "bs58";
 import Decimal from "decimal.js";
 import { Keypair } from "@solana/web3.js";
 import type { AssetConfig, Config } from "../config.js";
-import { bookStale, floorToStep, vwap, type Instrument } from "../market.js";
+import { bookObservationStale, bookStale, floorToStep, vwap, type Instrument } from "../market.js";
 import type { Book } from "../okx.js";
 import type { PoolMonitorState } from "../fixed-pools.js";
+import { logger } from "../logger.js";
+import { calculateProfit } from "../profit-calculation.js";
 import { saveDirectPoolDecision, saveDirectPoolQuote } from "./direct-pool-storage.js";
 import { createPoolAdapter } from "./pool-adapter-factory.js";
 import { createXLayerWrapperAdapter, PoolIdentityMismatchError, UnsupportedTokenError, type ExactInQuote, type PoolAdapter, type XLayerWrapperAdapter } from "./pool-adapters.js";
@@ -40,6 +42,25 @@ type SimulationOutcome = {
 const messageOf = (error: unknown) => error instanceof Error ? error.message.replace(/https?:\/\/[^\s"'<>]+/g, "[rpc endpoint]").slice(0, 500) : "unknown quote error";
 const directDirection = (direction: Direction) => direction === "cex_buy_dex_sell" ? "asset_to_quote" as const : "quote_to_asset" as const;
 const rawAmount = (amount: Decimal, decimals: number) => BigInt(amount.mul(new Decimal(10).pow(decimals)).floor().toFixed(0));
+const solanaQuoteLogHeartbeatMs = 60_000;
+const lastSolanaQuoteLogs = new Map<string, { signature: string; loggedAt: number; suppressed: number; changed: boolean }>();
+function logSolanaQuote(pool: RegisteredPool, scanId: string, quoteId: number, direction: Direction, quote: ExactInQuote, requestMs: number): void {
+  if (pool.chain !== "solana") return;
+  const key = `${pool.id}/${direction}`;
+  const signature = `${quote.amountInRaw}/${quote.amountOutRaw}`;
+  const now = Date.now();
+  const previous = lastSolanaQuoteLogs.get(key);
+  if (previous && now - previous.loggedAt < solanaQuoteLogHeartbeatMs) {
+    if (signature !== previous.signature) previous.changed = true;
+    previous.suppressed++;
+    return;
+  }
+  const changed = previous?.changed || previous?.signature !== signature;
+  const reason = !previous ? "initial" : changed ? "quote_changed" : "heartbeat";
+  const suppressed = previous?.suppressed ?? 0;
+  lastSolanaQuoteLogs.set(key, { signature, loggedAt: now, suppressed: 0, changed: false });
+  logger.info(`[solana-quote] scan_id=${scanId} quote_id=${quoteId} pool_id=${pool.id} dex=${pool.dex} direction=${direction} log_reason=${reason} suppressed=${suppressed} amount_in_raw=${quote.amountInRaw} amount_out_raw=${quote.amountOutRaw} quote_slot=${quote.version.slot?.toString() ?? "unknown"} state_fingerprint=${quote.version.stateFingerprint ?? "unknown"} quoted_at=${new Date(quote.quotedAt).toISOString()} request_ms=${requestMs}`);
+}
 
 export class DirectPoolCollector {
   private readonly routes = new Map<string, Route>();
@@ -202,7 +223,7 @@ export class DirectPoolCollector {
       const cexAssetMultiplier = pool.chain === "solana"
         ? assetUiMultiplier
         : new Decimal(1);
-      const targetShares = book?.ready && !bookStale(book) && instrument
+      const targetShares = book?.ready && !bookObservationStale(book) && instrument
         && book.asks[0] && book.bids[0]
         ? floorToStep(quoteAmount.div(new Decimal(book.asks[0]!.price).plus(book.bids[0]!.price).div(2)), instrument.lotSz)
         : null;
@@ -226,15 +247,17 @@ export class DirectPoolCollector {
           if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) {
             return;
           }
+          const requestMs = Date.now() - startedAt;
           let quoteId: number;
           try { quoteId = await saveDirectPoolQuote({
             scanId, instrumentId: pool.instrument_id, chainIndex: asset.chainIndex, poolId: pool.id, dex: pool.dex, direction,
             amountInRaw: quote.amountInRaw, amountOutRaw: quote.amountOutRaw, minimumAmountOutRaw: quote.minimumAmountOutRaw,
             priceImpactPercent: quote.priceImpactPercent, networkFeeNativeRaw: quote.networkFeeNativeRaw, networkFeeUsdt: quote.networkFeeUsdt,
             blockNumber: quote.version.blockNumber ?? null, blockHash: quote.version.blockHash ?? null, slot: quote.version.slot ?? null,
-            poolStateFingerprint: quote.version.stateFingerprint, quotedAt: new Date(quote.quotedAt), requestMs: Date.now() - startedAt,
+            poolStateFingerprint: quote.version.stateFingerprint, quotedAt: new Date(quote.quotedAt), requestMs,
             status: "OK", failureCode: null, failureReason: null, rawResponse: quote.raw,
           }); } catch (error) { this.options.onDatabaseError(error); return; }
+          logSolanaQuote(pool, scanId, quoteId, direction, quote, requestMs);
           observed = { quote, quoteId };
         } catch (error) {
           const identityMismatch = error instanceof PoolIdentityMismatchError;
@@ -244,6 +267,7 @@ export class DirectPoolCollector {
           else {
             adapterState.retryAt = Date.now() + adapterState.retryDelayMs;
             adapterState.retryDelayMs = Math.min(adapterState.retryDelayMs * 2, 30_000);
+            route.dueAt = Math.min(route.dueAt, adapterState.retryAt);
           }
           this.options.onHealth(pool.id, identityMismatch ? "invalid" : "unavailable", failureReason);
           if (!await persist({
@@ -253,7 +277,7 @@ export class DirectPoolCollector {
             poolStateFingerprint: null, quotedAt: new Date(), requestMs: Date.now() - startedAt, status: "FAILED",
             failureCode: identityMismatch ? "POOL_IDENTITY_MISMATCH" : unsupportedToken ? error.failureCode : "EXACT_IN_QUOTE_FAILED", failureReason, rawResponse: null,
           })) return;
-          if (identityMismatch || unsupportedToken) break;
+          if (identityMismatch || unsupportedToken || Date.now() < adapterState.retryAt) break;
         }
         if (observed && (!adapterOwnsPoolState || (adapterState.watchStatus === "healthy" && adapterState.watchGeneration === watchGeneration))) {
           await this.recordObserveDecision(route, scanId, size, direction, observed.quoteId, observed.quote, state, targetShares, watchGeneration);
@@ -267,6 +291,7 @@ export class DirectPoolCollector {
       else {
         adapterState.retryAt = Date.now() + adapterState.retryDelayMs;
         adapterState.retryDelayMs = Math.min(adapterState.retryDelayMs * 2, 30_000);
+        route.dueAt = Math.min(route.dueAt, adapterState.retryAt);
       }
       this.options.onHealth(pool.id, identityMismatch ? "invalid" : "unavailable", failureReason);
       const hasMarginalPrice = !!poolStatus.marginalPrice;
@@ -319,8 +344,10 @@ export class DirectPoolCollector {
     let gross: Decimal | null = null;
     let net: Decimal | null = null;
     let invested: Decimal | null = null;
+    let calculation: ReturnType<typeof calculateProfit> | null = null;
     const gasBudget = new Decimal(pool.chain === "solana" ? this.options.observationGas.solanaSwapGasUsdt
       : direction === "cex_buy_dex_sell" ? this.options.observationGas.xlayerWrapThenSwapGasUsdt : this.options.observationGas.xlayerSwapThenUnwrapGasUsdt);
+    const rebalanceCost = asset.rebalanceCostUsdtPerTrade === undefined ? null : new Decimal(asset.rebalanceCostUsdtPerTrade);
     let conversion: Record<string, string> = {};
     let underlyingRaw = direction === "cex_buy_dex_sell" ? quote.amountInRaw : quote.amountOutRaw;
     let reason: string | null = null;
@@ -343,7 +370,7 @@ export class DirectPoolCollector {
     const feeRate = current.feeRate;
     if (!reason) {
       if (!book?.ready) reason = "CEX_BOOK_UNAVAILABLE";
-      else if (bookStale(book)) reason = "CEX_BOOK_STALE";
+      else if (bookObservationStale(book)) reason = "CEX_BOOK_STALE";
       else if (!instrument) reason = "CEX_INSTRUMENT_UNAVAILABLE";
       else if (!feeRate?.isFinite() || feeRate.lt(0)) reason = "CEX_FEE_UNAVAILABLE";
       else if (initial.instrument && (current.instrument?.instId !== initial.instrument.instId || current.instrument.lotSz !== initial.instrument.lotSz || current.instrument.minSz !== initial.instrument.minSz)) reason = "CEX_INSTRUMENT_CHANGED";
@@ -369,9 +396,18 @@ export class DirectPoolCollector {
           const quoteAmount = direction === "cex_buy_dex_sell"
             ? new Decimal(quote.amountOutRaw.toString()).div(new Decimal(10).pow(pool.token_in_out.quote_decimals))
             : new Decimal(quote.amountInRaw.toString()).div(new Decimal(10).pow(pool.token_in_out.quote_decimals));
-          gross = direction === "cex_buy_dex_sell" ? quoteAmount.minus(cexFill.notional) : cexFill.notional.minus(quoteAmount);
-          net = gross.minus(cexFee).minus(gasBudget);
-          invested = direction === "cex_buy_dex_sell" ? cexFill.notional : quoteAmount;
+          calculation = calculateProfit({
+            direction, cexNotionalUsdt: cexFill.notional, dexQuoteAmountUsdt: quoteAmount, valuationStatus: "ASSUMED",
+            costs: [
+              { kind: "cex_fee", amountUsdt: cexFee, source: "cex_fee_rate" },
+              { kind: "network_fee", amountUsdt: gasBudget, source: "config.direct_pool_observation" },
+              ...(rebalanceCost === null ? [] : [{ kind: "rebalance" as const, amountUsdt: rebalanceCost, source: "config.rebalanceCostUsdtPerTrade" }]),
+            ],
+          });
+          gross = calculation.grossProfitUsdt;
+          net = calculation.netProfitUsdt;
+          invested = calculation.investedUsdt;
+          if (calculation.uncomputableReason) reason = `PROFIT_CALCULATION_${calculation.uncomputableReason}`;
         }
       }
     }
@@ -390,10 +426,10 @@ export class DirectPoolCollector {
       cexSeqId: book?.seqId ?? null, cexBid: book?.bids[0]?.price ?? null, cexAsk: book?.asks[0]?.price ?? null,
       cexVwap: cexFill?.vwap.toString() ?? null, cexFeeUsdt: cexFee?.toString() ?? null,
       dexNetworkFeeUsdt: null, gasBudgetUsdt: gasBudget.toString(),
-      valuationInputs: { quoteMint: pool.token_in_out.quote_address, quoteToUsdt: "ASSUMED_1_TO_1", wrapper: conversion, cex: cexSnapshot, assetUiMultiplier: quote.assetUiMultiplier, backedMultiplierApplied: pool.chain === "xlayer" ? null : "1", gasBudgetUsdt: gasBudget.toString(), gasSource: "config.direct_pool_observation", priceImpactPercent: quote.priceImpactPercent },
+      valuationInputs: { quoteMint: pool.token_in_out.quote_address, quoteToUsdt: "ASSUMED_1_TO_1", wrapper: conversion, cex: cexSnapshot, cexBookLiveness: book ? { receivedAt: book.receivedAt, exchangeTime: book.exchangeTime, streamAliveAt: book.streamAliveAt ?? null } : null, assetUiMultiplier: quote.assetUiMultiplier, backedMultiplierApplied: pool.chain === "xlayer" ? null : "1", gasBudgetUsdt: gasBudget.toString(), gasSource: "config.direct_pool_observation", rebalanceCostUsdt: rebalanceCost?.toString() ?? null, costBreakdown: calculation?.costBreakdown ?? [], calculationReasonCode: calculation?.uncomputableReason ?? null, priceImpactPercent: quote.priceImpactPercent },
       grossProfitUsdt: gross?.toString() ?? null, netProfitUsdt: net?.toString() ?? null,
-      roi: net && invested?.gt(0) ? net.div(invested).toString() : null,
-      valuationStatus: net === null ? "UNKNOWN" : "ASSUMED_1_TO_1",
+      roi: calculation?.roi?.toString() ?? null,
+      valuationStatus: "ASSUMED_1_TO_1",
       decisionStatus: reason ? "BLOCKED" : highImpact ? "HIGH_PRICE_IMPACT" : "OBSERVED",
       blockReason: reason ?? (highImpact ? "PRICE_IMPACT_OVER_LIMIT_OBSERVATION_ONLY" : null),
       simulationStatus: simulation.status, simulationReason: simulation.reason,
@@ -489,7 +525,7 @@ export class DirectPoolCollector {
     this.options.onAggregatorShadow?.({ scanId, asset, sizeUsdt: size, book, assetAmountRaw, quoteAmountRaw });
 
     for (const direction of ["cex_buy_dex_sell", "dex_buy_cex_sell"] as const) {
-      let selected: { quoteId: number; poolId: string; quote: ExactInQuote; gross: Decimal; net: Decimal; cexVwap: Decimal; cexFee: Decimal; invested: Decimal } | undefined;
+      let bestQuote: { quoteId: number; poolId: string; quote: ExactInQuote; calculation: ReturnType<typeof calculateProfit>; cexVwap: Decimal; cexFee: Decimal } | undefined;
       let blockReason = "NO_VALID_POOL_QUOTE";
       const attempts: string[] = [];
       for (const pool of route.pools) {
@@ -530,6 +566,7 @@ export class DirectPoolCollector {
               failureCode: null, failureReason: null, rawResponse: quote.raw,
             });
           } catch (error) { this.options.onDatabaseError(error); throw error; }
+          logSolanaQuote(pool, scanId, quoteId, direction, quote, requestMs);
           if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) {
             blockReason = "POOL_STATE_CHANGED";
             attempts.push(`${pool.id}:pool_state_changed`);
@@ -540,14 +577,30 @@ export class DirectPoolCollector {
           if (latest.quoteValuationStatus !== "VERIFIED") { blockReason = "QUOTE_VALUATION_UNKNOWN"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }
           if (new Decimal(quote.priceImpactPercent).abs().gt(this.options.guardrails.maxDexPriceImpactPercent)) { blockReason = "PRICE_IMPACT_LIMIT"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }
           if (quote.networkFeeUsdt === null) { blockReason = "NETWORK_FEE_UNKNOWN"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }
-          const quoteAmount = new Decimal(quote.amountOutRaw.toString()).div(new Decimal(10).pow(direction === "cex_buy_dex_sell" ? asset.quoteTokenDecimals : asset.tokenDecimals));
-          const cexShares = direction === "cex_buy_dex_sell" ? targetShares : floorToStep(quoteAmount.mul(multiplier), instrument.lotSz);
+          const dexQuoteAmount = new Decimal((direction === "cex_buy_dex_sell" ? quote.amountOutRaw : quote.amountInRaw).toString()).div(new Decimal(10).pow(asset.quoteTokenDecimals));
+          const dexAssetAmount = new Decimal((direction === "cex_buy_dex_sell" ? quote.amountInRaw : quote.amountOutRaw).toString()).div(new Decimal(10).pow(asset.tokenDecimals));
+          const cexShares = direction === "cex_buy_dex_sell" ? targetShares : floorToStep(dexAssetAmount.mul(multiplier), instrument.lotSz);
           const fill = direction === "cex_buy_dex_sell" ? askFill : vwap(book.bids, cexShares);
           if (!fill || cexShares.lt(instrument.minSz)) { blockReason = "CEX_DEPTH_INSUFFICIENT"; attempts.push(`${pool.id}:${blockReason.toLowerCase()}`); continue; }
           const cexFee = fill.notional.mul(feeRate);
-          const gross = direction === "cex_buy_dex_sell" ? quoteAmount.minus(fill.notional) : fill.notional.minus(new Decimal(size));
-          const net = gross.minus(cexFee).minus(quote.networkFeeUsdt);
-          if (net.gt(0)) { selected = { quoteId, poolId: pool.id, quote, gross, net, cexVwap: fill.vwap, cexFee, invested: direction === "cex_buy_dex_sell" ? fill.notional : new Decimal(size) }; blockReason = "SELECTED"; break; }
+          const rebalanceCost = asset.rebalanceCostUsdtPerTrade === undefined ? null : new Decimal(asset.rebalanceCostUsdtPerTrade);
+          const calculation = calculateProfit({
+            direction, cexNotionalUsdt: fill.notional, dexQuoteAmountUsdt: dexQuoteAmount, valuationStatus: "VERIFIED",
+            costs: [
+              { kind: "cex_fee", amountUsdt: cexFee, source: "cex_fee_rate" },
+              { kind: "network_fee", amountUsdt: new Decimal(quote.networkFeeUsdt), source: "adapter_network_fee_quote" },
+              ...(rebalanceCost === null ? [] : [{ kind: "rebalance" as const, amountUsdt: rebalanceCost, source: "config.rebalanceCostUsdtPerTrade" }]),
+            ],
+          });
+          const gross = calculation.grossProfitUsdt;
+          const net = calculation.netProfitUsdt;
+          if (calculation.uncomputableReason || !gross || !net) {
+            blockReason = `PROFIT_CALCULATION_${calculation.uncomputableReason ?? "UNAVAILABLE"}`;
+            attempts.push(`${pool.id}:${blockReason.toLowerCase()}`);
+            continue;
+          }
+          if (net.gt(0)) { bestQuote = { quoteId, poolId: pool.id, quote, calculation, cexVwap: fill.vwap, cexFee }; blockReason = "SELECTED"; break; }
+          if (!bestQuote || net.gt(bestQuote.calculation.netProfitUsdt!)) bestQuote = { quoteId, poolId: pool.id, quote, calculation, cexVwap: fill.vwap, cexFee };
           blockReason = "NO_NET_OPPORTUNITY";
           attempts.push(`${pool.id}:no_net_opportunity`);
         } catch (error) {
@@ -561,6 +614,7 @@ export class DirectPoolCollector {
           } else {
             adapterState.retryAt = Date.now() + adapterState.retryDelayMs;
             adapterState.retryDelayMs = Math.min(adapterState.retryDelayMs * 2, 30_000);
+            route.dueAt = Math.min(route.dueAt, adapterState.retryAt);
             blockReason = unsupportedToken ? error.failureCode : "EXACT_IN_QUOTE_FAILED";
             this.options.onHealth(pool.id, "unavailable", failureReason);
           }
@@ -577,20 +631,26 @@ export class DirectPoolCollector {
         }
       }
       const current = this.options.getState(asset, route.pools[0]!);
-      const selectedId = selected?.quoteId ?? null;
-      const shares = selected ? (direction === "cex_buy_dex_sell" ? targetShares : new Decimal(selected.quote.amountOutRaw.toString()).div(new Decimal(10).pow(asset.tokenDecimals)).mul(multiplier)) : direction === "cex_buy_dex_sell" ? targetShares : null;
+      const selectedId = bestQuote?.quoteId ?? null;
+      const shares = bestQuote ? (direction === "cex_buy_dex_sell" ? targetShares : new Decimal(bestQuote.quote.amountOutRaw.toString()).div(new Decimal(10).pow(asset.tokenDecimals)).mul(multiplier)) : direction === "cex_buy_dex_sell" ? targetShares : null;
       const cexFill = shares === null ? null : vwap(direction === "cex_buy_dex_sell" ? book.asks : book.bids, shares);
       const cexFee = cexFill && feeRate ? cexFill.notional.mul(feeRate) : null;
+      const profitable = bestQuote?.calculation.netProfitUsdt?.gt(0) ?? false;
+      const noOpportunity = bestQuote !== undefined || blockReason === "NO_NET_OPPORTUNITY";
+      const decisionStatus = profitable ? "SELECTED" : noOpportunity ? "NO_OPPORTUNITY" : "BLOCKED";
+      const decisionReason = profitable ? null : noOpportunity
+        ? attempts.length ? `NO_NET_OPPORTUNITY: ${attempts.join(", ")}` : "NO_NET_OPPORTUNITY"
+        : attempts.length ? `${blockReason}: ${attempts.join(", ")}` : blockReason;
       try {
         await saveDirectPoolDecision({
-          scanId, instrumentId: route.pools[0]!.instrument_id, chainIndex: asset.chainIndex, poolId: selected?.poolId ?? (route.pools.length === 1 ? route.pools[0]!.id : null), direction, sizeUsdt: String(size),
+          scanId, instrumentId: route.pools[0]!.instrument_id, chainIndex: asset.chainIndex, poolId: bestQuote?.poolId ?? (route.pools.length === 1 ? route.pools[0]!.id : null), direction, sizeUsdt: String(size),
           selectedQuoteId: selectedId, cexBookAt: new Date(book.exchangeTime), cexReceivedAt: new Date(book.receivedAt), cexSeqId: book.seqId,
-          cexBid: book.bids[0]?.price ?? null, cexAsk: book.asks[0]?.price ?? null, cexVwap: selected?.cexVwap.toString() ?? cexFill?.vwap.toString() ?? null,
-          cexFeeUsdt: selected?.cexFee.toString() ?? cexFee?.toString() ?? null, dexNetworkFeeUsdt: selected?.quote.networkFeeUsdt ?? null, gasBudgetUsdt: null,
-          valuationInputs: { quoteValuationStatus: current.quoteValuationStatus, attempts }, grossProfitUsdt: selected?.gross.toString() ?? null,
-          netProfitUsdt: selected?.net.toString() ?? null, roi: selected?.invested.gt(0) ? selected.net.div(selected.invested).toString() : null,
-          valuationStatus: current.quoteValuationStatus, decisionStatus: selected ? "SELECTED" : blockReason === "NO_NET_OPPORTUNITY" ? "NO_OPPORTUNITY" : "BLOCKED",
-          blockReason: selected ? null : attempts.length ? `${blockReason}: ${attempts.join(", ")}` : blockReason,
+          cexBid: book.bids[0]?.price ?? null, cexAsk: book.asks[0]?.price ?? null, cexVwap: bestQuote?.cexVwap.toString() ?? cexFill?.vwap.toString() ?? null,
+          cexFeeUsdt: bestQuote?.cexFee.toString() ?? cexFee?.toString() ?? null, dexNetworkFeeUsdt: bestQuote?.quote.networkFeeUsdt ?? null, gasBudgetUsdt: null,
+          valuationInputs: { quoteValuationStatus: current.quoteValuationStatus, attempts, costBreakdown: bestQuote?.calculation.costBreakdown ?? [] },
+          grossProfitUsdt: bestQuote?.calculation.grossProfitUsdt?.toString() ?? null,
+          netProfitUsdt: bestQuote?.calculation.netProfitUsdt?.toString() ?? null, roi: bestQuote?.calculation.roi?.toString() ?? null,
+          valuationStatus: current.quoteValuationStatus, decisionStatus, blockReason: decisionReason,
         });
       } catch (error) { this.options.onDatabaseError(error); throw error; }
     }

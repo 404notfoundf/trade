@@ -20,12 +20,12 @@ export class MeteoraDlmmAdapter implements PoolAdapter {
   private readonly dex: NonNullable<MarketRegistry["dexes"][string]>;
   private readonly wsUrl: string | null;
 
-  constructor(registry: MarketRegistry, dexId: string) {
-    const dex = registry.dexes[dexId];
-    const rpc = registry.chains.solana.rpc_http;
+  constructor(registry: MarketRegistry, pool: RegisteredPool) {
+    const dex = registry.dexes[pool.dex];
+    const rpc = pool.rpc_http;
     if (!dex || !rpc || dex.program_id !== METEORA_DLMM_PROGRAM_ADDRESS) throw new Error("Solana RPC or pinned Meteora DLMM Program ID is not configured");
     this.dex = dex;
-    this.wsUrl = registry.chains.solana.rpc_ws;
+    this.wsUrl = pool.rpc_ws;
     this.connection = new Connection(rpc, { commitment: "confirmed", wsEndpoint: this.wsUrl ?? undefined, fetch: solanaRpcFetch, disableRetryOnRateLimit: true });
   }
 

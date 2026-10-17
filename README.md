@@ -18,6 +18,7 @@ TypeScript 本机服务：读取配置中 OKX 现货交易对的盘口、X Layer
 
 ## 补充说明
 
+- [文档索引](docs/README.md)
 - [交易执行与恢复](docs/TRADING_EXECUTION.md)
 - [待办事项](docs/TODO.md)
 
@@ -38,7 +39,7 @@ TypeScript 本机服务：读取配置中 OKX 现货交易对的盘口、X Layer
 4. `market-registry.yaml` 当前的池仍是 `observe_only`：X Layer 使用 wNVDAx/USDG，Solana 使用 XNVDA/USDC 和 SPCXx/USDC。每个池可单独设 `enabled: false` 暂停报价和监控；省略时默认为 `true`，修改后重启采集器生效。采集器把 Exact-In 与同规模 OKX VWAP 对比，记录毛收益、CEX 手续费、固定 Gas 预算、观察净收益和 ROI；USDG/USDC 明确按 1:1 假设估值。`config.yaml` 的 `direct_pool_observation.simulation_enabled` 控制合格 Solana observe-only 报价的全局模拟；模拟签名使用 `SOLANA_SIMULATION_PRIVATE_KEY`，不会广播。X Layer Wrapper 只读读取 `asset()`，按方向调用 ERC-4626 `previewDeposit`、`previewMint` 或 `previewRedeem` 换算数量；EVM XNVDA 不再重复乘 Backed multiplier。异常时只阻断 X Layer 收益估算。所有结果继续固定为 `NOT_EXECUTABLE`。
 5. 打开 `/direct-pools` 查看报价和收益拆分。当前 Gas 预算在 `config.yaml` 的 `direct_pool_observation`：X Layer 每方向 0.05 USDT（Wrapper + Swap），Solana 每次 Swap 0.01 USDT。后续待办会把固定预算替换为实时 OKB/SOL Gas 折算。观察净收益使用稳定币 1:1 假设，不代表真实兑换、充值提现成本或可成交净收益。
 
-运行日志会同时输出到终端和 `logs/`：`info-YYYY-MM-DD.log`、`warn-YYYY-MM-DD.log`、`error-YYYY-MM-DD.log` 按 UTC 日期和级别切分；日志目录已加入 `.gitignore`。健康状态变化和错误会记录一次，相同状态的重复错误会去重；详细依赖状态仍可在 `/health` 查看。
+运行日志会同时输出到终端和 `logs/`，时间戳使用 UTC+8（ISO 8601 的 `+08:00`），并按 UTC+8 日期和级别共用文件（如 `info-YYYY-MM-DD.log`）；单个文件达到 20 MiB 后切分归档，归档名带轮转时间和随机标识。日志目录已加入 `.gitignore`。旧日志不自动删除，因此 20 MiB 限制单个文件大小，不限制日志目录总占用。Solana 成功报价日志按池和方向最多每分钟一条，期间的报价数量会汇总到 `suppressed`；报价明细仍可通过 `quote_id` 查询。健康状态变化和错误会记录一次，相同状态的重复错误会去重；详细依赖状态仍可在 `/health` 查看。
 
 DEX Quote 请求由所有路线共享队列串行发送，间隔至少 1.1 秒，以适配试用 API 默认每秒 1 次的限频；两条路线、每条 3 个规模的双向报价一轮约需 13.2 秒。单边报价成功时仍会保存该方向结果。
 

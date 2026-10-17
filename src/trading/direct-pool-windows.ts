@@ -9,9 +9,13 @@ export type DirectPoolRangePreset = "5m" | "1h" | "24h" | "custom";
 export type DirectPoolRange = { from: Date; to: Date; preset: DirectPoolRangePreset; invalid: boolean };
 export type WindowSample = {
   id: number; createdAt: Date; instrumentId: string; chainIndex: string; poolId: string | null;
-  direction: string; sizeUsdt: string; netProfitUsdt: string | null; valuationStatus: string | null;
+  direction: string; sizeUsdt: string; netProfitUsdt: string | null; valuationStatus: string | null; selectedQuoteId?: number | null;
 };
-export type PositiveWindow = { startAt: Date; endAt: Date | null; key: string };
+export type PositiveWindow = {
+  startAt: Date; endAt: Date | null; key: string; instrumentId: string; chainIndex: string; poolId: string;
+  direction: string; sizeUsdt: string; sampleCount: number; firstSampleId: number; lastSampleId: number; lastObservedAt: Date;
+  latestNetProfitUsdt: string; peakNetProfitUsdt: string; selectedQuoteId: number | null;
+};
 
 type Utc8Parts = { year: number; month: number; day: number; hour: number; minute: number; second: number };
 
@@ -100,18 +104,25 @@ export function directPoolHref(path: string, range: DirectPoolRange, extra?: Rec
 export function directPoolQuoteBackUrl(params: URLSearchParams): string {
   const page = parsePageNumber(params.get("page") ?? params.get("quote_page"));
   const backToDecisions = params.get("back") === "decisions";
+  const backToWindow = params.get("back") === "window";
   const pool = params.get("pool")?.trim().slice(0, 128);
   const direction = params.get("direction");
   const assetPool = params.get("assetPool")?.trim().slice(0, 128);
+  const windowParams: Record<string, string> = {};
+  if (backToWindow) for (const key of ["window_from_ms", "window_to_ms", "window_closed", "window_instrument", "window_chain", "window_size", "window_first_id", "window_last_id", "window_positive_count"]) {
+    const value = params.get(key);
+    if (value !== null) windowParams[key] = value;
+  }
   return directPoolHref(
-    backToDecisions ? "/direct-pools/decisions" : "/direct-pools/quotes",
+    backToWindow ? "/direct-pools/window" : backToDecisions ? "/direct-pools/decisions" : "/direct-pools/quotes",
     parseDirectPoolRange(params),
     {
       ...(page > 1 ? { page: String(page) } : {}),
       ...(pool ? { pool } : {}),
+      ...windowParams,
       ...(backToDecisions && params.get("profit") === "positive" ? { profit: "positive" } : {}),
       ...(backToDecisions && assetPool ? { assetPool } : {}),
-      ...(backToDecisions && (direction === "cex_buy_dex_sell" || direction === "dex_buy_cex_sell") ? { direction } : {}),
+      ...((backToDecisions || backToWindow) && (direction === "cex_buy_dex_sell" || direction === "dex_buy_cex_sell") ? { direction } : {}),
     },
   );
 }
@@ -138,13 +149,35 @@ function groupKey(sample: WindowSample): string {
   return [sample.instrumentId, sample.chainIndex, sample.poolId, sample.direction, sizeKey(sample.sizeUsdt)].join("\0");
 }
 
-type GroupState = { open: PositiveWindow | null; pendingPositiveAt: Date | null; nonPositiveStreak: number; lastValidAt: Date | null };
+type GroupState = { open: PositiveWindow | null; pendingPositive: WindowSample | null; nonPositiveStreak: number; lastValidAt: Date | null };
+
+function recordWindowSample(window: PositiveWindow, sample: WindowSample, profit: Decimal): void {
+  window.sampleCount++;
+  window.lastObservedAt = sample.createdAt;
+  window.latestNetProfitUsdt = profit.toString();
+  window.peakNetProfitUsdt = Decimal.max(new Decimal(window.peakNetProfitUsdt), profit).toString();
+  window.selectedQuoteId = sample.selectedQuoteId ?? null;
+}
+
+function openWindow(first: WindowSample, second: WindowSample, key: string): PositiveWindow {
+  const firstProfit = numericNet(first.netProfitUsdt)!;
+  const window: PositiveWindow = {
+    startAt: first.createdAt, endAt: null, key, instrumentId: first.instrumentId, chainIndex: first.chainIndex,
+    poolId: first.poolId!, direction: first.direction, sizeUsdt: first.sizeUsdt, sampleCount: 0,
+    firstSampleId: first.id, lastSampleId: second.id,
+    lastObservedAt: first.createdAt, latestNetProfitUsdt: firstProfit.toString(), peakNetProfitUsdt: firstProfit.toString(),
+    selectedQuoteId: null,
+  };
+  recordWindowSample(window, first, firstProfit);
+  recordWindowSample(window, second, numericNet(second.netProfitUsdt)!);
+  return window;
+}
 
 function expire(state: GroupState, at: Date): void {
   if (!state.lastValidAt || at.getTime() - state.lastValidAt.getTime() <= DIRECT_POOL_WINDOW_GAP_MS) return;
   if (state.open && state.open.endAt === null) state.open.endAt = new Date(state.lastValidAt.getTime() + DIRECT_POOL_WINDOW_GAP_MS);
   state.open = null;
-  state.pendingPositiveAt = null;
+  state.pendingPositive = null;
   state.nonPositiveStreak = 0;
   state.lastValidAt = null;
 }
@@ -159,25 +192,30 @@ export function collectPositiveWindows(samples: WindowSample[], until?: Date): P
     const net = sample.poolId ? numericNet(sample.netProfitUsdt) : null;
     if (!sample.poolId || !net || sample.valuationStatus?.startsWith("INVALIDATED_")) continue;
     const key = groupKey(sample);
-    const state = groups.get(key) ?? { open: null, pendingPositiveAt: null, nonPositiveStreak: 0, lastValidAt: null };
+    const state = groups.get(key) ?? { open: null, pendingPositive: null, nonPositiveStreak: 0, lastValidAt: null };
     groups.set(key, state);
     expire(state, sample.createdAt);
     if (!state.open) {
       if (net.gt(0)) {
-        if (state.pendingPositiveAt) {
-          const opened = { startAt: state.pendingPositiveAt, endAt: null, key };
+        if (state.pendingPositive) {
+          const opened = openWindow(state.pendingPositive, sample, key);
           windows.push(opened);
           state.open = opened;
-          state.pendingPositiveAt = null;
+          state.pendingPositive = null;
           state.nonPositiveStreak = 0;
-        } else state.pendingPositiveAt = sample.createdAt;
-      } else state.pendingPositiveAt = null;
-    } else if (net.gt(0)) state.nonPositiveStreak = 0;
-    else if (++state.nonPositiveStreak >= 2) {
-      state.open.endAt = sample.createdAt;
-      state.open = null;
-      state.nonPositiveStreak = 0;
-      state.pendingPositiveAt = null;
+        } else state.pendingPositive = sample;
+      } else state.pendingPositive = null;
+    } else {
+      state.open.lastSampleId = sample.id;
+      if (net.gt(0)) {
+        recordWindowSample(state.open, sample, net);
+        state.nonPositiveStreak = 0;
+      } else if (++state.nonPositiveStreak >= 2) {
+        state.open.endAt = sample.createdAt;
+        state.open = null;
+        state.nonPositiveStreak = 0;
+        state.pendingPositive = null;
+      }
     }
     state.lastValidAt = sample.createdAt;
   }

@@ -4,6 +4,8 @@ import type { Book, Level } from "./okx.js";
 export type Instrument = { instId: string; state: string; lotSz: string; minSz: string; tickSz: string };
 export type Fill = { quantity: Decimal; notional: Decimal; vwap: Decimal };
 export const MAX_BOOK_AGE_MS = 2_000;
+// OKX sends an empty incremental-book heartbeat about every 60 seconds.
+export const MAX_BOOK_STREAM_SILENCE_MS = 90_000;
 
 export function vwap(levels: Level[], quantity: Decimal): Fill | null {
   let remaining = quantity;
@@ -32,4 +34,8 @@ export function bookStale(book: Book): boolean {
   const now = Date.now();
   return !Number.isFinite(book.receivedAt) || !Number.isFinite(book.exchangeTime)
     || now - book.receivedAt > MAX_BOOK_AGE_MS || now - book.exchangeTime > MAX_BOOK_AGE_MS;
+}
+
+export function bookObservationStale(book: Book): boolean {
+  return !book.ready || !Number.isFinite(book.streamAliveAt) || Date.now() - book.streamAliveAt! > MAX_BOOK_STREAM_SILENCE_MS;
 }

@@ -348,10 +348,12 @@ async function tryCexBuyDexSell(asset: AssetConfig, input: ExecutionInput): Prom
     const decision = decideValuation({
       chainIndex: asset.chainIndex, quoteTokenAddress: asset.quoteTokenAddress, direction: "cex_buy_dex_sell",
       quoteAmount: outputHuman, cexCost: fill.notional, cexFee: fill.notional.mul(latest.feeRate), gasUsdt,
+      cexFeeSource: "cex_fee_rate", networkFeeSource: "pretrade_gas_quote_estimate",
       now, maxAgeMs, maxUsdtUsdDeviationPercent: input.guardrails.maxUsdtUsdDeviationPercent,
       maxUsdt0UsdtDeviationPercent: input.guardrails.maxUsdt0UsdtDeviationPercent,
     });
-    if (decision.valuationStatus !== "VERIFIED" || !decision.netProfitUsdt || !netMarginOk(new Decimal(decision.netProfitUsdt), fill.notional.plus(fill.notional.mul(latest.feeRate)).plus(gasUsdt))) {
+    if (decision.valuationStatus !== "VERIFIED" || !decision.netProfitUsdt || !decision.capitalAtRiskUsdt
+      || !netMarginOk(new Decimal(decision.netProfitUsdt), new Decimal(decision.capitalAtRiskUsdt))) {
       await setCycle(cycleId, "HEDGE_REQUIRED", decision.reason ?? "DEX filled but the minimum net margin is no longer available");
       input.setHealth("trade_execution", "blocked", `Trade cycle ${cycleId} needs manual CEX hedge`);
       return true;
@@ -393,6 +395,7 @@ async function tryCexBuyDexSell(asset: AssetConfig, input: ExecutionInput): Prom
     const finalDecision = decideValuation({
       chainIndex: asset.chainIndex, quoteTokenAddress: asset.quoteTokenAddress, direction: "cex_buy_dex_sell",
       quoteAmount: outputHuman, cexCost: actualCost, cexFee: actualCost.mul(latest.feeRate), gasUsdt,
+      cexFeeSource: "cex_fee_rate", networkFeeSource: "pretrade_gas_quote_estimate",
       now: Date.now(), maxAgeMs, maxUsdtUsdDeviationPercent: input.guardrails.maxUsdtUsdDeviationPercent,
       maxUsdt0UsdtDeviationPercent: input.guardrails.maxUsdt0UsdtDeviationPercent,
     });
@@ -557,12 +560,12 @@ async function tryDexBuyCexSell(asset: AssetConfig, input: ExecutionInput): Prom
     const decision = decideValuation({
       chainIndex: asset.chainIndex, quoteTokenAddress: asset.quoteTokenAddress, direction: "dex_buy_cex_sell",
       quoteAmount: quoteSpentHuman, cexCost: fill.notional, cexFee: fill.notional.mul(latest.feeRate), gasUsdt,
+      cexFeeSource: "cex_fee_rate", networkFeeSource: "pretrade_gas_quote_estimate",
       now, maxAgeMs, maxUsdtUsdDeviationPercent: input.guardrails.maxUsdtUsdDeviationPercent,
       maxUsdt0UsdtDeviationPercent: input.guardrails.maxUsdt0UsdtDeviationPercent,
     });
-    const invested = new Decimal(decision.usdtLeg ?? "NaN").plus(fill.notional.mul(latest.feeRate)).plus(gasUsdt);
-    if (decision.valuationStatus !== "VERIFIED" || !decision.usdtLeg || !decision.netProfitUsdt
-      || !netMarginOk(new Decimal(decision.netProfitUsdt), invested)) {
+    if (decision.valuationStatus !== "VERIFIED" || !decision.usdtLeg || !decision.netProfitUsdt || !decision.capitalAtRiskUsdt
+      || !netMarginOk(new Decimal(decision.netProfitUsdt), new Decimal(decision.capitalAtRiskUsdt))) {
       await setCycle(cycleId, "HEDGE_REQUIRED", decision.reason ?? "DEX filled but the minimum net margin is no longer available");
       input.setHealth("trade_execution", "blocked", "Trade cycle " + cycleId + " needs manual CEX hedge");
       return true;
@@ -597,12 +600,12 @@ async function tryDexBuyCexSell(asset: AssetConfig, input: ExecutionInput): Prom
     const finalDecision = decideValuation({
       chainIndex: asset.chainIndex, quoteTokenAddress: asset.quoteTokenAddress, direction: "dex_buy_cex_sell",
       quoteAmount: quoteSpentHuman, cexCost: filled.mul(avgPrice), cexFee: filled.mul(avgPrice).mul(latest.feeRate), gasUsdt,
+      cexFeeSource: "cex_fee_rate", networkFeeSource: "pretrade_gas_quote_estimate",
       now: Date.now(), maxAgeMs, maxUsdtUsdDeviationPercent: input.guardrails.maxUsdtUsdDeviationPercent,
       maxUsdt0UsdtDeviationPercent: input.guardrails.maxUsdt0UsdtDeviationPercent,
     });
-    const finalInvested = new Decimal(finalDecision.usdtLeg ?? "NaN").plus(filled.mul(avgPrice).mul(latest.feeRate)).plus(gasUsdt);
-    if (finalDecision.valuationStatus !== "VERIFIED" || !finalDecision.netProfitUsdt
-      || !netMarginOk(new Decimal(finalDecision.netProfitUsdt), finalInvested)) {
+    if (finalDecision.valuationStatus !== "VERIFIED" || !finalDecision.netProfitUsdt || !finalDecision.capitalAtRiskUsdt
+      || !netMarginOk(new Decimal(finalDecision.netProfitUsdt), new Decimal(finalDecision.capitalAtRiskUsdt))) {
       await setCycle(cycleId, "HEDGE_REQUIRED", finalDecision.reason ?? "Final trade margin fell below the configured minimum", txHash);
       return true;
     }
@@ -662,13 +665,12 @@ async function evaluateSwap(asset: AssetConfig, bundle: SwapBundle, expectedInpu
   const decision = decideValuation({
     chainIndex: asset.chainIndex, quoteTokenAddress: asset.quoteTokenAddress, direction,
     quoteAmount: direction === "cex_buy_dex_sell" ? quoteOutput : quoteInput, cexCost: cexFill.notional, cexFee: cexFill.notional.mul(state.feeRate), gasUsdt,
+    cexFeeSource: "cex_fee_rate", networkFeeSource: "aggregator_trade_fee_estimate+safety_buffer",
     now, maxAgeMs, maxUsdtUsdDeviationPercent: input.guardrails.maxUsdtUsdDeviationPercent,
     maxUsdt0UsdtDeviationPercent: input.guardrails.maxUsdt0UsdtDeviationPercent,
   });
-  const invested = direction === "cex_buy_dex_sell"
-    ? cexFill.notional.plus(cexFill.notional.mul(state.feeRate)).plus(gasUsdt)
-    : new Decimal(decision.usdtLeg ?? "NaN").plus(cexFill.notional.mul(state.feeRate)).plus(gasUsdt);
-  if (decision.valuationStatus !== "VERIFIED" || !decision.netProfitUsdt || !netMarginOk(new Decimal(decision.netProfitUsdt), invested)) return null;
+  if (decision.valuationStatus !== "VERIFIED" || !decision.netProfitUsdt || !decision.capitalAtRiskUsdt
+    || !netMarginOk(new Decimal(decision.netProfitUsdt), new Decimal(decision.capitalAtRiskUsdt))) return null;
   if (new Decimal(input.tradeSizeUsdt).gt(input.maxTradeSizeUsdt)) return null;
   return { decision, gasUsdt: gasUsdt.toString(), quoteInput: quoteInput.toString(), quoteOutput: quoteOutput.toString(), shares: estimatedShares };
 }

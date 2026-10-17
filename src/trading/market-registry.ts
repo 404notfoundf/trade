@@ -51,6 +51,8 @@ export type RegisteredPool = {
   enabled: boolean;
   instrument_id: string;
   chain: RegistryChainName;
+  rpc_http: string | null;
+  rpc_ws: string | null;
   dex: string;
   mode: "trade_candidate" | "observe_only";
   reason?: "wrapper_required" | "quote_asset_not_pinned" | "unverified";
@@ -100,6 +102,9 @@ function resolveEnv(value: unknown, name: string): string | null {
   const match = /^env:([A-Z][A-Z0-9_]*)$/.exec(ref);
   if (!match) throw new Error(`market-registry.yaml ${name} must use an env:NAME reference`);
   return process.env[match[1]!] || null;
+}
+function poolRpcEndpoint(value: unknown, name: string, chainDefault: string | null): string | null {
+  return value === undefined ? chainDefault : resolveEnv(value, name);
 }
 function address(value: unknown, chain: RegistryChainName, name: string): string {
   const text = requireText(value, name);
@@ -187,6 +192,9 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
     const id = requireText(raw.id, `pools[${index}].id`);
     const instrument_id = requireText(raw.instrument_id, `pools[${index}].instrument_id`);
     const chain = raw.chain;
+    if ((raw.rpc_http === undefined) !== (raw.rpc_ws === undefined)) throw new Error(`Pool ${id} must override rpc_http and rpc_ws together`);
+    const rpc_http = poolRpcEndpoint(raw.rpc_http, `pools[${index}].rpc_http`, chains[chain].rpc_http);
+    const rpc_ws = poolRpcEndpoint(raw.rpc_ws, `pools[${index}].rpc_ws`, chains[chain].rpc_ws);
     const dexId = requireText(raw.dex, `pools[${index}].dex`);
     const dex = dexes[dexId];
     const instrument = instruments.find((candidate) => candidate.instrument_id === instrument_id);
@@ -235,7 +243,7 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
         || typeof raw.max_notional_usdt !== "string" || !positiveDecimal.test(raw.max_notional_usdt) || Number(raw.max_notional_usdt) <= 0
         || !sameAddress(chain, assetAddress, asset.address) || !sameAddress(chain, quoteAddress, asset.quote_asset.address)
         || assetDecimals !== asset.decimals || quoteDecimals !== asset.quote_asset.decimals
-        || !chains[chain].rpc_http || !chains[chain].rpc_ws
+        || !rpc_http || !rpc_ws
         || (chain === "xlayer" && (!dex.factory || !dex.quoter_v2 || !dex.swap_router))
         || (chain === "solana" && !dex.program_id)
         || reason !== undefined) throw new Error(`Unsafe or incomplete trade_candidate registration ${id}`);
@@ -247,7 +255,7 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
       if (!Number.isSafeInteger(raw.expected_fee_tier) || Number(raw.expected_fee_tier) < 0 || Number(raw.expected_fee_tier) > 1_000_000) throw new Error(`Pool ${id} has invalid expected_fee_tier`);
       expected_fee_tier = Number(raw.expected_fee_tier);
     }
-    pools.push({ id, enabled: raw.enabled !== false, instrument_id, chain, dex: dexId, mode: raw.mode, reason: reason as RegisteredPool["reason"], verified: raw.verified,
+    pools.push({ id, enabled: raw.enabled !== false, instrument_id, chain, rpc_http, rpc_ws, dex: dexId, mode: raw.mode, reason: reason as RegisteredPool["reason"], verified: raw.verified,
       priority: raw.priority as number | undefined, max_notional_usdt: raw.max_notional_usdt as string | undefined,
       address: poolAddress, token_in_out: { asset_address: assetAddress, asset_decimals: assetDecimals, quote_address: quoteAddress, quote_decimals: quoteDecimals },
       expected_fee_tier, expected_fee_rate, expected_tick_spacing, expected_bin_step });

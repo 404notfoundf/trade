@@ -133,11 +133,12 @@ async function run(input: PrepareInput, services: PrepareServices): Promise<Prep
   const decision = services.decideValuation({
     chainIndex: asset.chainIndex, quoteTokenAddress: asset.quoteTokenAddress, direction: "dex_buy_cex_sell", quoteAmount,
     cexCost: fill.notional, cexFee: fill.notional.mul(latest.feeRate), gasUsdt: gas, now, maxAgeMs,
+    cexFeeSource: "cex_fee_rate", networkFeeSource: "aggregator_trade_fee_estimate+safety_buffer",
     maxUsdtUsdDeviationPercent: guardrails.maxUsdtUsdDeviationPercent, maxUsdt0UsdtDeviationPercent: guardrails.maxUsdt0UsdtDeviationPercent,
   });
-  if (decision.valuationStatus !== "VERIFIED" || !decision.usdtLeg || !decision.netProfitUsdt) return fail(decision.reason ?? "估值不是 VERIFIED，拒绝生成");
+  if (decision.valuationStatus !== "VERIFIED" || !decision.netProfitUsdt || !decision.investedUsdt) return fail(decision.reason ?? "估值不是 VERIFIED，拒绝生成");
   const net = new Decimal(decision.netProfitUsdt);
-  const invested = new Decimal(decision.usdtLeg);
+  const invested = new Decimal(decision.investedUsdt);
   if (!netMarginOk(net, invested)) return fail(`扣完费用后净边际 ${net.div(invested).mul(100).toFixed(4)}% 低于 1% 入账缓冲`);
   const picked = selectCall({ allowance, required: amount, quoteToken: asset.quoteTokenAddress, spender: approvalSpender, swapTo: item.tx.to, swapData: item.tx.data });
   const call: UnsignedCall = { ...picked, chainId: "196", amount: amount.toFixed(0), slippagePercent: slippage, receiver: input.wallet };

@@ -93,6 +93,7 @@ instruments:
         quote_asset: { symbol: USDT, address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 }
 
 # These manually monitored pools are deliberately ineligible for direct-pool decisions.
+# Optional per-pool rpc_http/rpc_ws values override the chain defaults above. Use env:NAME references.
 pools:
   - id: xnvda-xlayer-uniswap-v3
     enabled: false
@@ -119,6 +120,9 @@ pools:
     enabled: true
     instrument_id: XSPCX
     chain: solana
+    # Optional pool-specific endpoints; omit both to use chains.solana defaults.
+    # rpc_http: env:SOLANA_XSPCX_RAYDIUM_RPC_HTTP
+    # rpc_ws: env:SOLANA_XSPCX_RAYDIUM_RPC_WS
     dex: raydium_clmm_solana
     mode: observe_only
     reason: quote_asset_not_pinned
@@ -129,6 +133,9 @@ pools:
     enabled: true
     instrument_id: XSPCX
     chain: solana
+    # Optional pool-specific endpoints; omit both to use chains.solana defaults.
+    rpc_http: env:SOLANA_XSPCX_ORCA_RPC_HTTP
+    rpc_ws: env:SOLANA_XSPCX_ORCA_RPC_WS
     dex: orca_whirlpool_solana
     mode: observe_only
     reason: quote_asset_not_pinned
@@ -141,6 +148,9 @@ pools:
     enabled: true
     instrument_id: XSPCX
     chain: solana
+    # Optional pool-specific endpoints; omit both to use chains.solana defaults.
+    rpc_http: env:SOLANA_XSPCX_METEORA_RPC_HTTP
+    rpc_ws: env:SOLANA_XSPCX_METEORA_RPC_WS
     dex: meteora_dlmm_solana
     mode: observe_only
     reason: quote_asset_not_pinned

@@ -2,7 +2,7 @@ import { createHmac } from "node:crypto";
 import WebSocket from "ws";
 
 export type Level = { price: string; size: string };
-export type Book = { asks: Level[]; bids: Level[]; exchangeTime: number; receivedAt: number; seqId: number; ready: boolean };
+export type Book = { asks: Level[]; bids: Level[]; exchangeTime: number; receivedAt: number; streamAliveAt?: number; seqId: number; ready: boolean };
 export type Credentials = { key: string; secret: string; passphrase: string };
 export type DexQuoteTiming = { requestStartedAt: Date; responseAt: Date; requestMs: number; queueWaitMs: number };
 const OKX = "https://www.okx.com";
@@ -143,7 +143,7 @@ export class OkxOrderBook {
   stop(): void { this.closed = true; clearTimeout(this.retry); clearInterval(this.heartbeat); this.socket?.close(); }
   private connect(): void {
     if (this.closed) return;
-    this.socket = new WebSocket("wss://ws.okx.com:8443/ws/v5/public");
+    this.socket = new WebSocket("wss://ws.okx.com/ws/v5/public");
     this.socket.on("open", () => {
       this.socket?.send(JSON.stringify({ op: "subscribe", args: [{ channel: "books", instId: this.instId }] }));
       clearInterval(this.heartbeat);
@@ -165,21 +165,29 @@ export class OkxOrderBook {
     if (text === "pong") return;
     let message: any;
     try { message = JSON.parse(text); } catch { return; }
-    if (message.event === "error") { this.onError(`OKX WebSocket subscription error ${message.code}`); return; }
+    if (message.event === "error") { this.onError(`OKX WebSocket subscription error ${message.code}`); this.socket?.close(); return; }
     const data = message.data?.[0];
     if (!data) return;
+    if (!Array.isArray(data.asks) || !Array.isArray(data.bids)) return;
+    const receivedAt = Date.now();
     if (message.action === "snapshot") {
       this.asks.clear(); this.bids.clear(); this.apply(this.asks, data.asks); this.apply(this.bids, data.bids);
     } else {
       if (this.seqId < 0 || (data.prevSeqId !== this.seqId && !(data.seqId < data.prevSeqId && data.prevSeqId === this.seqId))) {
         this.onError("OKX book sequence gap; reconnecting for a fresh snapshot"); this.socket?.close(); return;
       }
+      // An empty incremental update is OKX's channel heartbeat; preserve the last book-data timestamp.
+      if (data.asks.length === 0 && data.bids.length === 0) {
+        this.seqId = Number(data.seqId);
+        if (this.current) this.current.streamAliveAt = receivedAt;
+        return;
+      }
       this.apply(this.asks, data.asks); this.apply(this.bids, data.bids);
     }
     this.seqId = Number(data.seqId);
     const sorted = (levels: Map<string, string>, descending: boolean) => [...levels.entries()]
       .map(([price, size]) => ({ price, size })).sort((a, b) => (Number(a.price) - Number(b.price)) * (descending ? -1 : 1));
-    this.current = { asks: sorted(this.asks, false), bids: sorted(this.bids, true), exchangeTime: Number(data.ts), receivedAt: Date.now(), seqId: this.seqId, ready: true };
+    this.current = { asks: sorted(this.asks, false), bids: sorted(this.bids, true), exchangeTime: Number(data.ts), receivedAt, streamAliveAt: receivedAt, seqId: this.seqId, ready: true };
     this.onUpdate(this.current);
   }
 }

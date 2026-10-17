@@ -166,7 +166,7 @@ Orca 检查与当前 Raydium 检查等价：
 7. dashboard test：DEX 显示为 Orca Whirlpool，模拟说明保持协议中立，`NOT_EXECUTABLE` 清晰可见。
 8. 手工 RPC smoke test：在已审核 endpoint 读取该固定池、核对第 1 节身份值和已登记 fee/tick spacing，完成两个方向 quote；若配置了隔离模拟钱包，再完成一次不广播模拟。
 
-验收通过也不授权真实执行。任何后续执行必须先修改 `DIRECT_POOL_LIVE_EXECUTION.md` 所列前置条件并进行单独安全审核。
+验收通过也不授权真实执行。任何后续执行必须先满足 [Direct Pool 实盘执行规划](../DIRECT_POOL_LIVE_EXECUTION.md) 所列前置条件并进行单独安全审核。
 
 ## 9. 实施顺序与回滚
 

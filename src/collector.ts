@@ -1,8 +1,9 @@
 import Decimal from "decimal.js";
 import type { AssetConfig, Config } from "./config.js";
-import { bookMidpoint, bookStale, floorToStep, MAX_BOOK_AGE_MS, vwap, type Instrument } from "./market.js";
+import { bookMidpoint, bookObservationStale, bookStale, floorToStep, MAX_BOOK_AGE_MS, MAX_BOOK_STREAM_SILENCE_MS, vwap, type Instrument } from "./market.js";
 import { dexQuote, reserveDexRequestSlot, type Book, type Credentials, type DexQuoteTiming } from "./okx.js";
 import { decideValuation, XLAYER_CHAIN } from "./valuation.js";
+import { calculateProfit } from "./profit-calculation.js";
 import { closeOpportunityWindow, saveQuoteObservations, type QuoteObservation } from "./observations.js";
 import { recordBlockedObservation, type BlockedObservation } from "./risk.js";
 
@@ -72,9 +73,9 @@ export class OpportunityCollector {
     this.lastQuoteAt = Date.now();
     this.collecting = true;
     try {
-      const stale = bookStale(book);
+      const stale = bookObservationStale(book);
       if (stale) {
-        const reason = `OKX order book is stale; ${bookFreshnessDetails(book)}`;
+        const reason = `OKX order book stream is stale; ${bookFreshnessDetails(book)}`;
         setHealth("cex_book", "stale", reason);
         for (const size of asset.observationSizesUsdt) await this.recordBlock({ instId: asset.instId, chainIndex: asset.chainIndex, sizeUsdt: size, reasonCode: "CEX_BOOK_STALE", reason, cexTs: new Date(book.exchangeTime), quoteResponse: bookDiagnostic(book) });
         return;
@@ -87,7 +88,7 @@ export class OpportunityCollector {
       for (const size of [scanSize]) {
         if (getState().routeStatus === "BLOCKED" || multiplierChanged) break;
         const sizingBook = getState().book;
-        if (!sizingBook?.ready || bookStale(sizingBook)) {
+        if (!sizingBook?.ready || bookObservationStale(sizingBook)) {
           const reason = `OKX order book ${sizingBook ? "not ready or stale" : "missing"}; ${bookFreshnessDetails(sizingBook)}`;
           setHealth("cex_book", "stale", reason);
           await this.recordBlock({ instId: asset.instId, chainIndex: asset.chainIndex, sizeUsdt: size, reasonCode: "CEX_BOOK_STALE", reason, cexTs: sizingBook ? new Date(sizingBook.exchangeTime) : null, quoteResponse: sizingBook ? bookDiagnostic(sizingBook) : null });
@@ -134,14 +135,14 @@ export class OpportunityCollector {
             if (!impact) throw new BlockedScanError("PRICE_IMPACT_UNKNOWN", `DEX ${direction} quote has no usable price impact; positive estimate suppressed`);
             if (impact.abs().gt(guardrails.maxDexPriceImpactPercent)) throw new BlockedScanError("PRICE_IMPACT_LIMIT", `DEX ${direction} price impact ${impact.toString()}% exceeds ${guardrails.maxDexPriceImpactPercent}%`);
             const currentBook = getState().book;
-            if (!currentBook?.ready || bookStale(currentBook)) {
+            if (!currentBook?.ready || bookObservationStale(currentBook)) {
               const state = !currentBook ? "missing" : !currentBook.ready ? "not_ready" : "stale";
               throw new BlockedScanError("CEX_BOOK_STALE", `OKX order book ${state} after DEX ${direction} quote; ${bookFreshnessDetails(currentBook)}; dexRequestMs=${timing.requestMs.toFixed(0)}; dexQueueWaitMs=${timing.queueWaitMs.toFixed(0)}`);
             }
             const observation = await build(quote, currentBook, timing);
             const latestState = currentState();
             if (!latestState) return;
-            if (bookStale(currentBook)) throw new BlockedScanError("CEX_BOOK_STALE", `OKX order book expired during ${direction} valuation; ${bookFreshnessDetails(currentBook)}; dexRequestMs=${timing.requestMs.toFixed(0)}; dexQueueWaitMs=${timing.queueWaitMs.toFixed(0)}`);
+            if (bookObservationStale(currentBook)) throw new BlockedScanError("CEX_BOOK_STALE", `OKX order book stream expired during ${direction} valuation; ${bookFreshnessDetails(currentBook)}; dexRequestMs=${timing.requestMs.toFixed(0)}; dexQueueWaitMs=${timing.queueWaitMs.toFixed(0)}`);
             observation.routeStatus = latestState.routeStatus;
             const profit = observation.netProfitAfterRebalanceUsdt ?? observation.netProfitUsdt;
             const buffer = Decimal.max(new Decimal("0.5"), new Decimal(size).mul("0.003"));
@@ -153,6 +154,9 @@ export class OpportunityCollector {
             } else if (latestState.routeStatus !== "ENABLED") {
               observation.executableStatus = "NOT_EXECUTABLE";
               observation.executionReason = latestState.routeReason ?? "Route is not enabled for transfers";
+            } else if (bookStale(currentBook)) {
+              observation.executableStatus = "NOT_EXECUTABLE";
+              observation.executionReason = `CEX order book data is older than ${MAX_BOOK_AGE_MS} ms`;
             } else if (observation.valuationStatus !== "VERIFIED" || observation.status !== "OK" || !profit || !new Decimal(profit).gt(buffer)) {
               observation.executableStatus = "NOT_EXECUTABLE";
               observation.executionReason = "Net profit does not exceed the execution safety buffer";
@@ -160,7 +164,10 @@ export class OpportunityCollector {
               observation.executableProfitUsdt = new Decimal(profit).minus(buffer).toString();
               try { observation.executionReason = this.options.checkInventory ? await this.options.checkInventory(observation) ?? "" : "Inventory check is unavailable"; }
               catch (error) { observation.executionReason = `Inventory check failed: ${messageOf(error)}`; }
-              observation.executableStatus = observation.executionReason === "" ? "EXECUTABLE" : "NOT_EXECUTABLE";
+              if (bookStale(currentBook)) {
+                observation.executableStatus = "NOT_EXECUTABLE";
+                observation.executionReason = `CEX order book data is older than ${MAX_BOOK_AGE_MS} ms`;
+              } else observation.executableStatus = observation.executionReason === "" ? "EXECUTABLE" : "NOT_EXECUTABLE";
             }
             observations.push(observation);
           } catch (error) {
@@ -240,15 +247,15 @@ export class OpportunityCollector {
 }
 
 function bookDiagnostic(book: Book): unknown {
-  return { exchangeTime: book.exchangeTime, receivedAt: book.receivedAt, seqId: book.seqId, asks: book.asks.slice(0, 5), bids: book.bids.slice(0, 5) };
+  return { exchangeTime: book.exchangeTime, receivedAt: book.receivedAt, streamAliveAt: book.streamAliveAt ?? null, seqId: book.seqId, asks: book.asks.slice(0, 5), bids: book.bids.slice(0, 5) };
 }
 
 function bookFreshnessDetails(book: Book | undefined): string {
-  if (!book) return `maxAgeMs=${MAX_BOOK_AGE_MS}; book=missing`;
+  if (!book) return `maxBookAgeMs=${MAX_BOOK_AGE_MS}; maxStreamSilenceMs=${MAX_BOOK_STREAM_SILENCE_MS}; book=missing`;
   const now = Date.now();
   const age = (timestamp: number) => Number.isFinite(timestamp) ? String(Math.round(now - timestamp)) : "invalid";
   const iso = (timestamp: number) => Number.isFinite(new Date(timestamp).getTime()) ? new Date(timestamp).toISOString() : "invalid";
-  return `maxAgeMs=${MAX_BOOK_AGE_MS}; receivedAgeMs=${age(book.receivedAt)}; exchangeAgeMs=${age(book.exchangeTime)}; receivedAt=${iso(book.receivedAt)}; exchangeTime=${iso(book.exchangeTime)}; seqId=${book.seqId}; bestBid=${book.bids[0]?.price ?? "none"}; bestAsk=${book.asks[0]?.price ?? "none"}`;
+  return `maxBookAgeMs=${MAX_BOOK_AGE_MS}; maxStreamSilenceMs=${MAX_BOOK_STREAM_SILENCE_MS}; bookAgeMs=${age(book.receivedAt)}; exchangeAgeMs=${age(book.exchangeTime)}; streamSilenceMs=${age(book.streamAliveAt ?? Number.NaN)}; receivedAt=${iso(book.receivedAt)}; exchangeTime=${iso(book.exchangeTime)}; streamAliveAt=${iso(book.streamAliveAt ?? Number.NaN)}; seqId=${book.seqId}; bestBid=${book.bids[0]?.price ?? "none"}; bestAsk=${book.asks[0]?.price ?? "none"}`;
 }
 
 class BlockedScanError extends Error {
@@ -294,17 +301,24 @@ async function makeObservation(asset: AssetConfig, direction: "cex_buy_dex_sell"
   const now = Date.now();
   const decision = decideValuation({
     chainIndex: asset.chainIndex, quoteTokenAddress: asset.quoteTokenAddress, direction, quoteAmount, cexCost, cexFee, gasUsdt: gas,
+    cexFeeSource: "cex_fee_rate", networkFeeSource: "dex.tradeFee_usd+safety_buffer",
     now, maxAgeMs,
     maxUsdtUsdDeviationPercent: guardrails.maxUsdtUsdDeviationPercent, maxUsdt0UsdtDeviationPercent: guardrails.maxUsdt0UsdtDeviationPercent,
   });
   const verified = decision.valuationStatus === "VERIFIED";
-  const sameUnit = !verified && decision.grossProfitUsdt !== null;
-  const gross = verified || sameUnit ? decision.grossProfitUsdt : null;
-  const net = verified || sameUnit ? decision.netProfitUsdt : null;
+  const gross = decision.grossProfitUsdt;
+  const net = decision.netProfitUsdt;
   const rebalanceCost = asset.rebalanceCostUsdtPerTrade === undefined ? null : new Decimal(asset.rebalanceCostUsdtPerTrade);
-  const afterRebalance = verified && net && rebalanceCost ? new Decimal(net).minus(rebalanceCost) : null;
-  const invested = direction === "cex_buy_dex_sell" ? cexCost : new Decimal(size);
-  const profitForRoi = verified ? (afterRebalance ?? (net ? new Decimal(net) : null)) : null;
+  const adjusted = verified && decision.usdtLeg !== null && rebalanceCost !== null ? calculateProfit({
+    direction, cexNotionalUsdt: cexCost, dexQuoteAmountUsdt: new Decimal(decision.usdtLeg), valuationStatus: "VERIFIED",
+    costs: [
+      { kind: "cex_fee", amountUsdt: cexFee, source: "cex_fee_rate" },
+      { kind: "network_fee", amountUsdt: gas, source: "dex.tradeFee_usd+safety_buffer" },
+      { kind: "rebalance", amountUsdt: rebalanceCost, source: "config.rebalanceCostUsdtPerTrade" },
+    ],
+  }) : null;
+  const afterRebalance = adjusted?.netProfitUsdt ?? null;
+  const roi = rebalanceCost === null ? decision.roi : adjusted?.roi?.toString() ?? null;
   const fromPrice = validUsdPrice(quote.fromToken.tokenUnitPrice);
   const toPrice = validUsdPrice(quote.toToken.tokenUnitPrice);
   const impact = parseDecimal(quote.priceImpactPercentage ?? quote.priceImpactPercent);
@@ -317,14 +331,14 @@ async function makeObservation(asset: AssetConfig, direction: "cex_buy_dex_sell"
     gasSource: "dex.tradeFee_usd", grossProfitUsdt: gross,
     netProfitUsdt: net, rebalanceCostUsdt: rebalanceCost?.toString() ?? null,
     netProfitAfterRebalanceUsdt: afterRebalance?.toString() ?? null,
-    roi: profitForRoi && invested.gt(0) ? profitForRoi.div(invested).toString() : null,
+    roi,
     multiplier: multiplier.toString(), multiplierRaw: JSON.stringify(multiplierRaw), cexTs: new Date(book.exchangeTime), cexReceivedAt: new Date(book.receivedAt),
     dexTs: timing.responseAt, dexRequestStartedAt: timing.requestStartedAt, dexQueueWaitMs: timing.queueWaitMs,
     priceImpactPercent: impact?.isFinite() ? impact.toString() : null,
     dexRequestMs: timing.requestMs,
     fromTokenUnitPriceUsd: fromPrice?.toString() ?? null, toTokenUnitPriceUsd: toPrice?.toString() ?? null,
     paidValueUsd: null, receivedValueUsd: null,
-    isStale, status: gas === null ? "GAS_UNKNOWN" : "OK", rawResponse: JSON.stringify(quote),
+    isStale, status: gas === null ? "GAS_UNKNOWN" : "OK", rawResponse: JSON.stringify({ ...quote, orderBookLiveness: { exchangeTime: book.exchangeTime, receivedAt: book.receivedAt, streamAliveAt: book.streamAliveAt ?? null } }),
     nativeQuoteAmount: decision.nativeAmount, nativeQuoteSymbol: decision.nativeSymbol, usdtRate: verified ? decision.usdtRate : null,
     conversionCostUsdt: verified ? decision.conversionCostUsdt : null, usdtEstimate: verified ? decision.usdtEstimate : null,
     valuationStatus: decision.valuationStatus, priceSourceTime: decision.priceSourceTime, quoteSummary: decision.quoteSummary,

@@ -27,6 +27,7 @@
 | [OKX_XLayer_Solana_Pool_Monitor_TypeScript_Design.md](OKX_XLayer_Solana_Pool_Monitor_TypeScript_Design.md) | OKX、X Layer 与 Solana 池监听的早期技术设计参考；当前实现以架构文档和代码为准。 |
 | [ARBBRIDGE_PROFIT_CALCULATION_LESSONS.md](ARBBRIDGE_PROFIT_CALCULATION_LESSONS.md) | ArbBridge 双向定价与收益核算对本项目的参考、适用边界和复算方法。 |
 | [ARBBRIDGE_PROJECT_WIDE_REVIEW.md](ARBBRIDGE_PROJECT_WIDE_REVIEW.md) | 对照 ArbBridge 扫描本项目的估值门槛、收益核算、数据可复算、规模优化和后续执行建议。 |
+| [ARBBRIDGE_DETAILED_BENCHMARK.md](ARBBRIDGE_DETAILED_BENCHMARK.md) | ArbBridge 深度对标：运行准入、可恢复执行、可复算性、风控、运维和测试的适配边界与实施顺序。 |
 
 ## 归档
 

@@ -18,6 +18,7 @@ import {
 } from "../okx.js";
 import { decideValuation, SOLANA_CHAIN, XLAYER_CHAIN } from "../valuation.js";
 import { netMarginOk, swapTxError, type SwapTx } from "./gates.js";
+import { recoverCycle, type CexOrderIntent, type RecoveryCycle, type RecoveryDecision, type RecoveryOrder } from "./recovery.js";
 import { logger } from "../logger.js";
 
 type RouterToken = { tokenContractAddress?: string; decimal?: string; taxRate?: string | number | null; isHoneyPot?: boolean };
@@ -40,13 +41,18 @@ type ExecutionState = {
 };
 type CexBalance = { ccy: string; availBal: string };
 type CexOrder = {
-  ordId?: string; clOrdId?: string; sCode?: string; sMsg?: string;
-  state?: string; accFillSz?: string; avgPx?: string;
+  ordId?: string; clOrdId?: string; instId?: string; side?: string; sz?: string; px?: string; cTime?: string;
+  sCode?: string; sMsg?: string; state?: string; accFillSz?: string; avgPx?: string;
+};
+type RecoveryCycleRow = {
+  id: number; status: string; inst_id: string; chain_index: string;
+  direction: "cex_buy_dex_sell" | "dex_buy_cex_sell"; client_order_id: string | null;
+  cex_order_intent: unknown; chain_tx_hash: string | null;
 };
 type ApprovalTransaction = { dexContractAddress?: string; data?: string };
 type ExecutionInput = {
   enabled: boolean; armed: () => boolean; tradeSizeUsdt: number; maxTradeSizeUsdt: number;
-  assets: AssetConfig[]; okx: Credentials; dex: Credentials;
+  assets: AssetConfig[]; recoveryAssets: AssetConfig[]; okx: Credentials; dex: Credentials;
   signers: Config["signers"]; guardrails: Config["runtime"]["guardrails"];
   dbReady: () => boolean; getState: (asset: AssetConfig) => ExecutionState; pause: () => void;
   setHealth: (dependency: string, status: string, error?: string | null) => void;
@@ -129,12 +135,167 @@ const SOLANA_WRAPPED_SOL = "So11111111111111111111111111111111111111112";
 const SOLANA_MAX_TX_FEE_LAMPORTS = 1_000_000n;
 const fail = (message: string): never => { throw new Error(message); };
 
-export function createTradeExecutor(input: ExecutionInput): { tick: () => Promise<void>; checkApprovals: () => Promise<void> } {
+function recoveryCycle(row: RecoveryCycleRow): RecoveryCycle {
+  return {
+    id: row.id, status: row.status, instId: row.inst_id, chainIndex: row.chain_index,
+    direction: row.direction, chainTxHash: row.chain_tx_hash, clientOrderId: row.client_order_id,
+    cexOrderIntent: parseCexOrderIntent(row.cex_order_intent),
+  };
+}
+
+function parseCexOrderIntent(value: unknown): CexOrderIntent | null {
+  try {
+    const parsed = typeof value === "string" ? JSON.parse(value) as Record<string, unknown> : value as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== "object" || typeof parsed.instId !== "string" || typeof parsed.clOrdId !== "string"
+      || (parsed.side !== "buy" && parsed.side !== "sell") || typeof parsed.sz !== "string" || typeof parsed.px !== "string"
+      || typeof parsed.dexAssetDeltaRaw !== "string" || !/^-?\d+$/.test(parsed.dexAssetDeltaRaw)
+      || typeof parsed.dexQuoteDeltaRaw !== "string" || !/^-?\d+$/.test(parsed.dexQuoteDeltaRaw)) return null;
+    return {
+      instId: parsed.instId, clOrdId: parsed.clOrdId, side: parsed.side, sz: parsed.sz, px: parsed.px,
+      dexAssetDeltaRaw: parsed.dexAssetDeltaRaw, dexQuoteDeltaRaw: parsed.dexQuoteDeltaRaw,
+      preparedAt: typeof parsed.preparedAt === "string" ? parsed.preparedAt : undefined,
+    };
+  } catch { return null; }
+}
+
+async function findOrderForRecovery(credentials: Credentials, cycle: RecoveryCycle): Promise<CexOrder | null> {
+  const intent = cycle.cexOrderIntent;
+  const instId = intent?.instId ?? cycle.instId;
+  const clOrdId = intent?.clOrdId ?? cycle.clientOrderId;
+  if (!clOrdId) return null;
+  const base = new URLSearchParams({ instId, clOrdId });
+  const history = new URLSearchParams({ instType: "SPOT", instId, ordType: "ioc", clOrdId });
+  let succeeded = false;
+  let lastError: unknown;
+  for (const path of [
+    `/api/v5/trade/order?${base}`,
+    `/api/v5/trade/orders-history?${history}`,
+    `/api/v5/trade/orders-history-archive?${history}`,
+  ]) {
+    try {
+      const rows = await okxPrivateGet<CexOrder[]>(path, credentials);
+      succeeded = true;
+      const notBefore = intent?.preparedAt ? Date.parse(intent.preparedAt) - 5 * 60_000 : undefined;
+      const order = rows.find((row) => row.clOrdId === clOrdId && row.instId === instId
+        && (notBefore === undefined || (Number.isFinite(Number(row.cTime)) && Number(row.cTime) >= notBefore)));
+      if (order) return order;
+    } catch (error) { lastError = error; }
+  }
+  if (!succeeded && lastError) throw lastError;
+  return null;
+}
+
+async function inspectChainTransaction(chainIndex: string, txHash: string, solanaRpcUrl: string): Promise<"confirmed" | "failed" | "pending" | "unknown"> {
+  if (chainIndex === XLAYER_CHAIN) {
+    const provider = evmProvider();
+    const [receipt, transaction] = await Promise.all([
+      provider.getTransactionReceipt(txHash), provider.getTransaction(txHash),
+    ]);
+    if (receipt) return receipt.status === 1 ? "confirmed" : "failed";
+    return transaction ? "pending" : "unknown";
+  }
+  if (chainIndex === SOLANA_CHAIN) {
+    const connection = new Connection(solanaRpcUrl, { commitment: "confirmed", fetch: solanaRpcFetch });
+    const result = await connection.getSignatureStatuses([txHash], { searchTransactionHistory: true });
+    const status = result.value[0];
+    if (!status) return "unknown";
+    if (status.err) return "failed";
+    return status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized" ? "confirmed" : "pending";
+  }
+  return "unknown";
+}
+
+async function persistRecoveryDecision(cycleId: number, txHash: string | null, decision: RecoveryDecision): Promise<void> {
+  if (txHash && decision.chainStatus) {
+    const txStatus = decision.chainStatus === "confirmed" ? "CONFIRMED" : decision.chainStatus === "failed" ? "FAILED" : "UNCERTAIN";
+    await execute("UPDATE trade_cycle_tx SET status=? WHERE tx_hash=? AND purpose='swap'", [txStatus, txHash]);
+  }
+  await execute(
+    `UPDATE trade_cycle SET status=?,reason=?,cex_order_id=COALESCE(?,cex_order_id),
+       cex_order_state=COALESCE(?,cex_order_state),cex_filled_size=COALESCE(?,cex_filled_size),
+       cex_average_price=COALESCE(?,cex_average_price),
+       dex_actual_asset_delta_raw=COALESCE(?,dex_actual_asset_delta_raw),
+       dex_actual_quote_delta_raw=COALESCE(?,dex_actual_quote_delta_raw),recovery_checked_at=UTC_TIMESTAMP(3)
+     WHERE id=? AND status NOT IN ('COMPLETE','FAILED','RECONCILED')`,
+    [decision.status, decision.reason.slice(0, 500), decision.order?.ordId ?? null, decision.order?.state ?? null,
+      decision.order?.accFillSz ?? null, decision.order?.avgPx ?? null, decision.assetDeltaRaw ?? null,
+      decision.quoteDeltaRaw ?? null, cycleId],
+  );
+}
+
+export function createTradeExecutor(input: ExecutionInput): { tick: () => Promise<void>; checkApprovals: () => Promise<void>; recover: () => Promise<boolean> } {
   const lastScanAt = new Map<string, number>();
   let localRunning = false;
+  let recoveryReady = false;
+  let recoveryRunning = false;
   return {
+    recover: async () => {
+      if (recoveryReady) return true;
+      if (!input.dbReady() || recoveryRunning) return false;
+      recoveryRunning = true;
+      try {
+        const result = await withNamedLock("xaapl_trade_execution", async () => {
+          const cycles = await query<Array<RecoveryCycleRow>>(
+            `SELECT c.id,c.status,c.inst_id,c.chain_index,c.direction,c.client_order_id,c.cex_order_intent,
+                    COALESCE(c.chain_tx_hash,tx.tx_hash) chain_tx_hash
+             FROM trade_cycle c LEFT JOIN trade_cycle_tx tx ON tx.trade_cycle_id=c.id AND tx.purpose='swap'
+             WHERE c.status NOT IN ('COMPLETE','FAILED','RECONCILED') ORDER BY c.id`,
+          );
+          if (!cycles.length) {
+            recoveryReady = true;
+            input.setHealth("trade_execution", "healthy", "No incomplete trade cycles need recovery");
+            return true;
+          }
+
+          recoveryReady = false;
+          input.pause();
+          for (const row of cycles) {
+            const cycle = recoveryCycle(row);
+            let decision;
+            try {
+              const asset = input.recoveryAssets.find((item) => item.instId === row.inst_id && item.chainIndex === row.chain_index);
+              decision = await recoverCycle(cycle, {
+                chainStatus: (chainIndex, txHash) => inspectChainTransaction(chainIndex, txHash, input.signers.solanaRpcUrl),
+                swapDeltas: async (pending) => {
+                  if (!asset) throw new Error("Asset configuration for the incomplete trade cycle is unavailable");
+                  const wallet = signer(asset.chainIndex, input.signers.xlayerPrivateKey, input.signers.solanaPrivateKey);
+                  if (!wallet) throw new Error("Wallet signer is unavailable to verify the recorded chain transaction");
+                  return readSwapDeltas(asset, pending.chainTxHash!, wallet.address, input.signers.solanaRpcUrl);
+                },
+                cexOrder: (pending) => findOrderForRecovery(input.okx, pending),
+              });
+            } catch (error) {
+              decision = { status: "RECOVERY_REQUIRED" as const, reason: messageOf(error).slice(0, 500) };
+            }
+            await persistRecoveryDecision(row.id, cycle.chainTxHash, decision);
+          }
+
+          const remaining = await query<Array<{ id: number; status: string }>>(
+            "SELECT id,status FROM trade_cycle WHERE status NOT IN ('COMPLETE','FAILED','RECONCILED') ORDER BY id LIMIT 1",
+          );
+          if (remaining[0]) {
+            input.setHealth("trade_execution", remaining[0].status === "HEDGE_REQUIRED" ? "blocked" : "reconciling", `Trade cycle ${remaining[0].id} requires ${remaining[0].status}; automatic trading remains paused`);
+            return false;
+          }
+          recoveryReady = true;
+          input.setHealth("trade_execution", "healthy", "Trade-cycle recovery completed");
+          return true;
+        });
+        if (result === null) {
+          input.setHealth("trade_execution", "busy", "Another process holds the trade execution lock; recovery is pending");
+          return false;
+        }
+        return result;
+      } catch (error) {
+        recoveryReady = false;
+        input.pause();
+        input.setHealth("trade_execution", "blocked", `Trade-cycle recovery failed: ${messageOf(error)}`);
+        logger.error("Trade-cycle recovery failed", error);
+        return false;
+      } finally { recoveryRunning = false; }
+    },
     tick: async () => {
-      if (!input.enabled || !input.armed() || !input.dbReady() || localRunning) return;
+      if (!input.enabled || !input.armed() || !input.dbReady() || !recoveryReady || localRunning) return;
       localRunning = true;
       try {
         const acquired = await withNamedLock("xaapl_trade_execution", async () => {
@@ -142,6 +303,7 @@ export function createTradeExecutor(input: ExecutionInput): { tick: () => Promis
             "SELECT id,status FROM trade_cycle WHERE status NOT IN ('COMPLETE','FAILED','RECONCILED') ORDER BY id DESC LIMIT 1",
           );
           if (active[0]) {
+            recoveryReady = false;
             input.pause();
             input.setHealth("trade_execution", active[0].status === "HEDGE_REQUIRED" ? "blocked" : "reconciling", `Trade cycle ${active[0].id} is ${active[0].status}; automatic trading is paused`);
             return;
@@ -254,7 +416,8 @@ async function tryCexBuyDexSell(asset: AssetConfig, input: ExecutionInput): Prom
     ? await checkEvmAllowance(asset, asset.tokenAddress, asset.tokenSymbol, asset.tokenDecimals, wallet.address, amount, input)
     : null;
   if (asset.chainIndex === XLAYER_CHAIN && !approvalSpender) return false;
-  const cycleId = await createCycle(asset, "cex_buy_dex_sell", gate.decision.netProfitUsdt!, gate.quoteInput, gate.quoteOutput, gate.shares);
+  const cycleId = await createCycle(asset, "cex_buy_dex_sell", gate.decision.netProfitUsdt!, gate.quoteInput, gate.quoteOutput, gate.shares,
+    createExecutionIntent(asset, "cex_buy_dex_sell", bundle, quoteState, gate.quoteInput, gate.quoteOutput, gate.shares, gate.decision.netProfitUsdt!));
   try {
     if (!input.armed()) {
       await setCycle(cycleId, "FAILED", "Trading was disarmed before the swap was signed");
@@ -303,6 +466,7 @@ async function tryCexBuyDexSell(asset: AssetConfig, input: ExecutionInput): Prom
     }
     await setCycle(cycleId, "DEX_CONFIRMED", null, txHash);
     const deltas = await readSwapDeltas(asset, txHash, wallet.address, input.signers.solanaRpcUrl);
+    await persistSwapDeltas(cycleId, deltas);
     const tokenSold = -deltas.assetDelta;
     const stableReceived = deltas.quoteDelta;
     if (tokenSold <= 0n || stableReceived <= 0n || tokenSold > amount) {
@@ -378,14 +542,16 @@ async function tryCexBuyDexSell(asset: AssetConfig, input: ExecutionInput): Prom
     const clOrdIdResult = (await query<Array<{ client_order_id: string }>>("SELECT client_order_id FROM trade_cycle WHERE id=?", [cycleId]))[0]?.client_order_id;
     if (!clOrdIdResult) throw new Error("Trade client order ID was not persisted");
     const clOrdId = clOrdIdResult;
-    await setCycle(cycleId, "CEX_SUBMITTED", null, txHash);
+    await persistCexOrderIntent(cycleId, txHash, {
+      version: 1, instId: asset.instId, tdMode: "cash", clOrdId, side: "buy", ordType: "ioc",
+      px: limitPrice.toString(), sz: actualShares.toString(), bookExchangeTime: latestBook.exchangeTime,
+      bookReceivedAt: latestBook.receivedAt, bookSeqId: latestBook.seqId,
+      dexAssetDeltaRaw: deltas.assetDelta.toString(), dexQuoteDeltaRaw: deltas.quoteDelta.toString(), preparedAt: new Date().toISOString(),
+    });
     const order = await placeIocOrder(input.okx, cycleId, clOrdId, asset.instId, "buy", actualShares, limitPrice);
+    await persistCexOrderResult(cycleId, order);
     const filled = new Decimal(order.accFillSz ?? "0");
     const avgPrice = order.avgPx ? new Decimal(order.avgPx) : null;
-    await execute(
-      "UPDATE trade_cycle SET cex_requested_size=?,cex_filled_size=?,cex_average_price=? WHERE id=?",
-      [actualShares.toString(), filled.toString(), avgPrice?.toString() ?? null, cycleId],
-    );
     if (!filled.eq(actualShares) || order.state !== "filled" || !avgPrice?.isFinite()) {
       await setCycle(cycleId, "HEDGE_REQUIRED", `CEX IOC ended ${order.state ?? "unknown"} with ${filled.toString()} of ${actualShares.toString()} shares filled`, txHash);
       input.setHealth("trade_execution", "blocked", `Trade cycle ${cycleId} has an unmatched position; manual reconciliation required`);
@@ -410,10 +576,11 @@ async function tryCexBuyDexSell(asset: AssetConfig, input: ExecutionInput): Prom
     logger.info(`Completed CEX-buy/DEX-sell cycle ${cycleId} on ${asset.network}`);
     return true;
   } catch (error) {
+    const currentCycle = await query<Array<{ status: string }>>("SELECT status FROM trade_cycle WHERE id=?", [cycleId]).catch(() => null);
     const chainRows = await query<Array<{ purpose: string; status: string }>>(
       "SELECT purpose,status FROM trade_cycle_tx WHERE trade_cycle_id=?", [cycleId],
     ).catch(() => null);
-    const status = chainRows === null
+    const status = currentCycle?.[0]?.status === "CEX_SUBMITTED" ? "RECOVERY_REQUIRED" : chainRows === null
       || chainRows.some((row) => row.status === "SUBMITTED" || row.status === "UNCERTAIN")
       || chainRows.some((row) => row.purpose === "swap" && row.status !== "FAILED")
       ? "HEDGE_REQUIRED" : "FAILED";
@@ -463,7 +630,8 @@ async function tryDexBuyCexSell(asset: AssetConfig, input: ExecutionInput): Prom
     ? await checkEvmAllowance(asset, asset.quoteTokenAddress, asset.quoteTokenSymbol, asset.quoteTokenDecimals, wallet.address, amount, input)
     : null;
   if (asset.chainIndex === XLAYER_CHAIN && !approvalSpender) return false;
-  const cycleId = await createCycle(asset, "dex_buy_cex_sell", gate.decision.netProfitUsdt!, gate.quoteInput, gate.quoteOutput, gate.shares);
+  const cycleId = await createCycle(asset, "dex_buy_cex_sell", gate.decision.netProfitUsdt!, gate.quoteInput, gate.quoteOutput, gate.shares,
+    createExecutionIntent(asset, "dex_buy_cex_sell", bundle, quoteState, gate.quoteInput, gate.quoteOutput, gate.shares, gate.decision.netProfitUsdt!));
   try {
     if (!input.armed()) {
       await setCycle(cycleId, "FAILED", "Trading was disarmed before the swap was signed");
@@ -515,6 +683,7 @@ async function tryDexBuyCexSell(asset: AssetConfig, input: ExecutionInput): Prom
     }
     await setCycle(cycleId, "DEX_CONFIRMED", null, txHash);
     const deltas = await readSwapDeltas(asset, txHash, wallet.address, input.signers.solanaRpcUrl);
+    await persistSwapDeltas(cycleId, deltas);
     const tokenBought = deltas.assetDelta;
     const quoteSpent = -deltas.quoteDelta;
     if (tokenBought <= 0n || quoteSpent <= 0n || quoteSpent > amount) {
@@ -584,14 +753,16 @@ async function tryDexBuyCexSell(asset: AssetConfig, input: ExecutionInput): Prom
 
     const clOrdId = (await query<Array<{ client_order_id: string }>>("SELECT client_order_id FROM trade_cycle WHERE id=?", [cycleId]))[0]?.client_order_id;
     if (!clOrdId) throw new Error("Trade client order ID was not persisted");
-    await setCycle(cycleId, "CEX_SUBMITTED", null, txHash);
+    await persistCexOrderIntent(cycleId, txHash, {
+      version: 1, instId: asset.instId, tdMode: "cash", clOrdId, side: "sell", ordType: "ioc",
+      px: limitPrice.toString(), sz: actualShares.toString(), bookExchangeTime: latestBook.exchangeTime,
+      bookReceivedAt: latestBook.receivedAt, bookSeqId: latestBook.seqId,
+      dexAssetDeltaRaw: deltas.assetDelta.toString(), dexQuoteDeltaRaw: deltas.quoteDelta.toString(), preparedAt: new Date().toISOString(),
+    });
     const order = await placeIocOrder(input.okx, cycleId, clOrdId, asset.instId, "sell", actualShares, limitPrice);
+    await persistCexOrderResult(cycleId, order);
     const filled = new Decimal(order.accFillSz ?? "0");
     const avgPrice = order.avgPx ? new Decimal(order.avgPx) : null;
-    await execute(
-      "UPDATE trade_cycle SET cex_requested_size=?,cex_filled_size=?,cex_average_price=? WHERE id=?",
-      [actualShares.toString(), filled.toString(), avgPrice?.toString() ?? null, cycleId],
-    );
     if (!filled.eq(actualShares) || order.state !== "filled" || !avgPrice?.isFinite()) {
       await setCycle(cycleId, "HEDGE_REQUIRED", "CEX IOC ended " + (order.state ?? "unknown") + " with " + filled.toString() + " of " + actualShares.toString() + " shares filled", txHash);
       input.setHealth("trade_execution", "blocked", "Trade cycle " + cycleId + " has an unmatched position; manual reconciliation required");
@@ -616,10 +787,11 @@ async function tryDexBuyCexSell(asset: AssetConfig, input: ExecutionInput): Prom
     logger.info("Completed DEX-buy/CEX-sell cycle " + cycleId + " on " + asset.network);
     return true;
   } catch (error) {
+    const currentCycle = await query<Array<{ status: string }>>("SELECT status FROM trade_cycle WHERE id=?", [cycleId]).catch(() => null);
     const chainRows = await query<Array<{ purpose: string; status: string }>>(
       "SELECT purpose,status FROM trade_cycle_tx WHERE trade_cycle_id=?", [cycleId],
     ).catch(() => null);
-    const status = chainRows === null
+    const status = currentCycle?.[0]?.status === "CEX_SUBMITTED" ? "RECOVERY_REQUIRED" : chainRows === null
       || chainRows.some((row) => row.status === "SUBMITTED" || row.status === "UNCERTAIN")
       || chainRows.some((row) => row.purpose === "swap" && row.status !== "FAILED")
       ? "HEDGE_REQUIRED" : "FAILED";
@@ -765,6 +937,26 @@ async function readChainBalances(asset: AssetConfig, owner: string, signers: Con
     connection.getBalance(ownerKey, "confirmed"),
   ]);
   return { asset: token, quote, native: BigInt(native) };
+}
+
+export async function inspectRouteBalances(
+  asset: AssetConfig, credentials: Credentials, signers: Config["signers"],
+): Promise<{ walletAddress: string; cexUsdt: string; cexAsset: string; chainAssetRaw: string; chainQuoteRaw: string; chainNativeRaw: string }> {
+  const wallet = signer(asset.chainIndex, signers.xlayerPrivateKey, signers.solanaPrivateKey);
+  if (!wallet) throw new Error(`Wallet signer is unavailable for ${asset.network}`);
+  const [cexUsdt, cexAsset, chain] = await Promise.all([
+    okxAvailable(credentials, "USDT"),
+    okxAvailable(credentials, asset.okxCurrency),
+    readChainBalances(asset, wallet.address, signers),
+  ]);
+  return {
+    walletAddress: wallet.address,
+    cexUsdt: cexUsdt.toString(),
+    cexAsset: cexAsset.toString(),
+    chainAssetRaw: chain.asset.toString(),
+    chainQuoteRaw: chain.quote.toString(),
+    chainNativeRaw: chain.native.toString(),
+  };
 }
 
 async function readEvmTokenBalance(provider: JsonRpcProvider, token: string, owner: string): Promise<bigint> {
@@ -1197,13 +1389,59 @@ function minCexSellPrice(cost: string, gas: Decimal, shares: Decimal, feeRate: D
   return price.gt(0) ? price : null;
 }
 
-async function createCycle(asset: AssetConfig, direction: string, netProfit: string, dexInput: string, dexOutput: string, cexSize: Decimal): Promise<number> {
+function createExecutionIntent(
+  asset: AssetConfig, direction: string, bundle: SwapBundle, state: ExecutionState,
+  dexInput: string, dexOutput: string, cexSize: Decimal, netProfit: string,
+): string {
+  return JSON.stringify({
+    version: 1, recordedAt: new Date().toISOString(), instId: asset.instId, chainIndex: asset.chainIndex, direction,
+    expected: { dexInput, dexOutput, cexSize: cexSize.toString(), netProfitUsdt: netProfit },
+    dexQuote: {
+      fromToken: bundle.routerResult?.fromToken?.tokenContractAddress,
+      toToken: bundle.routerResult?.toToken?.tokenContractAddress,
+      fromTokenAmount: bundle.routerResult?.fromTokenAmount,
+      toTokenAmount: bundle.routerResult?.toTokenAmount,
+      priceImpactPercent: bundle.routerResult?.priceImpactPercent ?? bundle.routerResult?.priceImpactPercentage,
+    },
+    market: {
+      multiplier: state.multiplier?.toString(), feeRate: state.feeRate?.toString(),
+      book: state.book && { exchangeTime: state.book.exchangeTime, receivedAt: state.book.receivedAt, seqId: state.book.seqId },
+    },
+  });
+}
+
+async function createCycle(asset: AssetConfig, direction: string, netProfit: string, dexInput: string, dexOutput: string, cexSize: Decimal, executionIntent: string): Promise<number> {
   const clOrdId = `xa${Date.now().toString(36)}${randomBytes(6).toString("hex")}`.slice(0, 32);
   const result = await execute(
-    "INSERT INTO trade_cycle (inst_id,chain_index,direction,status,client_order_id,dex_from_amount,dex_to_amount,cex_requested_size,expected_net_profit_usdt,reason) VALUES (?,?,?,'PREPARING',?,?,?,?,?,NULL)",
-    [asset.instId, asset.chainIndex, direction, clOrdId, dexInput, dexOutput, cexSize.toString(), netProfit],
+    "INSERT INTO trade_cycle (inst_id,chain_index,direction,status,client_order_id,dex_from_amount,dex_to_amount,cex_requested_size,expected_net_profit_usdt,execution_intent,reason) VALUES (?,?,?,'PREPARING',?,?,?,?,?,?,NULL)",
+    [asset.instId, asset.chainIndex, direction, clOrdId, dexInput, dexOutput, cexSize.toString(), netProfit, executionIntent],
   );
   return result.insertId;
+}
+
+async function persistSwapDeltas(cycleId: number, deltas: { assetDelta: bigint; quoteDelta: bigint }): Promise<void> {
+  await execute("UPDATE trade_cycle SET dex_actual_asset_delta_raw=?,dex_actual_quote_delta_raw=? WHERE id=?", [
+    deltas.assetDelta.toString(), deltas.quoteDelta.toString(), cycleId,
+  ]);
+}
+
+async function persistCexOrderIntent(cycleId: number, txHash: string, intent: CexOrderIntent & {
+  version: 1; tdMode: "cash"; ordType: "ioc"; bookExchangeTime: number; bookReceivedAt: number; bookSeqId: number; preparedAt: string;
+}): Promise<void> {
+  const result = await execute(
+    `UPDATE trade_cycle SET cex_order_intent=?,cex_order_side=?,cex_order_limit_price=?,cex_requested_size=?,
+       cex_order_state='SUBMITTING',status='CEX_SUBMITTED',reason=NULL,chain_tx_hash=COALESCE(?,chain_tx_hash)
+     WHERE id=? AND status='DEX_CONFIRMED' AND cex_order_intent IS NULL`,
+    [JSON.stringify(intent), intent.side, intent.px, intent.sz, txHash, cycleId],
+  );
+  if (result.affectedRows !== 1) throw new Error(`CEX order intent was not persisted for trade cycle ${cycleId}`);
+}
+
+async function persistCexOrderResult(cycleId: number, order: CexOrder): Promise<void> {
+  await execute(
+    `UPDATE trade_cycle SET cex_order_id=?,cex_order_state=?,cex_filled_size=?,cex_average_price=? WHERE id=?`,
+    [order.ordId ?? null, order.state ?? null, order.accFillSz ?? "0", order.avgPx ?? null, cycleId],
+  );
 }
 
 async function setCycle(id: number, status: string, reason: string | null, txHash?: string): Promise<void> {

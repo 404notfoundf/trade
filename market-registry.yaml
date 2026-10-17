@@ -121,8 +121,8 @@ pools:
     instrument_id: XSPCX
     chain: solana
     # Optional pool-specific endpoints; omit both to use chains.solana defaults.
-    # rpc_http: env:SOLANA_XSPCX_RAYDIUM_RPC_HTTP
-    # rpc_ws: env:SOLANA_XSPCX_RAYDIUM_RPC_WS
+    rpc_http: env:SOLANA_XSPCX_RAYDIUM_RPC_HTTP
+    rpc_ws: env:SOLANA_XSPCX_RAYDIUM_RPC_WS
     dex: raydium_clmm_solana
     mode: observe_only
     reason: quote_asset_not_pinned

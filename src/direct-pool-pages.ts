@@ -3,6 +3,7 @@ import type { AssetConfig, Config } from "./config.js";
 import { query } from "./db.js";
 import type { PoolMonitorState } from "./fixed-pools.js";
 import { solveDirectPoolCandidates } from "./trading/market-registry.js";
+import { summarizeDirectionAudit, type DirectionAuditSample } from "./trading/direction-audit.js";
 import {
   collectPositiveWindows,
   DIRECT_POOL_POOL_ID_MIGRATION,
@@ -48,6 +49,14 @@ type QuoteRow = {
   valuation_status: string | null;
 };
 type StatRow = { positive: number; valid: number; max_net: string | null };
+type CountRow = { total: number };
+type DirectionAuditSampleRow = {
+  instrument_id: string; chain_index: string; size_usdt: string;
+  cex_pool_id: string | null; dex_pool_id: string | null;
+  cex_book_seq_id: string | null; dex_book_seq_id: string | null;
+  cex_pool_state_fingerprint: string | null; dex_pool_state_fingerprint: string | null;
+  cex_net_profit_usdt: string | null; dex_net_profit_usdt: string | null;
+};
 type OffsetRow = { offset_seconds: number };
 type MigrationRow = { applied_at: Date };
 
@@ -55,7 +64,14 @@ const pageSize = 20;
 const validEstimateSql = "net_profit_usdt IS NOT NULL AND valuation_status NOT LIKE 'INVALIDATED_%'";
 const actualTime = (stored: Date, offsetSeconds: number) => new Date(stored.getTime() - offsetSeconds * 1000);
 const storedTime = (utc: Date, offsetSeconds: number) => new Date(utc.getTime() + offsetSeconds * 1000);
+const fixedRange = (range: DirectPoolRange): DirectPoolRange => ({ from: range.from, to: range.to, preset: "custom", invalid: false });
 const isInvalidated = (status: string | null) => status?.startsWith("INVALIDATED_") ?? false;
+function formatWindowSpan(startAt: Date, lastObservedAt: Date): string {
+  const seconds = Math.max(0, Math.floor((lastObservedAt.getTime() - startAt.getTime()) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds % 3600 / 60);
+  return hours ? `${hours}小时${minutes}分` : minutes ? `${minutes}分${seconds % 60}秒` : `${seconds}秒`;
+}
 export const directPoolSimulationLabel = (status: string | null | undefined): string => ({
   NOT_REQUESTED: "未请求", NOT_APPLICABLE: "不适用", DISABLED: "未开启", NOT_QUALIFIED: "未达触发条件",
   COOLDOWN: "冷却中", SKIPPED: "已跳过", PASSED: "模拟通过", FAILED: "模拟失败",
@@ -146,14 +162,15 @@ function rangeControl(path: string, range: DirectPoolRange, poolId: string, pool
   </style>`;
 }
 
-function pagination(path: string, range: DirectPoolRange, page: number, hasNext: boolean, label: string, extra?: Record<string, string>): string {
+function pagination(path: string, range: DirectPoolRange, page: number, total: number, label: string, extra?: Record<string, string>): string {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const previous = page > 1 ? `<a href="${directPoolHref(path, range, { ...extra, page: String(page - 1) })}">上一页</a>` : "";
-  const next = hasNext ? `<a href="${directPoolHref(path, range, { ...extra, page: String(page + 1) })}">下一页</a>` : "";
+  const next = page < totalPages ? `<a href="${directPoolHref(path, range, { ...extra, page: String(page + 1) })}">下一页</a>` : "";
   const params = rangeSearchParams(range);
   for (const [key, value] of Object.entries(extra ?? {})) params.set(key, value);
   const hidden = [...params].map(([key, value]) => `<input type="hidden" name="${key}" value="${value}">`).join("");
-  const jump = `<form class="pagination-jump" action="${path}" method="get" style="display:flex;align-items:center;gap:6px;margin:0">${hidden}<label>跳至第 <input type="number" name="page" value="${page}" min="1" step="1" required aria-label="跳转到页码" style="width:68px;padding:5px 7px"> 页</label><button type="submit">跳转</button></form>`;
-  return `<nav class="direct-pagination" aria-label="${label}"><span>第 ${page} 页 · 每页 ${pageSize} 条</span><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${previous}${next}${jump}</div></nav>`;
+  const jump = `<form class="pagination-jump" action="${path}" method="get" style="display:flex;align-items:center;gap:6px;margin:0">${hidden}<label>跳至第 <input type="number" name="page" value="${page}" min="1" max="${totalPages}" step="1" required aria-label="跳转到页码" style="width:68px;padding:5px 7px"> / ${totalPages} 页</label><button type="submit">跳转</button></form>`;
+  return `<nav class="direct-pagination" aria-label="${label}"><span>第 ${page} / ${totalPages} 页 · 共 ${total} 条 · 每页 ${pageSize} 条</span><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${previous}${next}${jump}</div></nav>`;
 }
 
 function pageStyle(): string {
@@ -192,8 +209,12 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
   const positiveOnly = filters?.positiveOnly ?? false;
   const filterParams = decisionFilterParams(filters);
   const invalidRange = range.invalid ? '<p class="guard-alert">时间范围无效，已回退为最近 1 小时。</p>' : "";
-  const positiveShortcut = path === "/direct-pools" ? `<p><a href="${directPoolHref("/direct-pools/decisions", range, { ...(poolId ? { pool: poolId } : {}), profit: "positive" })}">查看所选时间范围内全部正收益记录 →</a></p>` : "";
-  const header = `<h2>${path === "/direct-pools/quotes" ? "Exact-In 报价记录" : path === "/direct-pools/decisions" ? "收益明细" : "指定池收益总览"}</h2>${subNav(path, range, poolId, filters)}${rangeControl(path, range, poolId, config.marketRegistry.pools, escapeHtml, filters)}${positiveShortcut}${invalidRange}`;
+  const positiveShortcut = path === "/direct-pools" ? `<p><a href="${directPoolHref("/direct-pools/decisions", range, { ...(poolId ? { pool: poolId } : {}), profit: "positive" })}">查看逐条正收益观测样本 →</a></p>` : "";
+  const header = path === "/direct-pools/window"
+    ? `<h2>正收益窗口样本</h2><p><a href="${directPoolHref("/direct-pools", range, poolId ? { pool: poolId } : undefined)}">← 返回收益总览</a></p>`
+    : path === "/direct-pools/windows"
+      ? `<h2>全部正收益窗口</h2><p><a href="${directPoolHref("/direct-pools", range, poolId ? { pool: poolId } : undefined)}">← 返回收益总览</a></p>${rangeControl(path, range, poolId, config.marketRegistry.pools, escapeHtml)}${invalidRange}`
+    : `<h2>${path === "/direct-pools/quotes" ? "Exact-In 报价记录" : path === "/direct-pools/decisions" ? "收益明细" : "指定池收益总览"}</h2>${subNav(path, range, poolId, filters)}${rangeControl(path, range, poolId, config.marketRegistry.pools, escapeHtml, filters)}${positiveShortcut}${invalidRange}`;
   if (!dbOnline) return `${header}<p class="guard-alert">数据库不可用，暂时无法读取 Direct Pool 观察数据。</p>${pageStyle()}`;
 
   let offsetSeconds: number;
@@ -202,10 +223,68 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
   const toStored = storedTime(range.to, offsetSeconds);
 
   try {
+    if (path === "/direct-pools/window") {
+      const fromMsValue = url.searchParams.get("window_from_ms") ?? "";
+      const toMsValue = url.searchParams.get("window_to_ms") ?? "";
+      const instrumentId = (url.searchParams.get("window_instrument") ?? "").trim().slice(0, 32);
+      const chainIndex = (url.searchParams.get("window_chain") ?? "").trim().slice(0, 16);
+      const windowPoolId = (url.searchParams.get("pool") ?? "").trim().slice(0, 128);
+      const direction = url.searchParams.get("direction") ?? "";
+      const sizeUsdt = (url.searchParams.get("window_size") ?? "").trim();
+      const closedValue = url.searchParams.get("window_closed") ?? "";
+      const firstId = url.searchParams.get("window_first_id") ?? "";
+      const lastId = url.searchParams.get("window_last_id") ?? "";
+      const positiveCountValue = url.searchParams.get("window_positive_count") ?? "";
+      const positiveCount = Number(positiveCountValue);
+      const validSize = sizeUsdt.length <= 31 && /^\d+(?:\.\d{1,12})?$/.test(sizeUsdt) && new Decimal(sizeUsdt).gt(0);
+      const validIds = /^\d{1,20}$/.test(firstId) && /^\d{1,20}$/.test(lastId)
+        && (firstId.length < lastId.length || firstId.length === lastId.length && firstId <= lastId);
+      const fromMs = Number(fromMsValue);
+      const toMs = Number(toMsValue);
+      const closed = closedValue === "1";
+      const validWindow = /^\d{13}$/.test(fromMsValue) && /^\d{13}$/.test(toMsValue)
+        && Number.isSafeInteger(fromMs) && Number.isSafeInteger(toMs) && (closed ? fromMs <= toMs : fromMs < toMs)
+        && instrumentId !== "" && chainIndex !== "" && windowPoolId !== ""
+        && (closedValue === "0" || closedValue === "1")
+        && (direction === "cex_buy_dex_sell" || direction === "dex_buy_cex_sell") && validSize && validIds
+        && /^\d{1,9}$/.test(positiveCountValue) && Number.isSafeInteger(positiveCount);
+      if (!validWindow) return `${header}<p class="guard-alert">窗口参数无效，请从收益总览重新打开。</p>${pageStyle()}`;
+      const from = new Date(fromMs);
+      const to = new Date(toMs);
+      const page = parsePageNumber(url.searchParams.get("page"));
+      const windowWhere = "id >= ? AND id <= ? AND instrument_id = ? AND chain_index = ? AND pool_id = ? AND direction = ? AND size_usdt = ?";
+      const windowParameters = [firstId, lastId, instrumentId, chainIndex, windowPoolId, direction, sizeUsdt];
+      const [rows, countRows] = await Promise.all([
+        query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,simulation_status,simulation_reason,created_at FROM direct_pool_decision WHERE ${windowWhere} ORDER BY created_at ASC,id ASC LIMIT ? OFFSET ?`, [...windowParameters, pageSize + 1, (page - 1) * pageSize]),
+        query<CountRow[]>(`SELECT COUNT(*) total FROM direct_pool_decision WHERE ${windowWhere}`, windowParameters),
+      ]);
+      const total = Number(countRows[0]?.total ?? 0);
+      const windowParams = {
+        pool: windowPoolId, direction, window_instrument: instrumentId, window_chain: chainIndex, window_size: sizeUsdt,
+        window_from_ms: fromMsValue, window_to_ms: toMsValue, window_closed: closed ? "1" : "0", window_first_id: firstId, window_last_id: lastId, window_positive_count: positiveCountValue,
+      };
+      const recordRows = rows.slice(0, pageSize).map((raw) => {
+        const row = correctedDecision(raw, offsetSeconds);
+        const profit = decisionProfit(row, helpers);
+        const positive = !isInvalidated(row.valuation_status) && row.net_profit_usdt !== null && new Decimal(row.net_profit_usdt).gt(0);
+        const included = positive ? "计入正收益窗口指标" : row.net_profit_usdt !== null && !isInvalidated(row.valuation_status) ? "非正收益，仅用于连续性判断" : "无有效收益估值，不计入窗口判断";
+        const quote = row.selected_quote_id === null ? "原始报价已过保留期或未关联" : `<a href="${directPoolHref("/direct-pools/quote", range, { id: String(row.selected_quote_id), back: "window", ...windowParams, ...(page > 1 ? { page: String(page) } : {}) })}">报价拆分详情 →</a>`;
+        return `<tr><td>${escapeHtml(formatUtc8(row.created_at))}</td><td class="numeric ${profit.className}"><strong>${escapeHtml(profit.text)}</strong></td><td class="numeric">${escapeHtml(row.cex_vwap === null ? "—" : formatReportDecimal(row.cex_vwap, 8))}</td><td class="numeric">${escapeHtml(row.gross_profit_usdt === null ? "—" : `${formatReportDecimal(row.gross_profit_usdt, 6)} USDT`)}</td><td class="numeric">${escapeHtml(row.cex_fee_usdt === null ? "—" : `${formatReportDecimal(row.cex_fee_usdt, 6)} USDT`)}</td><td class="numeric">${escapeHtml(row.gas_budget_usdt === null ? "—" : `${formatReportDecimal(row.gas_budget_usdt, 6)} USDT`)}</td><td>${escapeHtml(included)}<small>${escapeHtml(row.decision_status)} · ${escapeHtml(row.valuation_status)} · ${escapeHtml(row.execution_status)}${row.block_reason ? ` · ${escapeHtml(row.block_reason)}` : ""}</small></td><td>${quote}</td></tr>`;
+      }).join("");
+      const directionLabel = direction === "dex_buy_cex_sell" ? "DEX 买入 · CEX 卖出" : "CEX 买入 · DEX 卖出";
+      return `${header}<div class="window-detail-meta"><div><small>资产</small><strong>${escapeHtml(instrumentId)}</strong></div><div><small>链 / 池</small><strong>${escapeHtml(chainIndex)} · ${escapeHtml(windowPoolId)}</strong></div><div><small>方向</small><strong>${escapeHtml(directionLabel)}</strong></div><div><small>规模</small><strong>${escapeHtml(formatReportDecimal(sizeUsdt, 8))} USDT</strong></div><div><small>正收益样本数</small><strong>${positiveCount}</strong></div><div class="window-range"><small>窗口范围（UTC+8）</small><strong>${escapeHtml(formatUtc8(from))} 至 ${escapeHtml(formatUtc8(to))}${closed ? " · 结束确认时间" : " · 当前查询截止"}</strong></div></div><p class="window-detail-note">按时间正序展示窗口内的收益观测。正收益样本计入窗口指标；零/负收益样本用于连续性判断；无法估值样本仅供诊断。结果是观察估算，不代表可成交或实际收益。</p><section class="overview"><div class="section-heading"><h3>窗口内全部样本</h3><span>每页 20 条</span></div><div class="table-wrap"><table class="direct-record-table window-sample-table"><thead><tr><th>时间（UTC+8）</th><th>净收益 / ROI</th><th>CEX VWAP</th><th>毛收益</th><th>CEX 手续费</th><th>Gas 预算</th><th>窗口统计 / 状态</th><th>详情</th></tr></thead><tbody>${recordRows || `<tr><td class="window-sample-empty" colspan="8">${positiveCount ? `明细查询未返回记录，但摘要统计有 ${positiveCount} 个正收益样本。` : "该窗口没有可显示的收益样本。"}</td></tr>`}</tbody></table></div>${pagination(path, range, page, total, "窗口收益样本分页", windowParams)}</section>${pageStyle()}<style>.window-detail-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin:16px 0;padding:14px 16px;border:1px solid #e5eaf2;border-radius:10px;background:#fff}.window-detail-meta>div{min-width:0}.window-detail-meta small{display:block;margin-bottom:3px;color:#758198;font-size:11px}.window-detail-meta strong{display:block;overflow-wrap:anywhere;color:#26364f;font-size:13px}.window-detail-meta .window-range{grid-column:1/-1}.window-detail-note{margin:0 0 14px;color:#65738a;font-size:12px;line-height:1.55}.window-sample-table{table-layout:fixed;min-width:1040px}.window-sample-table th,.window-sample-table td{padding:10px 8px;white-space:normal;overflow-wrap:anywhere;line-height:1.45}.window-sample-table th:nth-child(1){width:14%}.window-sample-table th:nth-child(2){width:15%}.window-sample-table th:nth-child(3){width:11%}.window-sample-table th:nth-child(4){width:11%}.window-sample-table th:nth-child(5){width:12%}.window-sample-table th:nth-child(6){width:10%}.window-sample-table th:nth-child(7){width:20%}.window-sample-table th:nth-child(8){width:7%}.window-sample-empty{padding:22px!important;color:#65738a;text-align:center!important}@media(max-width:700px){.window-detail-meta{grid-template-columns:1fr 1fr}.window-sample-table{min-width:960px}}</style>`;
+    }
+
     if (path === "/direct-pools/quotes") {
       const page = parsePageNumber(url.searchParams.get("page"));
       const poolPredicate = poolId ? " AND q.pool_id = ?" : "";
-      const rows = await query<QuoteRow[]>(`SELECT q.id,q.instrument_id,q.chain_index,q.pool_id,q.dex,q.direction,q.amount_in_raw,q.amount_out_raw,q.quoted_at,q.request_ms,q.status,q.failure_reason,q.raw_response,CAST(d.net_profit_usdt AS CHAR) net_profit_usdt,CAST(d.roi AS CHAR) roi,d.valuation_status FROM direct_pool_quote q LEFT JOIN direct_pool_decision d ON d.selected_quote_id=q.id WHERE ((q.quoted_at >= ? AND q.quoted_at < ?) OR (q.quoted_at IS NULL AND q.created_at >= ? AND q.created_at < ?))${poolPredicate} ORDER BY q.id DESC LIMIT ? OFFSET ?`, [range.from, range.to, fromStored, toStored, ...(poolId ? [poolId] : []), pageSize + 1, (page - 1) * pageSize]);
+      const quoteWhere = `((q.quoted_at >= ? AND q.quoted_at < ?) OR (q.quoted_at IS NULL AND q.created_at >= ? AND q.created_at < ?))${poolPredicate}`;
+      const quoteParameters = [range.from, range.to, fromStored, toStored, ...(poolId ? [poolId] : [])];
+      const [rows, countRows] = await Promise.all([
+        query<QuoteRow[]>(`SELECT q.id,q.instrument_id,q.chain_index,q.pool_id,q.dex,q.direction,q.amount_in_raw,q.amount_out_raw,q.quoted_at,q.request_ms,q.status,q.failure_reason,q.raw_response,CAST(d.net_profit_usdt AS CHAR) net_profit_usdt,CAST(d.roi AS CHAR) roi,d.valuation_status FROM direct_pool_quote q LEFT JOIN direct_pool_decision d ON d.selected_quote_id=q.id WHERE ${quoteWhere} ORDER BY q.id DESC LIMIT ? OFFSET ?`, [...quoteParameters, pageSize + 1, (page - 1) * pageSize]),
+        query<CountRow[]>(`SELECT COUNT(*) total FROM direct_pool_quote q LEFT JOIN direct_pool_decision d ON d.selected_quote_id=q.id WHERE ${quoteWhere}`, quoteParameters),
+      ]);
+      const total = Number(countRows[0]?.total ?? 0);
       const visible = rows.slice(0, pageSize);
       const tooOld = range.from.getTime() < Date.now() - config.marketdata.directQuoteRetentionDays * 86_400_000;
       const recordRows = visible.map((row) => {
@@ -221,7 +300,7 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
         const detail = directPoolHref("/direct-pools/quote", range, { id: String(row.id), ...(poolId ? { pool: poolId } : {}), ...(page > 1 ? { page: String(page) } : {}) });
         return `<tr><td>${escapeHtml(formatUtc8(row.quoted_at))}</td><td><strong>${escapeHtml(row.instrument_id)}</strong><small>${escapeHtml(row.pool_id)} · ${escapeHtml(directPoolDexLabel(row.dex))}</small></td><td>${escapeHtml(row.direction)}</td><td class="numeric">${escapeHtml(amounts)}</td><td>${row.status === "OK" ? `<span class="badge ${invalidated ? "unhealthy" : "fresh"}">${invalidated ? "估值失效" : "已报价"}</span>` : `<span class="badge unhealthy">失败</span><small>${escapeHtml(row.failure_reason ?? "报价失败")}</small>`}</td><td class="numeric">${escapeHtml(profit)}</td><td><a href="${detail}">详情 →</a></td></tr>`;
       }).join("");
-      return `${header}${tooOld ? `<p class="guard-alert">报价原始记录只保留 ${config.marketdata.directQuoteRetentionDays} 天；所选范围可能早于可用数据。</p>` : ""}<p class="direct-record-note">Exact-In 成功与失败报价；原始响应只在详情页显示。</p><section class="overview"><div class="table-wrap"><table class="direct-record-table"><thead><tr><th>时间 <small>(UTC+8)</small></th><th>路线</th><th>方向</th><th>输入 → 输出</th><th>状态</th><th>净收益 / ROI</th><th></th></tr></thead><tbody>${recordRows || '<tr><td colspan="7">当前范围没有报价记录。</td></tr>'}</tbody></table></div>${pagination(path, range, page, rows.length > pageSize, "报价记录分页", poolId ? { pool: poolId } : undefined)}</section>${pageStyle()}`;
+      return `${header}${tooOld ? `<p class="guard-alert">报价原始记录只保留 ${config.marketdata.directQuoteRetentionDays} 天；所选范围可能早于可用数据。</p>` : ""}<p class="direct-record-note">Exact-In 成功与失败报价；原始响应只在详情页显示。</p><section class="overview"><div class="table-wrap"><table class="direct-record-table"><thead><tr><th>时间 <small>(UTC+8)</small></th><th>路线</th><th>方向</th><th>输入 → 输出</th><th>状态</th><th>净收益 / ROI</th><th></th></tr></thead><tbody>${recordRows || '<tr><td colspan="7">当前范围没有报价记录。</td></tr>'}</tbody></table></div>${pagination(path, range, page, total, "报价记录分页", poolId ? { pool: poolId } : undefined)}</section>${pageStyle()}`;
     }
 
     if (path === "/direct-pools/decisions") {
@@ -243,7 +322,11 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
       }
       if (positiveOnly) decisionPredicates.push(`${validEstimateSql} AND net_profit_usdt > 0`);
       const filterSql = decisionPredicates.map((predicate) => ` AND ${predicate}`).join("");
-      const rows = await query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,simulation_status,simulation_reason,created_at FROM direct_pool_decision WHERE created_at >= ? AND created_at < ?${filterSql} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, [...decisionParameters, pageSize + 1, (page - 1) * pageSize]);
+      const [rows, countRows] = await Promise.all([
+        query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,simulation_status,simulation_reason,created_at FROM direct_pool_decision WHERE created_at >= ? AND created_at < ?${filterSql} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, [...decisionParameters, pageSize + 1, (page - 1) * pageSize]),
+        query<CountRow[]>(`SELECT COUNT(*) total FROM direct_pool_decision WHERE created_at >= ? AND created_at < ?${filterSql}`, decisionParameters),
+      ]);
+      const total = Number(countRows[0]?.total ?? 0);
       const recordRows = rows.slice(0, pageSize).map((raw) => {
         const row = correctedDecision(raw, offsetSeconds);
         const profit = decisionProfit(row, helpers);
@@ -255,39 +338,96 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
       const profitFilter = `<nav class="direct-subnav direct-profit-filter" aria-label="收益筛选"><a href="${directPoolHref(path, range, decisionFilterParams({ ...filters!, positiveOnly: false }))}"${positiveOnly ? "" : ' aria-current="page"'}>全部收益</a><a href="${directPoolHref(path, range, decisionFilterParams({ ...filters!, positiveOnly: true }))}"${positiveOnly ? ' aria-current="page"' : ""}>净收益大于 0</a></nav>`;
       const decisionNote = `<div class="direct-decision-note"><span>${positiveOnly ? "筛选结果：净收益为正且估值有效。" : "筛选结果：所选时间范围内的全部收益记录。"}</span><span>观察估算 · NOT_EXECUTABLE</span><span>CEX VWAP、收益拆分与估值口径见“报价详情”；保留 ${config.marketdata.directDecisionRetentionDays} 天，每页 20 条。</span></div>`;
       const emptyMessage = positiveOnly ? "当前时间范围没有净收益大于 0 的有效观察记录。" : "当前范围没有观察决策。";
-      return `${header}${profitFilter}${decisionNote}<section class="overview"><div class="table-wrap"><table class="direct-record-table direct-decision-table"><thead><tr><th>时间 <small>(UTC+8)</small></th><th>资产 / 链 / 池</th><th>方向</th><th>规模</th><th>净收益 / ROI</th><th>详情</th></tr></thead><tbody>${recordRows || `<tr><td colspan="6">${emptyMessage}</td></tr>`}</tbody></table></div>${pagination(path, range, page, rows.length > pageSize, "收益明细分页", filterParams)}</section>${pageStyle()}<style>.direct-profit-filter{display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px;margin:14px 0 10px;padding:4px;border:1px solid #e3e9f2;border-radius:10px;background:#f4f6fa}.direct-profit-filter a{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:0 13px;border-radius:7px;font-size:13px;font-weight:600;white-space:nowrap}.direct-profit-filter a[aria-current="page"]{background:#fff;color:#234a87;box-shadow:0 1px 3px #243b5a1a,inset 0 -2px #315fba}.direct-decision-note{display:flex;align-items:center;flex-wrap:wrap;gap:6px 14px;margin:0 0 14px;padding:10px 12px;border:1px solid #e7ecf3;border-radius:8px;background:#f8fafd;color:#65738a;font-size:12px;line-height:1.55}.direct-decision-note span{min-width:0;overflow-wrap:anywhere}.direct-decision-note span+span{padding-left:14px;border-left:1px solid #dce3ed}@media(max-width:700px){.direct-decision-note{align-items:flex-start;flex-direction:column;gap:4px}.direct-decision-note span+span{padding-left:0;border-left:0}}</style>`;
+      return `${header}${profitFilter}${decisionNote}<section class="overview"><div class="table-wrap"><table class="direct-record-table direct-decision-table"><thead><tr><th>时间 <small>(UTC+8)</small></th><th>资产 / 链 / 池</th><th>方向</th><th>规模</th><th>净收益 / ROI</th><th>详情</th></tr></thead><tbody>${recordRows || `<tr><td colspan="6">${emptyMessage}</td></tr>`}</tbody></table></div>${pagination(path, range, page, total, "收益明细分页", filterParams)}</section>${pageStyle()}<style>.direct-profit-filter{display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px;margin:14px 0 10px;padding:4px;border:1px solid #e3e9f2;border-radius:10px;background:#f4f6fa}.direct-profit-filter a{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:0 13px;border-radius:7px;font-size:13px;font-weight:600;white-space:nowrap}.direct-profit-filter a[aria-current="page"]{background:#fff;color:#234a87;box-shadow:0 1px 3px #243b5a1a,inset 0 -2px #315fba}.direct-decision-note{display:flex;align-items:center;flex-wrap:wrap;gap:6px 14px;margin:0 0 14px;padding:10px 12px;border:1px solid #e7ecf3;border-radius:8px;background:#f8fafd;color:#65738a;font-size:12px;line-height:1.55}.direct-decision-note span{min-width:0;overflow-wrap:anywhere}.direct-decision-note span+span{padding-left:14px;border-left:1px solid #dce3ed}@media(max-width:700px){.direct-decision-note{align-items:flex-start;flex-direction:column;gap:4px}.direct-decision-note span+span{padding-left:0;border-left:0}}</style>`;
     }
 
     const poolPredicate = poolId ? " AND pool_id = ?" : "";
     const poolParameters = poolId ? [poolId] : [];
-    const [statsRows, positiveRows, migrationRows] = await Promise.all([
+    const auditPoolFilter = poolId ? `AND EXISTS (
+      SELECT 1 FROM direct_pool_decision selected
+      WHERE selected.scan_id=d.scan_id AND selected.instrument_id=d.instrument_id AND selected.chain_index=d.chain_index
+        AND selected.size_usdt=d.size_usdt AND selected.pool_id=?
+    )` : "";
+    const [statsRows, migrationRows, auditRows] = await Promise.all([
       query<StatRow[]>(`SELECT COALESCE(SUM(net_profit_usdt > 0),0) positive,COUNT(*) valid,CAST(MAX(net_profit_usdt) AS CHAR) max_net FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND ${validEstimateSql}${poolPredicate}`, [fromStored, toStored, ...poolParameters]),
-      query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,simulation_status,simulation_reason,created_at FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND ${validEstimateSql} AND net_profit_usdt > 0${poolPredicate} ORDER BY created_at DESC,id DESC LIMIT 20`, [fromStored, toStored, ...poolParameters]),
       query<MigrationRow[]>("SELECT applied_at FROM schema_migrations WHERE version=? LIMIT 1", [DIRECT_POOL_POOL_ID_MIGRATION]),
+      query<DirectionAuditSampleRow[]>(`SELECT d.instrument_id,d.chain_index,CAST(d.size_usdt AS CHAR) size_usdt,
+        MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN d.pool_id END) cex_pool_id,
+        MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN d.pool_id END) dex_pool_id,
+        CAST(MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN d.cex_seq_id END) AS CHAR) cex_book_seq_id,
+        CAST(MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN d.cex_seq_id END) AS CHAR) dex_book_seq_id,
+        MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN q.pool_state_fingerprint END) cex_pool_state_fingerprint,
+        MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN q.pool_state_fingerprint END) dex_pool_state_fingerprint,
+        CAST(MAX(CASE WHEN d.direction='cex_buy_dex_sell' AND d.valuation_status NOT LIKE 'INVALIDATED_%' AND d.decision_status NOT IN ('BLOCKED','HIGH_PRICE_IMPACT') THEN d.net_profit_usdt END) AS CHAR) cex_net_profit_usdt,
+        CAST(MAX(CASE WHEN d.direction='dex_buy_cex_sell' AND d.valuation_status NOT LIKE 'INVALIDATED_%' AND d.decision_status NOT IN ('BLOCKED','HIGH_PRICE_IMPACT') THEN d.net_profit_usdt END) AS CHAR) dex_net_profit_usdt
+        FROM direct_pool_decision d LEFT JOIN direct_pool_quote q ON q.id=d.selected_quote_id
+        WHERE d.created_at >= UTC_TIMESTAMP(3)-INTERVAL 1 HOUR ${auditPoolFilter}
+        GROUP BY d.scan_id,d.instrument_id,d.chain_index,d.size_usdt
+        ORDER BY MAX(d.created_at) DESC`, poolId ? [poolId] : []),
     ]);
+    const directionAudit = summarizeDirectionAudit(auditRows.map((row): DirectionAuditSample => ({
+      instrumentId: row.instrument_id, chainIndex: row.chain_index, sizeUsdt: row.size_usdt,
+      cexPoolId: row.cex_pool_id, dexPoolId: row.dex_pool_id,
+      cexBookSeqId: row.cex_book_seq_id, dexBookSeqId: row.dex_book_seq_id,
+      cexPoolStateFingerprint: row.cex_pool_state_fingerprint, dexPoolStateFingerprint: row.dex_pool_state_fingerprint,
+      cexNetProfitUsdt: row.cex_net_profit_usdt, dexNetProfitUsdt: row.dex_net_profit_usdt,
+    })));
     const stats = statsRows[0] ?? { positive: 0, valid: 0, max_net: null };
     const coverageStart = migrationRows[0] ? actualTime(migrationRows[0].applied_at, offsetSeconds) : null;
     const coverageComplete = isWindowCoverageComplete(range.from, coverageStart);
-    let windowCount: number | null = null;
+    let positiveWindows: ReturnType<typeof collectPositiveWindows> = [];
     if (coverageComplete && coverageStart) {
       // shortcut: loads raw decisions from coverage start; add a summary table only if 180-day reads are measured too slow.
-      const windowRows = await query<WindowSample[]>(`SELECT id,created_at createdAt,instrument_id instrumentId,chain_index chainIndex,pool_id poolId,direction,CAST(size_usdt AS CHAR) sizeUsdt,CAST(net_profit_usdt AS CHAR) netProfitUsdt,valuation_status valuationStatus FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND pool_id IS NOT NULL AND ${validEstimateSql}${poolPredicate} ORDER BY created_at ASC,id ASC`, [storedTime(coverageStart, offsetSeconds), toStored, ...poolParameters]);
+      const windowRows = await query<WindowSample[]>(`SELECT id,created_at createdAt,instrument_id instrumentId,chain_index chainIndex,pool_id poolId,direction,CAST(size_usdt AS CHAR) sizeUsdt,CAST(net_profit_usdt AS CHAR) netProfitUsdt,valuation_status valuationStatus,selected_quote_id selectedQuoteId FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND pool_id IS NOT NULL AND ${validEstimateSql}${poolPredicate} ORDER BY created_at ASC,id ASC`, [storedTime(coverageStart, offsetSeconds), toStored, ...poolParameters]);
       const samples = windowRows.map((row) => ({ ...row, createdAt: actualTime(row.createdAt, offsetSeconds) }));
-      windowCount = collectPositiveWindows(samples, range.to).filter((item) => item.startAt >= range.from && item.startAt < range.to).length;
+      positiveWindows = collectPositiveWindows(samples, range.to).filter((item) => item.startAt >= range.from && item.startAt < range.to);
     }
-    const positive = positiveRows.map((raw) => {
-      const row = correctedDecision(raw, offsetSeconds);
-      const profit = decisionProfit(row, helpers);
-      const detail = row.selected_quote_id === null ? "原始报价已过保留期" : `<a href="${directPoolHref("/direct-pools/quote", range, { id: String(row.selected_quote_id) })}">报价详情 →</a>`;
-      return `<tr><td>${escapeHtml(formatUtc8(row.created_at))}</td><td><strong>${escapeHtml(row.instrument_id)}</strong><small>${escapeHtml(row.chain_index)} · ${escapeHtml(row.pool_id ?? "池 ID 不可用")}</small></td><td>${escapeHtml(row.direction)}</td><td class="numeric">${escapeHtml(formatReportDecimal(row.size_usdt, 8))} USDT</td><td class="numeric ${profit.className}"><strong>${escapeHtml(profit.text)}</strong></td><td>${escapeHtml(row.decision_status)} / ${escapeHtml(row.valuation_status)}<small>观察估算 · NOT_EXECUTABLE</small><small>模拟：${escapeHtml(directPoolSimulationLabel(row.simulation_status))}${row.simulation_reason ? ` · ${escapeHtml(row.simulation_reason)}` : ""}</small></td><td>${detail}</td></tr>`;
+    const audit = directionAudit.map((row) => {
+      const samePool = row.cexPoolId !== null && row.cexPoolId === row.dexPoolId;
+      const route = samePool ? row.cexPoolId! : `CEX: ${row.cexPoolId ?? "未选择"} / DEX: ${row.dexPoolId ?? "未选择"}`;
+      const avgDelta = row.averageNetDeltaUsdt === null ? "—" : `${new Decimal(row.averageNetDeltaUsdt).gt(0) ? "+" : ""}${formatReportDecimal(row.averageNetDeltaUsdt, 6)} USDT`;
+      return `<tr><td><strong>${escapeHtml(row.instrumentId)}</strong><small>${escapeHtml(row.chainIndex)}</small></td><td>${escapeHtml(route)}</td><td class="numeric">${escapeHtml(formatReportDecimal(row.sizeUsdt, 8))} USDT</td><td class="numeric">${row.comparableSamples}</td><td class="numeric">${row.cexOnlyPositive}</td><td class="numeric">${row.dexOnlyPositive}</td><td class="numeric">${row.bothPositive} / ${row.neitherPositive}</td><td class="numeric">${escapeHtml(avgDelta)}</td><td class="numeric">${row.incompleteSamples}</td></tr>`;
     }).join("");
+    const directionAuditSection = `<section class="overview"><div class="section-heading"><h3>同一扫描、同盘口、同池状态双方向对照</h3><span>最近 1 小时</span></div><p class="direct-audit-note">只统计 CEX 买 → DEX 卖 与 DEX 买 → CEX 卖 在同一扫描中选到同一池、使用相同 CEX 盘口序号且 DEX 池状态指纹一致的样本。平均差值 = 前者净收益 − 后者净收益；跨池、盘口或池状态不同、估值缺失、深度不足或高价格影响样本不参与方向胜负统计。</p><div class="table-wrap"><table class="direct-record-table"><thead><tr><th>资产 / 链</th><th>池匹配</th><th>规模</th><th>同池同状态可比样本</th><th>CEX买方向单独为正</th><th>DEX买方向单独为正</th><th>都为正 / 都非正</th><th>平均净收益差</th><th>不可比</th></tr></thead><tbody>${audit || '<tr><td colspan="9">最近 1 小时暂无双向扫描记录。</td></tr>'}</tbody></table></div></section>`;
     const registered = config.marketRegistry.pools.map((pool) => `<span><strong>${escapeHtml(pool.instrument_id)}</strong><code title="${escapeHtml(pool.id)}">${escapeHtml(pool.id)}</code><em>${escapeHtml(pool.enabled ? pool.mode : "已关闭")}</em></span>`).join("");
     const candidates = solveDirectPoolCandidates(config.marketRegistry, assets);
     const percentage = Number(stats.valid) ? `${(Number(stats.positive) / Number(stats.valid) * 100).toFixed(1)}%` : "—";
     const coverageCard = coverageComplete
-      ? `<strong>${windowCount ?? 0}</strong>`
+      ? `<strong>${positiveWindows.length}</strong>`
       : `<span class="coverage-status">数据不完整</span>${coverageStart ? `<span class="coverage-start">完整窗口统计始于<br>${escapeHtml(formatUtc8Minute(coverageStart))} UTC+8</span>` : ""}`;
-    return `${header}<p>范围内的数字是重复报价的观察估算，不代表实际成交或累计利润；所有结果均为 <strong>NOT_EXECUTABLE</strong>。已登记交易候选：${candidates.length}。</p><section class="overview"><div class="direct-cards"><article><small>正收益估算样本</small><strong class="profit-positive">${Number(stats.positive)}</strong></article><article class="window-card"><small>正收益窗口</small>${coverageCard}</article><article><small>正收益率</small><strong>${percentage}</strong></article><article><small>单笔最高净收益估算</small><strong>${escapeHtml(stats.max_net === null ? "—" : `${formatReportDecimal(stats.max_net, 6)} USDT`)}</strong></article></div></section><section class="overview"><h3>净收益估算为正 <small>最近 20 条</small></h3><div class="table-wrap"><table class="direct-record-table"><thead><tr><th>时间 <small>(UTC+8)</small></th><th>资产 / 链 / 池</th><th>方向</th><th>规模</th><th>净收益 / ROI</th><th>状态</th><th>详情</th></tr></thead><tbody>${positive || '<tr><td colspan="7">当前范围没有净收益大于 0 的有效观察估算。</td></tr>'}</tbody></table></div></section><details class="overview direct-pool-status"><summary><strong>已登记池与监控状态</strong><small>${config.marketRegistry.pools.length} 个登记池 · 点击展开</small></summary><div class="direct-pool-summary">${registered || "没有登记池。"}</div>${fixedPoolPanel(fixedPools)}</details>${pageStyle()}`;
+    const orderedWindows = positiveWindows.slice().sort((a, b) => b.startAt.getTime() - a.startAt.getTime() || b.firstSampleId - a.firstSampleId);
+    const renderWindowRows = (windows: typeof orderedWindows) => windows.map((window) => {
+      const latestProfit = new Decimal(window.latestNetProfitUsdt);
+      const latestProfitClass = latestProfit.gt(0) ? "profit-positive" : latestProfit.lt(0) ? "profit-negative" : "";
+      const direction = window.direction === "dex_buy_cex_sell" ? "DEX 买入 · CEX 卖出" : "CEX 买入 · DEX 卖出";
+      const windowDetail = directPoolHref("/direct-pools/window", range, {
+        pool: window.poolId, direction: window.direction, window_instrument: window.instrumentId, window_chain: window.chainIndex,
+        window_size: window.sizeUsdt, window_from_ms: String(window.startAt.getTime()),
+        window_to_ms: String((window.endAt ?? range.to).getTime()), window_closed: window.endAt ? "1" : "0",
+        window_first_id: String(window.firstSampleId), window_last_id: String(window.lastSampleId), window_positive_count: String(window.sampleCount),
+      });
+      const detail = `<a href="${windowDetail}">全部收益样本 →</a>`;
+      return `<tr><td>${escapeHtml(formatUtc8(window.startAt))}<small>至末次正收益 ${escapeHtml(formatUtc8(window.lastObservedAt))}<br>${window.endAt ? `结束确认 ${escapeHtml(formatUtc8(window.endAt))}` : "窗口仍在观察"}</small></td><td><strong>${escapeHtml(window.instrumentId)}</strong><small>${escapeHtml(window.chainIndex)} · ${escapeHtml(window.poolId)}</small></td><td>${escapeHtml(direction)}</td><td class="numeric">${escapeHtml(formatReportDecimal(window.sizeUsdt, 8))} USDT</td><td class="numeric ${latestProfitClass}"><strong>末次正收益 ${escapeHtml(formatReportDecimal(window.latestNetProfitUsdt, 6))} USDT</strong><small>窗口峰值 ${escapeHtml(formatReportDecimal(window.peakNetProfitUsdt, 6))} USDT</small></td><td class="numeric">${escapeHtml(formatWindowSpan(window.startAt, window.lastObservedAt))}<small>${window.sampleCount} 个正收益样本</small></td><td>${window.endAt ? "已结束" : "观察中"}<small>观察估算 · NOT_EXECUTABLE</small></td><td>${detail}</td></tr>`;
+    }).join("");
+    const windowTableHead = `<thead><tr><th>正收益观测区间 <small>(UTC+8)</small></th><th>资产 / 链 / 池</th><th>方向</th><th>规模</th><th>末次正收益 / 窗口峰值</th><th>正收益跨度 / 样本数</th><th>状态</th><th>详情</th></tr></thead>`;
+    if (path === "/direct-pools/windows") {
+      if (!coverageComplete) return `${header}<p class="guard-alert">窗口历史覆盖不完整，暂不展示可能被截断的窗口；可在收益明细中查看逐条正收益样本。</p>${pageStyle()}`;
+      const page = parsePageNumber(url.searchParams.get("page"));
+      const offset = (page - 1) * pageSize;
+      const visibleWindows = orderedWindows.slice(offset, offset + pageSize);
+      const recordRows = renderWindowRows(visibleWindows);
+      const pageParams = poolId ? { pool: poolId } : undefined;
+      const empty = orderedWindows.length === 0
+        ? "当前筛选范围没有满足连续性条件的正收益窗口；孤立正收益样本可在收益明细中查看。"
+        : `第 ${page} 页没有窗口。<a href="${directPoolHref(path, range, pageParams)}">返回第 1 页</a>`;
+      return `${header}<p class="direct-record-note">窗口是重复报价的观察估算，不代表成交、累计利润或可执行性。末次收益、峰值和样本数只统计正收益观测；非正收益样本仅用于连续性判断。</p><section class="overview"><div class="section-heading"><h3>正收益窗口</h3><span>共 ${orderedWindows.length} 个 · 每页 ${pageSize} 个</span></div><div class="table-wrap"><table class="direct-record-table">${windowTableHead}<tbody>${recordRows || `<tr><td colspan="8">${empty}</td></tr>`}</tbody></table></div>${pagination(path, fixedRange(range), page, orderedWindows.length, "全部正收益窗口分页", pageParams)}</section>${pageStyle()}`;
+    }
+    const windowRows = renderWindowRows(orderedWindows.slice(0, pageSize));
+    const windowTable = !coverageComplete
+      ? "窗口历史覆盖不完整，暂不展示窗口摘要；可在收益明细中查看逐条正收益样本。"
+      : windowRows || "当前范围没有满足连续性条件的正收益窗口；孤立正收益样本可在收益明细中查看。";
+    const allWindowsLink = coverageComplete && orderedWindows.length ? `<a href="${directPoolHref("/direct-pools/windows", fixedRange(range), poolId ? { pool: poolId } : undefined)}">查看全部 ${orderedWindows.length} 个窗口 →</a>` : "";
+    return `${header}<p>范围内的数字是重复报价的观察估算，不代表实际成交或累计利润；所有结果均为 <strong>NOT_EXECUTABLE</strong>。已登记交易候选：${candidates.length}。</p><section class="overview"><div class="direct-cards"><article><small>正收益估算样本</small><strong class="profit-positive">${Number(stats.positive)}</strong></article><article class="window-card"><small>正收益窗口</small>${coverageCard}</article><article><small>正收益率</small><strong>${percentage}</strong></article><article><small>单笔最高净收益估算</small><strong>${escapeHtml(stats.max_net === null ? "—" : `${formatReportDecimal(stats.max_net, 6)} USDT`)}</strong></article></div></section>${directionAuditSection}<section class="overview"><div class="section-heading"><h3>正收益窗口 <small>最近 20 个</small></h3>${allWindowsLink}</div><p class="direct-record-note">末次净收益、峰值和样本数只统计正收益观测；连续非正样本仅用于确认窗口结束，不计入这些指标。结束确认时间与末次正收益时间分开显示。所有结果均为观察估算，不代表可成交或实际收益。</p><div class="table-wrap"><table class="direct-record-table">${windowTableHead}<tbody>${windowRows ? windowRows : `<tr><td colspan="8">${escapeHtml(windowTable)}</td></tr>`}</tbody></table></div></section><details class="overview direct-pool-status"><summary><strong>已登记池与监控状态</strong><small>${config.marketRegistry.pools.length} 个登记池 · 点击展开</small></summary><div class="direct-pool-summary">${registered || "没有登记池。"}</div>${fixedPoolPanel(fixedPools)}</details>${pageStyle()}<style>.direct-audit-note{margin:8px 0 12px;color:#65738a;font-size:12px;line-height:1.6}.direct-record-table td small{display:block;color:#758198;font-size:11px;margin-top:3px}</style>`;
   } catch {
     return `${header}<p class="guard-alert">指定池数据表尚不可用；请先执行 npm run db:migrate。</p>${pageStyle()}`;
   }

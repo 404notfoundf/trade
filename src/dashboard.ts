@@ -8,7 +8,7 @@ import type { PoolMonitorState } from "./fixed-pools.js";
 import { solveDirectPoolCandidates } from "./trading/market-registry.js";
 import { directPoolDexLabel, directPoolSimulationLabel, renderDirectPoolPage } from "./direct-pool-pages.js";
 import { directPoolQuoteBackUrl } from "./trading/direct-pool-windows.js";
-import { collectOpportunityQuoteBuckets, type OpportunityQuoteSample } from "./opportunity-clusters.js";
+import { mapOpportunityQuoteBucketRows, type OpportunityQuoteBucketRow } from "./opportunity-clusters.js";
 
 type OpportunityRow = { id: number; opened_at: Date; observed_at: Date; ended_at: Date | null; close_reason: string | null; executable_status: string; execution_reason: string | null; execution_buffer_usdt: string | null; executable_profit_usdt: string | null; peak_profit_usdt: string | null; inst_id: string; chain_index: string; route_status: string; direction: string; size_usdt: string; shares: string | null; cex_vwap: string | null; dex_usdt_amount: string | null; cex_fee_usdt: string | null; gas_usdt: string | null; gross_profit_usdt: string | null; net_profit_usdt: string | null; rebalance_cost_usdt: string | null; net_profit_after_rebalance_usdt: string | null; roi: string | null; price_impact_percent: string | null; is_stale: number; status: string; native_quote_amount: string | null; native_quote_symbol: string | null; valuation_status: string; usdt_estimate: string | null };
 type OpportunityListRow = Pick<OpportunityRow, "id" | "opened_at" | "ended_at" | "close_reason" | "executable_status" | "execution_reason" | "peak_profit_usdt" | "inst_id" | "chain_index" | "direction" | "size_usdt" | "net_profit_usdt" | "roi" | "is_stale" | "valuation_status"> & { last_updated_at: Date | null; duration_seconds: number | string; sample_count: number | string };
@@ -344,14 +344,21 @@ export function startDashboard(config: Config, assets: AssetConfig[], getState: 
       body = `<h2>被拦截的观察</h2><p>这些记录不会计入正收益机会；点击“查看”进入单条诊断页面。</p>${!state.dbOnline ? '<p class="guard-alert">数据库不可用，暂时无法读取记录。</p>' : `<div class="table-wrap"><table class="blocked-table" style="min-width:980px"><thead><tr><th>时间 <small>(UTC + 8)</small></th><th>资产 / 网络</th><th>方向</th><th>规模</th><th>拦截原因</th><th>详情</th></tr></thead><tbody>${blockedRows || '<tr><td class="empty-state" colspan="6">暂无被拦截的观察</td></tr>'}</tbody></table></div>`}`;
     } else if (page === "/reports") {
       const conditions: string[] = [];
-      const values: string[] = [];
+      const values: unknown[] = [];
       const day = url.searchParams.get("day");
       const type = url.searchParams.get("type");
       const direction = url.searchParams.get("direction");
       const size = url.searchParams.get("size");
       const chain = url.searchParams.get("chain");
       const instId = url.searchParams.get("asset");
-      if (day && /^\d{4}-\d{2}-\d{2}$/.test(day)) { conditions.push("DATE(DATE_ADD(period_start, INTERVAL 8 HOUR))=?"); values.push(day); }
+      if (day && /^\d{4}-\d{2}-\d{2}$/.test(day)) {
+        const from = new Date(`${day}T00:00:00+08:00`);
+        if (Number.isFinite(from.getTime()) && from.toISOString().slice(0, 10) === day) {
+          const to = new Date(from.getTime() + 24 * 60 * 60 * 1000);
+          conditions.push("period_start>=? AND period_start<?");
+          values.push(from, to);
+        } else conditions.push("1=0");
+      }
       if (type === "hourly" || type === "daily") { conditions.push("period_type=?"); values.push(type); }
       if (direction === "cex_buy_dex_sell" || direction === "dex_buy_cex_sell") { conditions.push("direction=?"); values.push(direction); }
       if (size && ["100", "250", "500"].includes(size)) { conditions.push("size_usdt=?"); values.push(size); }
@@ -377,12 +384,6 @@ export function startDashboard(config: Config, assets: AssetConfig[], getState: 
       const chain = chainOptions.some(([chainIndex]) => chainIndex === requestedChain) ? requestedChain : "";
       const requestedDirection = url.searchParams.get("direction");
       const directionFilter = requestedDirection === "cex_buy_dex_sell" || requestedDirection === "dex_buy_cex_sell" ? requestedDirection : "";
-      const statusCounts = state.dbOnline ? await query<Array<{ valuation_status: string; total: number }>>("SELECT q.valuation_status,COUNT(*) AS total FROM opportunity o JOIN quote_observation q ON q.id=o.quote_observation_id WHERE o.legacy_sample=0 GROUP BY q.valuation_status") : [];
-      const countFor = (status: string) => statusCounts.find((row) => row.valuation_status === status)?.total ?? 0;
-      const verifiedCount = countFor("VERIFIED");
-      const legacyCount = countFor("LEGACY_NOMINAL");
-      const allCount = statusCounts.reduce((sum, row) => sum + row.total, 0);
-      const otherCount = allCount - verifiedCount - legacyCount;
       const conditions = ["o.legacy_sample=0"];
       const values: unknown[] = [];
       if (valuationFilter !== "all") { conditions.push("q.valuation_status=?"); values.push(valuationFilter); }
@@ -390,8 +391,13 @@ export function startDashboard(config: Config, assets: AssetConfig[], getState: 
       if (chain) { conditions.push("q.chain_index=?"); values.push(chain); }
       if (directionFilter) { conditions.push("o.direction=?"); values.push(directionFilter); }
       const where = `WHERE ${conditions.join(" AND ")}`;
-      const totalRows = state.dbOnline ? await query<Array<{ total: number }>>(`SELECT COUNT(*) AS total FROM opportunity o JOIN quote_observation q ON q.id=o.quote_observation_id ${where}`, values) : [];
-      const total = totalRows[0]?.total ?? 0;
+      const statusCounts = state.dbOnline ? await query<Array<{ valuation_status: string; total: number; filtered_total: number | string }>>(`SELECT q.valuation_status,COUNT(*) AS total,SUM(CASE WHEN ${conditions.join(" AND ")} THEN 1 ELSE 0 END) AS filtered_total FROM opportunity o JOIN quote_observation q ON q.id=o.quote_observation_id WHERE o.legacy_sample=0 GROUP BY q.valuation_status`, values) : [];
+      const countFor = (status: string) => statusCounts.find((row) => row.valuation_status === status)?.total ?? 0;
+      const verifiedCount = countFor("VERIFIED");
+      const legacyCount = countFor("LEGACY_NOMINAL");
+      const allCount = statusCounts.reduce((sum, row) => sum + row.total, 0);
+      const otherCount = allCount - verifiedCount - legacyCount;
+      const total = statusCounts.reduce((sum, row) => sum + Number(row.filtered_total), 0);
       const totalPages = Math.max(1, Math.ceil(total / pageSize));
       const currentPage = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? Math.min(requestedPage, totalPages) : 1;
       const rows = state.dbOnline ? await query<OpportunityListRow[]>(`SELECT o.id,o.observed_at opened_at,o.ended_at,o.close_reason,o.executable_status,o.execution_reason,CAST(o.peak_profit_usdt AS CHAR) peak_profit_usdt,q.inst_id,q.chain_index,o.direction,CAST(o.size_usdt AS CHAR) size_usdt,CAST(o.net_profit_usdt AS CHAR) net_profit_usdt,CAST(o.roi AS CHAR) roi,q.is_stale,q.valuation_status,
@@ -427,13 +433,26 @@ body = `<section class="overview"><h2>机会窗口</h2><p>数据库共 ${allCoun
   body = `<section class="overview"><h2>未找到机会记录</h2><p>该记录可能已删除，或链接中的编号无效。</p><p><a href="/opportunities">← 返回机会列表</a></p></section>`;
       } else {
         const now = new Date();
-        const history = await query<OpportunityQuoteSample[]>(`SELECT id,observed_at,CAST(COALESCE(net_profit_after_rebalance_usdt,net_profit_usdt) AS CHAR) net_profit_usdt,
-          CAST(price_impact_percent AS CHAR) price_impact_percent,status,valuation_status FROM quote_observation
+        const history = await query<OpportunityQuoteBucketRow[]>(`WITH bucketed AS (
+          SELECT FLOOR(TIMESTAMPDIFF(MICROSECOND,'1970-01-01 00:00:00.000000',observed_at)/5000000) bucket_index,
+            id,observed_at,COALESCE(net_profit_after_rebalance_usdt,net_profit_usdt) net_profit_usdt,price_impact_percent
+          FROM quote_observation
           WHERE inst_id=? AND chain_index=? AND direction=? AND size_usdt=? AND observed_at>=? AND observed_at<=?
-          AND status='OK' AND valuation_status='VERIFIED' ORDER BY observed_at ASC,id ASC`, [
+            AND status='OK' AND valuation_status='VERIFIED'
+        ), ranked AS (
+          SELECT bucket_index,observed_at,net_profit_usdt,
+            COUNT(*) OVER (PARTITION BY bucket_index) sample_count,
+            MAX(net_profit_usdt) OVER (PARTITION BY bucket_index) peak_profit,
+            MIN(ABS(price_impact_percent)) OVER (PARTITION BY bucket_index) min_price_impact,
+            ROW_NUMBER() OVER (PARTITION BY bucket_index ORDER BY observed_at DESC,id DESC) row_number
+          FROM bucketed
+        )
+        SELECT CAST(bucket_index*5000 AS CHAR) bucket_start_ms,observed_at latest_at,CAST(sample_count AS CHAR) sample_count,
+          CAST(net_profit_usdt AS CHAR) current_profit,CAST(peak_profit AS CHAR) peak_profit,CAST(min_price_impact AS CHAR) min_price_impact
+        FROM ranked WHERE row_number=1 ORDER BY bucket_index ASC`, [
           row.inst_id, row.chain_index, row.direction, row.size_usdt, row.opened_at, row.ended_at ?? now,
         ]);
-        const quoteBuckets = collectOpportunityQuoteBuckets(history, row.ended_at, now);
+        const quoteBuckets = mapOpportunityQuoteBucketRows(history, row.ended_at, now);
         const historySampleCount = quoteBuckets.reduce((total, bucket) => total + bucket.sampleCount, 0);
         const lastUpdatedAt = quoteBuckets.at(-1)?.latestAt ?? row.observed_at;
         const durationSeconds = Math.max(0, Math.floor(((row.ended_at ?? now).getTime() - row.opened_at.getTime()) / 1000));

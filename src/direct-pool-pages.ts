@@ -3,9 +3,9 @@ import type { AssetConfig, Config } from "./config.js";
 import { query } from "./db.js";
 import type { PoolMonitorState } from "./fixed-pools.js";
 import { solveDirectPoolCandidates } from "./trading/market-registry.js";
-import { summarizeDirectionAudit, type DirectionAuditSample } from "./trading/direction-audit.js";
 import {
   collectPositiveWindows,
+  directPoolWindowReadStart,
   DIRECT_POOL_POOL_ID_MIGRATION,
   directPoolHref,
   formatUtc8Input,
@@ -50,12 +50,12 @@ type QuoteRow = {
 };
 type StatRow = { positive: number; valid: number; max_net: string | null };
 type CountRow = { total: number };
-type DirectionAuditSampleRow = {
+type DirectionAuditSummaryRow = {
   instrument_id: string; chain_index: string; size_usdt: string;
   cex_pool_id: string | null; dex_pool_id: string | null;
-  cex_book_seq_id: string | null; dex_book_seq_id: string | null;
-  cex_pool_state_fingerprint: string | null; dex_pool_state_fingerprint: string | null;
-  cex_net_profit_usdt: string | null; dex_net_profit_usdt: string | null;
+  comparable_samples: string; cex_only_positive: string; dex_only_positive: string;
+  both_positive: string; neither_positive: string; incomplete_samples: string;
+  average_net_delta_usdt: string | null;
 };
 type OffsetRow = { offset_seconds: number };
 type MigrationRow = { applied_at: Date };
@@ -282,7 +282,7 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
       const quoteParameters = [range.from, range.to, fromStored, toStored, ...(poolId ? [poolId] : [])];
       const [rows, countRows] = await Promise.all([
         query<QuoteRow[]>(`SELECT q.id,q.instrument_id,q.chain_index,q.pool_id,q.dex,q.direction,q.amount_in_raw,q.amount_out_raw,q.quoted_at,q.request_ms,q.status,q.failure_reason,q.raw_response,CAST(d.net_profit_usdt AS CHAR) net_profit_usdt,CAST(d.roi AS CHAR) roi,d.valuation_status FROM direct_pool_quote q LEFT JOIN direct_pool_decision d ON d.selected_quote_id=q.id WHERE ${quoteWhere} ORDER BY q.id DESC LIMIT ? OFFSET ?`, [...quoteParameters, pageSize + 1, (page - 1) * pageSize]),
-        query<CountRow[]>(`SELECT COUNT(*) total FROM direct_pool_quote q LEFT JOIN direct_pool_decision d ON d.selected_quote_id=q.id WHERE ${quoteWhere}`, quoteParameters),
+        query<CountRow[]>(`SELECT COUNT(*) total FROM direct_pool_quote q WHERE ${quoteWhere}`, quoteParameters),
       ]);
       const total = Number(countRows[0]?.total ?? 0);
       const visible = rows.slice(0, pageSize);
@@ -351,34 +351,58 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
     const [statsRows, migrationRows, auditRows] = await Promise.all([
       query<StatRow[]>(`SELECT COALESCE(SUM(net_profit_usdt > 0),0) positive,COUNT(*) valid,CAST(MAX(net_profit_usdt) AS CHAR) max_net FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND ${validEstimateSql}${poolPredicate}`, [fromStored, toStored, ...poolParameters]),
       query<MigrationRow[]>("SELECT applied_at FROM schema_migrations WHERE version=? LIMIT 1", [DIRECT_POOL_POOL_ID_MIGRATION]),
-      query<DirectionAuditSampleRow[]>(`SELECT d.instrument_id,d.chain_index,CAST(d.size_usdt AS CHAR) size_usdt,
-        MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN d.pool_id END) cex_pool_id,
-        MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN d.pool_id END) dex_pool_id,
-        CAST(MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN d.cex_seq_id END) AS CHAR) cex_book_seq_id,
-        CAST(MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN d.cex_seq_id END) AS CHAR) dex_book_seq_id,
-        MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN q.pool_state_fingerprint END) cex_pool_state_fingerprint,
-        MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN q.pool_state_fingerprint END) dex_pool_state_fingerprint,
-        CAST(MAX(CASE WHEN d.direction='cex_buy_dex_sell' AND d.valuation_status NOT LIKE 'INVALIDATED_%' AND d.decision_status NOT IN ('BLOCKED','HIGH_PRICE_IMPACT') THEN d.net_profit_usdt END) AS CHAR) cex_net_profit_usdt,
-        CAST(MAX(CASE WHEN d.direction='dex_buy_cex_sell' AND d.valuation_status NOT LIKE 'INVALIDATED_%' AND d.decision_status NOT IN ('BLOCKED','HIGH_PRICE_IMPACT') THEN d.net_profit_usdt END) AS CHAR) dex_net_profit_usdt
-        FROM direct_pool_decision d LEFT JOIN direct_pool_quote q ON q.id=d.selected_quote_id
-        WHERE d.created_at >= UTC_TIMESTAMP(3)-INTERVAL 1 HOUR ${auditPoolFilter}
-        GROUP BY d.scan_id,d.instrument_id,d.chain_index,d.size_usdt
-        ORDER BY MAX(d.created_at) DESC`, poolId ? [poolId] : []),
+      query<DirectionAuditSummaryRow[]>(`WITH per_scan AS (
+          SELECT d.scan_id,d.instrument_id,d.chain_index,d.size_usdt,
+            MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN d.pool_id END) cex_pool_id,
+            MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN d.pool_id END) dex_pool_id,
+            CAST(MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN d.cex_seq_id END) AS CHAR) cex_book_seq_id,
+            CAST(MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN d.cex_seq_id END) AS CHAR) dex_book_seq_id,
+            MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN d.selected_quote_id END) cex_quote_id,
+            MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN d.selected_quote_id END) dex_quote_id,
+            MAX(CASE WHEN d.direction='cex_buy_dex_sell' AND d.valuation_status NOT LIKE 'INVALIDATED_%' AND d.decision_status NOT IN ('BLOCKED','HIGH_PRICE_IMPACT') THEN d.net_profit_usdt END) cex_net_profit_usdt,
+            MAX(CASE WHEN d.direction='dex_buy_cex_sell' AND d.valuation_status NOT LIKE 'INVALIDATED_%' AND d.decision_status NOT IN ('BLOCKED','HIGH_PRICE_IMPACT') THEN d.net_profit_usdt END) dex_net_profit_usdt
+          FROM direct_pool_decision d
+          WHERE d.created_at >= UTC_TIMESTAMP(3)-INTERVAL 1 HOUR ${auditPoolFilter}
+          GROUP BY d.scan_id,d.instrument_id,d.chain_index,d.size_usdt
+        ), paired AS (
+          SELECT p.*,cex_quote.pool_state_fingerprint cex_pool_state_fingerprint,dex_quote.pool_state_fingerprint dex_pool_state_fingerprint
+          FROM per_scan p
+          LEFT JOIN direct_pool_quote cex_quote ON cex_quote.id=p.cex_quote_id
+          LEFT JOIN direct_pool_quote dex_quote ON dex_quote.id=p.dex_quote_id
+        ), classified AS (
+          SELECT paired.*,
+            CASE WHEN cex_pool_id IS NOT NULL AND BINARY cex_pool_id=BINARY dex_pool_id
+              AND cex_book_seq_id IS NOT NULL AND cex_book_seq_id=dex_book_seq_id
+              AND cex_pool_state_fingerprint IS NOT NULL AND BINARY cex_pool_state_fingerprint=BINARY dex_pool_state_fingerprint
+              AND cex_net_profit_usdt IS NOT NULL AND dex_net_profit_usdt IS NOT NULL THEN 1 ELSE 0 END is_comparable
+          FROM paired
+        )
+        SELECT instrument_id,chain_index,CAST(size_usdt AS CHAR) size_usdt,MAX(cex_pool_id) cex_pool_id,MAX(dex_pool_id) dex_pool_id,
+          CAST(SUM(is_comparable) AS CHAR) comparable_samples,
+          CAST(SUM(CASE WHEN is_comparable=1 AND cex_net_profit_usdt>0 AND dex_net_profit_usdt<=0 THEN 1 ELSE 0 END) AS CHAR) cex_only_positive,
+          CAST(SUM(CASE WHEN is_comparable=1 AND cex_net_profit_usdt<=0 AND dex_net_profit_usdt>0 THEN 1 ELSE 0 END) AS CHAR) dex_only_positive,
+          CAST(SUM(CASE WHEN is_comparable=1 AND cex_net_profit_usdt>0 AND dex_net_profit_usdt>0 THEN 1 ELSE 0 END) AS CHAR) both_positive,
+          CAST(SUM(CASE WHEN is_comparable=1 AND cex_net_profit_usdt<=0 AND dex_net_profit_usdt<=0 THEN 1 ELSE 0 END) AS CHAR) neither_positive,
+          CAST(SUM(CASE WHEN is_comparable=0 THEN 1 ELSE 0 END) AS CHAR) incomplete_samples,
+          CAST(AVG(CASE WHEN is_comparable=1 THEN cex_net_profit_usdt-dex_net_profit_usdt END) AS CHAR) average_net_delta_usdt
+        FROM classified
+        GROUP BY instrument_id,chain_index,size_usdt,BINARY cex_pool_id,BINARY dex_pool_id
+        ORDER BY instrument_id,chain_index,size_usdt,cex_pool_id,dex_pool_id`, poolId ? [poolId] : []),
     ]);
-    const directionAudit = summarizeDirectionAudit(auditRows.map((row): DirectionAuditSample => ({
+    const directionAudit = auditRows.map((row) => ({
       instrumentId: row.instrument_id, chainIndex: row.chain_index, sizeUsdt: row.size_usdt,
       cexPoolId: row.cex_pool_id, dexPoolId: row.dex_pool_id,
-      cexBookSeqId: row.cex_book_seq_id, dexBookSeqId: row.dex_book_seq_id,
-      cexPoolStateFingerprint: row.cex_pool_state_fingerprint, dexPoolStateFingerprint: row.dex_pool_state_fingerprint,
-      cexNetProfitUsdt: row.cex_net_profit_usdt, dexNetProfitUsdt: row.dex_net_profit_usdt,
-    })));
+      comparableSamples: Number(row.comparable_samples), cexOnlyPositive: Number(row.cex_only_positive),
+      dexOnlyPositive: Number(row.dex_only_positive), bothPositive: Number(row.both_positive),
+      neitherPositive: Number(row.neither_positive), incompleteSamples: Number(row.incomplete_samples),
+      averageNetDeltaUsdt: row.average_net_delta_usdt,
+    }));
     const stats = statsRows[0] ?? { positive: 0, valid: 0, max_net: null };
     const coverageStart = migrationRows[0] ? actualTime(migrationRows[0].applied_at, offsetSeconds) : null;
     const coverageComplete = isWindowCoverageComplete(range.from, coverageStart);
     let positiveWindows: ReturnType<typeof collectPositiveWindows> = [];
     if (coverageComplete && coverageStart) {
-      // shortcut: loads raw decisions from coverage start; add a summary table only if 180-day reads are measured too slow.
-      const windowRows = await query<WindowSample[]>(`SELECT id,created_at createdAt,instrument_id instrumentId,chain_index chainIndex,pool_id poolId,direction,CAST(size_usdt AS CHAR) sizeUsdt,CAST(net_profit_usdt AS CHAR) netProfitUsdt,valuation_status valuationStatus,selected_quote_id selectedQuoteId FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND pool_id IS NOT NULL AND ${validEstimateSql}${poolPredicate} ORDER BY created_at ASC,id ASC`, [storedTime(coverageStart, offsetSeconds), toStored, ...poolParameters]);
+      const windowRows = await query<WindowSample[]>(`SELECT id,created_at createdAt,instrument_id instrumentId,chain_index chainIndex,pool_id poolId,direction,CAST(size_usdt AS CHAR) sizeUsdt,CAST(net_profit_usdt AS CHAR) netProfitUsdt,valuation_status valuationStatus,selected_quote_id selectedQuoteId FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND pool_id IS NOT NULL AND ${validEstimateSql}${poolPredicate} ORDER BY created_at ASC,id ASC`, [storedTime(directPoolWindowReadStart(range.from, coverageStart), offsetSeconds), toStored, ...poolParameters]);
       const samples = windowRows.map((row) => ({ ...row, createdAt: actualTime(row.createdAt, offsetSeconds) }));
       positiveWindows = collectPositiveWindows(samples, range.to).filter((item) => item.startAt >= range.from && item.startAt < range.to);
     }

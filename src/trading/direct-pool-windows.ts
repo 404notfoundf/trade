@@ -131,6 +131,10 @@ export function isWindowCoverageComplete(rangeFrom: Date, coverageStart: Date | 
   return coverageStart !== null && rangeFrom.getTime() >= coverageStart.getTime();
 }
 
+export function directPoolWindowReadStart(rangeFrom: Date, coverageStart: Date): Date {
+  return new Date(Math.max(coverageStart.getTime(), rangeFrom.getTime() - DIRECT_POOL_WINDOW_GAP_MS));
+}
+
 function numericNet(value: string | null): Decimal | null {
   if (value === null || value.trim() === "") return null;
   try {

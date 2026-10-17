@@ -748,6 +748,7 @@ async function main(): Promise<void> {
              gas_native_raw,gas_source,CAST(native_quote_amount AS CHAR) native_quote_amount,native_quote_symbol,valuation_status,
              CAST(usdt_rate AS CHAR) usdt_rate,price_source_time,observed_at,is_stale,status,route_status
            FROM quote_observation WHERE inst_id=? AND chain_index=? AND size_usdt=?
+             AND direction IN ('cex_buy_dex_sell','dex_buy_cex_sell')
            ORDER BY observed_at DESC LIMIT 20`, [asset.instId, asset.chainIndex, String(config.trading.tradeSizeUsdt)],
         );
       } catch (error) {

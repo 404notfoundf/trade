@@ -1,4 +1,5 @@
 import { MeteoraDlmmAdapter } from "./adapters/meteora-dlmm.js";
+import { ByrealClmmAdapter } from "./adapters/byreal-clmm.js";
 import { OrcaWhirlpoolAdapter } from "./adapters/orca-whirlpool.js";
 import { RaydiumClmmAdapter } from "./adapters/raydium-clmm.js";
 import { UniswapV3Adapter } from "./adapters/uniswap-v3.js";
@@ -12,6 +13,7 @@ export function createPoolAdapter(pool: RegisteredPool, registry: MarketRegistry
   if (dex.adapter === "raydium_clmm" && pool.chain === "solana") return new RaydiumClmmAdapter(registry, pool);
   if (dex.adapter === "orca_whirlpool" && pool.chain === "solana") return new OrcaWhirlpoolAdapter(registry, pool);
   if (dex.adapter === "meteora_dlmm" && pool.chain === "solana") return new MeteoraDlmmAdapter(registry, pool);
+  if (dex.adapter === "byreal_clmm" && pool.chain === "solana") return new ByrealClmmAdapter(registry, pool);
   throw new Error(`Unsupported adapter for pool ${pool.id}`);
 }
 

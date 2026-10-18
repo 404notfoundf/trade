@@ -6,6 +6,18 @@ import { pinnedQuote } from "../market/valuation.js";
 export type RegistryChainName = "xlayer" | "solana";
 export const ORCA_WHIRLPOOL_PROGRAM_ADDRESS = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 export const METEORA_DLMM_PROGRAM_ADDRESS = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+export const BYREAL_CLMM_PROGRAM_ADDRESS = "REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2";
+export const BYREAL_XSPCX_USDC_POOL = {
+  id: "xspcx-solana-byreal-clmm-usdc",
+  instrumentId: "XSPCX",
+  address: "LVcDubF4BFsEw8qmxupmw74bbZfiya99kor5c3Hh24r",
+  assetMint: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8",
+  quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  assetDecimals: 8,
+  quoteDecimals: 6,
+  feeRate: 1_000,
+  tickSpacing: 10,
+} as const;
 export const ORCA_XSPCX_USDC_POOL = {
   id: "xspcx-solana-orca-whirlpool-usdc",
   instrumentId: "XSPCX",
@@ -28,7 +40,7 @@ export const METEORA_XSPCX_USDC_POOL = {
 export type RegisteredChain = { chain_id: 196 | 501; kind: "evm" | "svm"; rpc_http: string | null; rpc_ws: string | null; native_symbol: "OKB" | "SOL" };
 export type RegisteredDex = {
   chain: RegistryChainName;
-  adapter: "uniswap_v3" | "raydium_clmm" | "orca_whirlpool" | "meteora_dlmm";
+  adapter: "uniswap_v3" | "raydium_clmm" | "orca_whirlpool" | "meteora_dlmm" | "byreal_clmm";
   quote_source: "onchain_quoter" | "local_math";
   quoter_v2?: string;
   swap_router?: string;
@@ -136,7 +148,7 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
     if (!record(raw) || (raw.chain !== "xlayer" && raw.chain !== "solana")) throw new Error(`Invalid DEX registration ${id}`);
     const expected = raw.chain === "xlayer"
       ? raw.adapter === "uniswap_v3" && raw.quote_source === "onchain_quoter"
-      : (raw.adapter === "raydium_clmm" || raw.adapter === "orca_whirlpool" || raw.adapter === "meteora_dlmm") && raw.quote_source === "local_math";
+      : (raw.adapter === "raydium_clmm" || raw.adapter === "orca_whirlpool" || raw.adapter === "meteora_dlmm" || raw.adapter === "byreal_clmm") && raw.quote_source === "local_math";
     if (!expected || (raw.enabled !== undefined && typeof raw.enabled !== "boolean")) throw new Error(`Unknown adapter or quote source for ${id}`);
     const dex: RegisteredDex = { chain: raw.chain, adapter: raw.adapter as RegisteredDex["adapter"], quote_source: raw.quote_source as RegisteredDex["quote_source"], enabled: raw.enabled as boolean | undefined };
     if (raw.chain === "xlayer") {
@@ -150,6 +162,9 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
       }
       if (raw.adapter === "meteora_dlmm" && (id !== "meteora_dlmm_solana" || dex.program_id !== METEORA_DLMM_PROGRAM_ADDRESS)) {
         throw new Error(`Meteora DLMM DEX ${id} must use the pinned Solana program`);
+      }
+      if (raw.adapter === "byreal_clmm" && (id !== "byreal_clmm_solana" || dex.program_id !== BYREAL_CLMM_PROGRAM_ADDRESS)) {
+        throw new Error(`Byreal CLMM DEX ${id} must use the pinned Solana program`);
       }
     }
     dexes[id] = dex;
@@ -235,6 +250,16 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
         throw new Error(`Pool ${id} must declare the pinned Meteora DLMM bin step only`);
       }
       expected_bin_step = METEORA_XSPCX_USDC_POOL.binStep;
+    } else if (dex.adapter === "byreal_clmm") {
+      if (id !== BYREAL_XSPCX_USDC_POOL.id || instrument_id !== BYREAL_XSPCX_USDC_POOL.instrumentId || chain !== "solana"
+        || poolAddress !== BYREAL_XSPCX_USDC_POOL.address || assetAddress !== BYREAL_XSPCX_USDC_POOL.assetMint
+        || quoteAddress !== BYREAL_XSPCX_USDC_POOL.quoteMint || assetDecimals !== BYREAL_XSPCX_USDC_POOL.assetDecimals
+        || quoteDecimals !== BYREAL_XSPCX_USDC_POOL.quoteDecimals || raw.mode !== "observe_only" || raw.verified !== true
+        || reason !== "quote_asset_not_pinned") throw new Error(`Byreal CLMM pool ${id} does not match the pinned XSPCX/USDC observe-only registration`);
+      if (raw.expected_fee_rate !== BYREAL_XSPCX_USDC_POOL.feeRate || raw.expected_tick_spacing !== BYREAL_XSPCX_USDC_POOL.tickSpacing
+        || raw.expected_fee_tier !== undefined || raw.expected_bin_step !== undefined) throw new Error(`Pool ${id} must declare the pinned Byreal fee rate and tick spacing`);
+      expected_fee_rate = BYREAL_XSPCX_USDC_POOL.feeRate;
+      expected_tick_spacing = BYREAL_XSPCX_USDC_POOL.tickSpacing;
     } else if (raw.expected_fee_rate !== undefined || raw.expected_tick_spacing !== undefined || raw.expected_bin_step !== undefined) {
       throw new Error(`Pool ${id} uses protocol-specific fee or bin-step fields`);
     }

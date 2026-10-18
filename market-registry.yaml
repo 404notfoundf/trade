@@ -47,6 +47,12 @@ dexes:
     quote_source: local_math
     enabled: true
     program_id: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+  byreal_clmm_solana:
+    chain: solana
+    adapter: byreal_clmm
+    quote_source: local_math
+    enabled: true
+    program_id: "REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2"
 
 instruments:
   - instrument_id: XAAPL
@@ -158,3 +164,15 @@ pools:
     address: "5whNk71ua6aRtNKazDqEeAimmfzuX9epJcjh4isQKprn"
     token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
     expected_bin_step: 8
+  - id: xspcx-solana-byreal-clmm-usdc
+    enabled: true
+    instrument_id: XSPCX
+    chain: solana
+    dex: byreal_clmm_solana
+    mode: observe_only
+    reason: quote_asset_not_pinned
+    verified: true
+    address: "LVcDubF4BFsEw8qmxupmw74bbZfiya99kor5c3Hh24r"
+    token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
+    expected_fee_rate: 1000
+    expected_tick_spacing: 10

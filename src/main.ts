@@ -69,7 +69,7 @@ function poolMonitorConfig(pool: RegisteredPool, config: Awaited<ReturnType<type
   const configuredAsset = config.assets.find((item) => item.instId === listing.symbol && item.chainIndex === config.marketRegistry.chains[pool.chain].chain_id.toString());
   const dex = config.marketRegistry.dexes[pool.dex]!;
   const chainIndex = config.marketRegistry.chains[pool.chain].chain_id.toString() as "196" | "501";
-  const dexName = ({ uniswap_v3: "uniswap-v3", raydium_clmm: "raydium-clmm", orca_whirlpool: "orca-whirlpool", meteora_dlmm: "meteora-dlmm" } as const)[dex.adapter];
+  const dexName = ({ uniswap_v3: "uniswap-v3", raydium_clmm: "raydium-clmm", orca_whirlpool: "orca-whirlpool", meteora_dlmm: "meteora-dlmm", byreal_clmm: "byreal-clmm" } as const)[dex.adapter];
   return {
     enabled: pool.enabled, id: pool.id, instId: listing.symbol, chainIndex,
     dex: dexName, address: pool.address,

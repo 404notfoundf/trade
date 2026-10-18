@@ -6,6 +6,7 @@ import { directPoolDexLabel, renderDirectPoolPage } from "./direct-pool-pages.js
 const registeredPools = [
   { id: "orca-pool", instrument_id: "XSPCX", dex: "orca_whirlpool_solana", address: "ASAxmEaTT1HFe3mVC3zbKDE4tuB28W7732XQrEMBM5W2", enabled: true },
   { id: "meteora-pool", instrument_id: "XSPCX", dex: "meteora_dlmm_solana", address: "5whNk71ua6aRtNKazDqEeAimmfzuX9epJcjh4isQKprn", enabled: false },
+  { id: "byreal-pool", instrument_id: "XSPCX", dex: "byreal_clmm_solana", address: "LVcDubF4BFsEw8qmxupmw74bbZfiya99kor5c3Hh24r", enabled: true },
 ];
 
 const pageConfig = { marketRegistry: { pools: registeredPools } } as unknown as Config;
@@ -21,6 +22,7 @@ const helpers = {
 test("direct-pool pages show registered Solana adapters by readable name", () => {
   assert.equal(directPoolDexLabel("orca_whirlpool_solana"), "Orca Whirlpool");
   assert.equal(directPoolDexLabel("meteora_dlmm_solana"), "Meteora DLMM");
+  assert.equal(directPoolDexLabel("byreal_clmm_solana"), "Byreal CLMM");
   assert.equal(directPoolDexLabel("raydium_clmm_solana"), "Raydium CLMM");
   assert.equal(directPoolDexLabel("unknown"), "unknown");
 });
@@ -33,6 +35,7 @@ test("pool selector is shared across pages and keeps missing historical pool sel
     assert.match(html, /<select name="pool">/);
     assert.match(html, /value="meteora-pool" selected/);
     assert.match(html, /XSPCX · Meteora DLMM · 5whNk71…QKprn · 已关闭/);
+    assert.match(html, /value="byreal-pool">XSPCX · Byreal CLMM · LVcDubF…Hh24r/);
   }
 
   const html = await renderDirectPoolPage({

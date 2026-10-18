@@ -7,7 +7,7 @@ import { AccountState, ASSOCIATED_TOKEN_PROGRAM_ID, ExtensionType, TOKEN_2022_PR
 import { ComputeBudgetProgram, Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, SystemProgram, Transaction } from "@solana/web3.js";
 import { ORCA_WHIRLPOOL_PROGRAM_ID, WhirlpoolContext, type SwapQuote, type WhirlpoolData } from "@orca-so/whirlpools-sdk";
 import WebSocket from "ws";
-import { METEORA_DLMM_PROGRAM_ADDRESS, METEORA_XSPCX_USDC_POOL, ORCA_WHIRLPOOL_PROGRAM_ADDRESS, ORCA_XSPCX_USDC_POOL, type MarketRegistry, type RegisteredPool } from "./market-registry.js";
+import { BYREAL_CLMM_PROGRAM_ADDRESS, BYREAL_XSPCX_USDC_POOL, METEORA_DLMM_PROGRAM_ADDRESS, METEORA_XSPCX_USDC_POOL, ORCA_WHIRLPOOL_PROGRAM_ADDRESS, ORCA_XSPCX_USDC_POOL, type MarketRegistry, type RegisteredPool } from "./market-registry.js";
 export { createSolanaSimulationTransaction } from "./raydium-simulator.js";
 
 // The SDK's ESM entrypoint imports an invalid Anchor directory in Node; its CJS entrypoint resolves correctly.
@@ -38,6 +38,7 @@ const token2022ObservationPools = [
   { protocol: "raydium_clmm", id: "xspcx-solana-raydium-usdc-clmm", instrumentId: "XSPCX", address: "AHNN6JmvaGG6XUoSg7sEr38gRYDB2jTbUvqXVuqaRHpq", programId: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", assetMint: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
   { protocol: "orca_whirlpool", id: ORCA_XSPCX_USDC_POOL.id, instrumentId: ORCA_XSPCX_USDC_POOL.instrumentId, address: ORCA_XSPCX_USDC_POOL.address, programId: ORCA_WHIRLPOOL_PROGRAM_ADDRESS, assetMint: ORCA_XSPCX_USDC_POOL.assetMint, quoteMint: ORCA_XSPCX_USDC_POOL.quoteMint },
   { protocol: "meteora_dlmm", id: METEORA_XSPCX_USDC_POOL.id, instrumentId: METEORA_XSPCX_USDC_POOL.instrumentId, address: METEORA_XSPCX_USDC_POOL.address, programId: METEORA_DLMM_PROGRAM_ADDRESS, assetMint: METEORA_XSPCX_USDC_POOL.assetMint, quoteMint: METEORA_XSPCX_USDC_POOL.quoteMint },
+  { protocol: "byreal_clmm", id: BYREAL_XSPCX_USDC_POOL.id, instrumentId: BYREAL_XSPCX_USDC_POOL.instrumentId, address: BYREAL_XSPCX_USDC_POOL.address, programId: BYREAL_CLMM_PROGRAM_ADDRESS, assetMint: BYREAL_XSPCX_USDC_POOL.assetMint, quoteMint: BYREAL_XSPCX_USDC_POOL.quoteMint },
 ];
 // shortcut: only these reviewed observe-only protocol/pool/mint pairs are supported; re-review extensions before adding another.
 const allowedToken2022Extensions = new Set<ExtensionType>([
@@ -202,7 +203,7 @@ export async function readSolanaTokenState(connection: Connection, pool: Registe
 
 export function validateSolanaTokenSupport(
   pool: RegisteredPool, state: SolanaMintState, blockTimestamp: bigint,
-  protocol: "raydium_clmm" | "orca_whirlpool" | "meteora_dlmm", programId: string | undefined,
+  protocol: "raydium_clmm" | "orca_whirlpool" | "meteora_dlmm" | "byreal_clmm", programId: string | undefined,
 ): SolanaMintState & { uiMultiplier: string; multiplierEffectiveTimestamp: string | null } {
   if (state.owner.equals(TOKEN_PROGRAM_ID)) return { ...state, uiMultiplier: "1", multiplierEffectiveTimestamp: null };
   if (!state.owner.equals(TOKEN_2022_PROGRAM_ID)) throw new UnsupportedTokenError("TOKEN_PROGRAM_UNSUPPORTED", `Unsupported Solana token program: ${state.owner.toBase58()}`);
@@ -223,7 +224,7 @@ export function validateSolanaTokenSupport(
   return { ...state, uiMultiplier: String(multiplier), multiplierEffectiveTimestamp: scaled?.newMultiplierEffectiveTimestamp.toString() ?? null };
 }
 
-export function isScopedToken2022Pool(pool: RegisteredPool, protocol: "raydium_clmm" | "orca_whirlpool" | "meteora_dlmm", programId: string | undefined): boolean {
+export function isScopedToken2022Pool(pool: RegisteredPool, protocol: "raydium_clmm" | "orca_whirlpool" | "meteora_dlmm" | "byreal_clmm", programId: string | undefined): boolean {
   return token2022ObservationPools.some((entry) => entry.protocol === protocol && pool.id === entry.id && pool.instrument_id === entry.instrumentId
     && pool.chain === "solana" && pool.mode === "observe_only" && pool.verified && pool.address === entry.address
     && programId === entry.programId && pool.token_in_out.asset_address === entry.assetMint && pool.token_in_out.quote_address === entry.quoteMint);
@@ -325,6 +326,11 @@ export function orcaQuotePerAsset(data: WhirlpoolData, pool: RegisteredPool): st
     ? pool.token_in_out.asset_decimals - pool.token_in_out.quote_decimals
     : pool.token_in_out.quote_decimals - pool.token_in_out.asset_decimals));
   return (assetIsA ? priceBPerA : new Decimal(1).div(priceBPerA)).toString();
+}
+
+export function byrealQuotePerAsset(priceBPerA: Decimal, assetIsA: boolean): Decimal {
+  if (!priceBPerA.isFinite() || !priceBPerA.gt(0)) throw new Error("Byreal pool price must be positive");
+  return assetIsA ? priceBPerA : new Decimal(1).div(priceBPerA);
 }
 
 export async function startSolanaAccountWatch(

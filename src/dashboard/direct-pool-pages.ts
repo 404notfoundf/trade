@@ -77,7 +77,7 @@ export const directPoolSimulationLabel = (status: string | null | undefined): st
   COOLDOWN: "冷却中", SKIPPED: "已跳过", PASSED: "模拟通过", FAILED: "模拟失败",
 } as Record<string, string>)[status ?? ""] ?? status ?? "未知";
 export const directPoolDexLabel = (dex: string | null | undefined): string => ({
-  uniswap_v3_xlayer: "Uniswap V3", raydium_clmm_solana: "Raydium CLMM", orca_whirlpool_solana: "Orca Whirlpool", meteora_dlmm_solana: "Meteora DLMM",
+  uniswap_v3_xlayer: "Uniswap V3", raydium_clmm_solana: "Raydium CLMM", orca_whirlpool_solana: "Orca Whirlpool", meteora_dlmm_solana: "Meteora DLMM", byreal_clmm_solana: "Byreal CLMM",
 } as Record<string, string>)[dex ?? ""] ?? dex ?? "未知";
 
 type DecisionFilters = { positiveOnly: boolean; assetPool: string; direction: string; poolId: string };

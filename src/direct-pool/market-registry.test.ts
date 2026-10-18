@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { parse } from "yaml";
-import { loadMarketRegistry, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, parseMarketRegistry, solveDirectPoolCandidates } from "./market-registry.js";
+import { BYREAL_CLMM_PROGRAM_ADDRESS, BYREAL_XSPCX_USDC_POOL, loadMarketRegistry, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, parseMarketRegistry, solveDirectPoolCandidates } from "./market-registry.js";
 import { createPoolAdapter } from "./pool-adapter-factory.js";
 
 const envKeys = ["XLAYER_RPC_HTTP", "XLAYER_RPC_WS"] as const;
-const solanaPoolEnvKeys = ["SOLANA_XSPCX_ORCA_RPC_HTTP", "SOLANA_XSPCX_ORCA_RPC_WS", "SOLANA_XSPCX_METEORA_RPC_HTTP", "SOLANA_XSPCX_METEORA_RPC_WS"] as const;
+const solanaPoolEnvKeys = ["SOLANA_RPC_URL", "SOLANA_RPC_WS", "SOLANA_XSPCX_ORCA_RPC_HTTP", "SOLANA_XSPCX_ORCA_RPC_WS", "SOLANA_XSPCX_METEORA_RPC_HTTP", "SOLANA_XSPCX_METEORA_RPC_WS"] as const;
 const withRpcEnv = (run: () => void) => {
   const old = new Map(envKeys.map((key) => [key, process.env[key]]));
   process.env.XLAYER_RPC_HTTP = "https://rpc.example";
@@ -33,13 +33,16 @@ test("existing wrapped and non-pinned pools stay observe-only and produce no can
   assert.equal(registry.dexes.raydium_clmm_solana?.program_id, "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
   assert.equal(registry.dexes.orca_whirlpool_solana?.adapter, "orca_whirlpool");
   assert.equal(registry.dexes.meteora_dlmm_solana?.adapter, "meteora_dlmm");
+  assert.deepEqual([registry.dexes.byreal_clmm_solana?.adapter, registry.dexes.byreal_clmm_solana?.program_id], ["byreal_clmm", BYREAL_CLMM_PROGRAM_ADDRESS]);
   assert.deepEqual(registry.pools.map((pool) => [pool.mode, pool.reason]), [
-    ["observe_only", "wrapper_required"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"],
+    ["observe_only", "wrapper_required"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"],
   ]);
   const orca = registry.pools.find((pool) => pool.id === ORCA_XSPCX_USDC_POOL.id)!;
   assert.deepEqual([orca.address, orca.expected_fee_rate, orca.expected_tick_spacing], [ORCA_XSPCX_USDC_POOL.address, 500, 8]);
   const meteora = registry.pools.find((pool) => pool.id === METEORA_XSPCX_USDC_POOL.id)!;
   assert.deepEqual([meteora.address, meteora.expected_bin_step], [METEORA_XSPCX_USDC_POOL.address, METEORA_XSPCX_USDC_POOL.binStep]);
+  const byreal = registry.pools.find((pool) => pool.id === BYREAL_XSPCX_USDC_POOL.id)!;
+  assert.deepEqual([byreal.address, byreal.expected_fee_rate, byreal.expected_tick_spacing], [BYREAL_XSPCX_USDC_POOL.address, BYREAL_XSPCX_USDC_POOL.feeRate, BYREAL_XSPCX_USDC_POOL.tickSpacing]);
   assert.deepEqual(solveDirectPoolCandidates(registry, [{ enabled: true, instId: "XNVDA-USDT", okxCurrency: "XNVDA", chainIndex: "196", tokenAddress: "0xc845b2894dbddd03858fd2d643b4ef725fe0849d", quoteTokenAddress: "0x779ded0c9e1022225f8e0630b35a9b54be713736" }]), []);
 });
 
@@ -98,6 +101,37 @@ test("registry rejects Meteora program, pool, mint, mode or bin-step drift", asy
     const raw = await readRawRegistry();
     const pool = raw.pools.find((candidate: any) => candidate.id === METEORA_XSPCX_USDC_POOL.id);
     mutate(pool, raw.dexes.meteora_dlmm_solana);
+    assert.throws(() => parseMarketRegistry(raw));
+  }
+});
+
+test("registry pins the Byreal CLMM pool and keeps it observe-only", async () => {
+  const raw = await readRawRegistry();
+  withSolanaPoolRpcEnv(() => {
+    const registry = parseMarketRegistry(raw);
+    const pool = registry.pools.find((candidate) => candidate.id === BYREAL_XSPCX_USDC_POOL.id)!;
+    const adapter = createPoolAdapter(pool, registry);
+    assert.equal(adapter.constructor.name, "ByrealClmmAdapter");
+    assert.equal(adapter.stateSource, "adapter_watch");
+    assert.equal(typeof adapter.watch, "function");
+    assert.deepEqual(solveDirectPoolCandidates(registry, [{ enabled: true, instId: "XSPCX-USDT", okxCurrency: "XSPCX", chainIndex: "501",
+      tokenAddress: BYREAL_XSPCX_USDC_POOL.assetMint, quoteTokenAddress: BYREAL_XSPCX_USDC_POOL.quoteMint }]), []);
+  });
+});
+
+test("registry rejects Byreal program, pool, mint, mode or fee metadata drift", async () => {
+  const mutations: Array<(pool: any, dex: any) => void> = [
+    (pool) => { pool.address = "LVcDubF4BFsEw8qmxupmw74bbZfiya99kor5c3Hh24s"; },
+    (pool) => { pool.expected_fee_rate = 999; },
+    (pool) => { pool.expected_tick_spacing = 8; },
+    (pool) => { pool.token_in_out.quote_address = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"; },
+    (pool) => { pool.mode = "trade_candidate"; },
+    (_pool, dex) => { dex.program_id = "11111111111111111111111111111111"; },
+  ];
+  for (const mutate of mutations) {
+    const raw = await readRawRegistry();
+    const pool = raw.pools.find((candidate: any) => candidate.id === BYREAL_XSPCX_USDC_POOL.id);
+    mutate(pool, raw.dexes.byreal_clmm_solana);
     assert.throws(() => parseMarketRegistry(raw));
   }
 });

@@ -20,6 +20,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@byreal-io/byreal-clmm-sdk": "0.2.2",
     "@coral-xyz/anchor": "0.32.1",
     "@meteora-ag/dlmm": "1.9.14",
     "@orca-so/common-sdk": "0.7.1",

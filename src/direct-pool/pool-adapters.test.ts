@@ -6,8 +6,8 @@ import Decimal from "decimal.js";
 import { Interface } from "ethers";
 import { Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { WebSocketServer } from "ws";
-import { assertMeteoraFullFill, createSolanaSimulationTransaction, encodeUniswapV3Swap, impactFromMarginalPrice, impactFromOrcaSqrtPrice, impactFromSqrtPrice, isScopedToken2022Pool, meteoraSwapForY, minimumOut, orcaInputMint, startSolanaAccountWatch } from "./pool-adapters.js";
-import { METEORA_DLMM_PROGRAM_ADDRESS, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, type RegisteredPool } from "./market-registry.js";
+import { assertMeteoraFullFill, byrealQuotePerAsset, createSolanaSimulationTransaction, encodeUniswapV3Swap, impactFromMarginalPrice, impactFromOrcaSqrtPrice, impactFromSqrtPrice, isScopedToken2022Pool, meteoraSwapForY, minimumOut, orcaInputMint, startSolanaAccountWatch } from "./pool-adapters.js";
+import { BYREAL_CLMM_PROGRAM_ADDRESS, BYREAL_XSPCX_USDC_POOL, METEORA_DLMM_PROGRAM_ADDRESS, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, type RegisteredPool } from "./market-registry.js";
 
 const pool = {
   id: "pool", token_in_out: {
@@ -26,6 +26,12 @@ test("Uniswap spot comparison reports exact-in impact in both directions", () =>
 test("minimum output applies integer basis-point slippage without rounding up", () => {
   assert.equal(minimumOut(10_001n, 50), 9_950n);
   assert.equal(minimumOut(999n, 0), 999n);
+});
+
+test("Byreal spot conversion handles either mint order and rejects invalid prices", () => {
+  assert.equal(byrealQuotePerAsset(new Decimal("2"), true).toString(), "2");
+  assert.equal(byrealQuotePerAsset(new Decimal("2"), false).toString(), "0.5");
+  assert.throws(() => byrealQuotePerAsset(new Decimal(0), true), /positive/);
 });
 
 test("Orca directions use the pinned raw mint pair and spot-price decimal normalization", () => {
@@ -49,6 +55,9 @@ test("Token-2022 review exception is scoped to the exact protocol, pool and mint
   const meteora = { ...orca, id: METEORA_XSPCX_USDC_POOL.id, address: METEORA_XSPCX_USDC_POOL.address };
   assert.equal(isScopedToken2022Pool(meteora, "meteora_dlmm", METEORA_DLMM_PROGRAM_ADDRESS), true);
   assert.equal(isScopedToken2022Pool({ ...meteora, token_in_out: { ...meteora.token_in_out, quote_address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" } }, "meteora_dlmm", METEORA_DLMM_PROGRAM_ADDRESS), false);
+  const byreal = { ...orca, id: BYREAL_XSPCX_USDC_POOL.id, address: BYREAL_XSPCX_USDC_POOL.address };
+  assert.equal(isScopedToken2022Pool(byreal, "byreal_clmm", BYREAL_CLMM_PROGRAM_ADDRESS), true);
+  assert.equal(isScopedToken2022Pool({ ...byreal, mode: "trade_candidate" }, "byreal_clmm", BYREAL_CLMM_PROGRAM_ADDRESS), false);
 });
 
 test("Meteora direction follows the pool's token X mint and rejects partial exact-in consumption", () => {

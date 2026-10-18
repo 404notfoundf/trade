@@ -41,7 +41,7 @@ ArbBridge 的 DEX sizing 目前把一次指定规模的 Quoter 报价折成单�
 
 ## 对本项目的对应检查
 
-当前启用的 XSPCX/USDC Solana 池是 `observe_only`。`src/trading/direct-pool-collector.ts` 每轮都会构造 quote → asset 的 DEX 买入报价；只有 CEX 盘口能换算出目标数量，或池边际价可用于回退换算时，才会同时构造 asset → quote 的 DEX 卖出报价。它在 `recordObserveDecision` 中：
+当前启用的 XSPCX/USDC Solana 池是 `observe_only`。`src/direct-pool/collector.ts` 每轮都会构造 quote → asset 的 DEX 买入报价；只有 CEX 盘口能换算出目标数量，或池边际价可用于回退换算时，才会同时构造 asset → quote 的 DEX 卖出报价。它在 `recordObserveDecision` 中：
 
 - CEX 买入方向取 asks，DEX 卖出收入减 CEX VWAP 买入成本；
 - CEX 卖出方向取 bids，CEX VWAP 卖出收入减 DEX quote 输入成本；
@@ -71,4 +71,4 @@ ArbBridge 的 DEX sizing 目前把一次指定规模的 Quoter 报价折成单�
 ## 本次扫描的代码位置
 
 - ArbBridge：`internal/strategy/form_takertaker.go`、`internal/strategy/candidate.go`、`internal/app/execplan/sizer.go`、`internal/pricing/solve.go`、`internal/pricing/types.go`、`internal/app/assemble_const.go`、`docs/ops/numbers.md`。
-- 本项目：[`src/trading/direct-pool-collector.ts`](../src/trading/direct-pool-collector.ts)、[`market-registry.yaml`](../market-registry.yaml)。
+- 本项目：[`src/direct-pool/collector.ts`](../src/direct-pool/collector.ts)、[`market-registry.yaml`](../market-registry.yaml)。

@@ -9,12 +9,14 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "dev:collector": "tsx watch src/main.ts --collector-only",
-    "dev:dashboard": "tsx watch src/dashboard-server.ts",
+    "dev:dashboard": "tsx watch src/dashboard/server.ts",
     "db:migrate": "tsx src/migrate.ts",
     "build": "tsc",
+    "test": "node scripts/run-offline-tests.mjs",
+    "check": "npm run typecheck && npm test",
     "start": "node dist/main.js",
     "start:collector": "node dist/main.js --collector-only",
-    "start:dashboard": "node dist/dashboard-server.js",
+    "start:dashboard": "node dist/dashboard/server.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

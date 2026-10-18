@@ -153,7 +153,14 @@ function groupKey(sample: WindowSample): string {
   return [sample.instrumentId, sample.chainIndex, sample.poolId, sample.direction, sizeKey(sample.sizeUsdt)].join("\0");
 }
 
-type GroupState = { open: PositiveWindow | null; pendingPositive: WindowSample | null; nonPositiveStreak: number; lastValidAt: Date | null };
+type GroupState = {
+  open: PositiveWindow | null;
+  pendingPositive: WindowSample | null;
+  nonPositiveStreak: number;
+  lastValidAt: Date | null;
+  coverageKnown: boolean;
+  boundaryNonPositiveStreak: number;
+};
 
 function recordWindowSample(window: PositiveWindow, sample: WindowSample, profit: Decimal): void {
   window.sampleCount++;
@@ -186,7 +193,7 @@ function expire(state: GroupState, at: Date): void {
   state.lastValidAt = null;
 }
 
-export function collectPositiveWindows(samples: WindowSample[], until?: Date): PositiveWindow[] {
+export function collectPositiveWindows(samples: WindowSample[], until?: Date, initialCoverageComplete = true): PositiveWindow[] {
   const ordered = samples.filter((sample) => !until || sample.createdAt.getTime() < until.getTime())
     .slice()
     .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id - b.id);
@@ -196,8 +203,22 @@ export function collectPositiveWindows(samples: WindowSample[], until?: Date): P
     const net = sample.poolId ? numericNet(sample.netProfitUsdt) : null;
     if (!sample.poolId || !net || sample.valuationStatus?.startsWith("INVALIDATED_")) continue;
     const key = groupKey(sample);
-    const state = groups.get(key) ?? { open: null, pendingPositive: null, nonPositiveStreak: 0, lastValidAt: null };
+    const state = groups.get(key) ?? {
+      open: null, pendingPositive: null, nonPositiveStreak: 0, lastValidAt: null,
+      coverageKnown: initialCoverageComplete, boundaryNonPositiveStreak: 0,
+    };
     groups.set(key, state);
+    if (!state.coverageKnown) {
+      if (state.lastValidAt && sample.createdAt.getTime() - state.lastValidAt.getTime() > DIRECT_POOL_WINDOW_GAP_MS) {
+        state.coverageKnown = true;
+      } else {
+        state.boundaryNonPositiveStreak = net.gt(0) ? 0 : state.boundaryNonPositiveStreak + 1;
+        state.lastValidAt = sample.createdAt;
+        if (state.boundaryNonPositiveStreak < 2) continue;
+        state.coverageKnown = true;
+        state.boundaryNonPositiveStreak = 0;
+      }
+    }
     expire(state, sample.createdAt);
     if (!state.open) {
       if (net.gt(0)) {

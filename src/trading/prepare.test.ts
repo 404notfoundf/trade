@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import Decimal from "decimal.js";
 import type { AssetConfig } from "../config.js";
-import type { Book } from "../okx.js";
+import type { Book } from "../market/okx.js";
 import { prepareBuy, type PrepareServices, type TradeState } from "./prepare.js";
 import { XLAYER_DEX_ROUTER } from "./gates.js";
 

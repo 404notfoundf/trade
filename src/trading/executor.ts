@@ -1,25 +1,27 @@
 import { randomBytes } from "node:crypto";
 import Decimal from "decimal.js";
 import bs58 from "bs58";
-import { FetchRequest, JsonRpcProvider, Wallet, keccak256 } from "ethers";
+import { JsonRpcProvider, Wallet, keccak256 } from "ethers";
 import {
   AddressLookupTableAccount, Connection, Keypair, PublicKey, TransactionInstruction,
   TransactionMessage, VersionedTransaction,
 } from "@solana/web3.js";
-import type { SimulatedTransactionAccountInfo } from "@solana/web3.js";
 import type { AssetConfig, Config } from "../config.js";
 import type { QuoteObservation } from "../observations.js";
 import { execute, query, withNamedLock } from "../db.js";
 import { solanaRpcFetch } from "../solana-rpc-logging.js";
-import { bookStale, floorToStep, vwap, type Instrument } from "../market.js";
+import { bookStale, floorToStep, vwap, type Instrument } from "../market/market.js";
 import {
   dexApproveTransaction, dexSolanaSwapInstructions, dexSwap, okxPrivateGet, okxPrivatePost,
   type Book, type Credentials,
-} from "../okx.js";
-import { decideValuation, SOLANA_CHAIN, XLAYER_CHAIN } from "../valuation.js";
+} from "../market/okx.js";
+import { decideValuation, SOLANA_CHAIN, XLAYER_CHAIN } from "../market/valuation.js";
 import { netMarginOk, swapTxError, type SwapTx } from "./gates.js";
 import { recoverCycle, type CexOrderIntent, type RecoveryCycle, type RecoveryDecision, type RecoveryOrder } from "./recovery.js";
+import { persistBeforeSubmit } from "./persist-before-submit.js";
 import { logger } from "../logger.js";
+import { evmProvider, okxAvailable, readChainBalances, readEvmAllowance, readSwapDeltas, signer } from "./balance-reader.js";
+import { readSolanaSwapTokenSnapshots, validateSolanaInstruction, validateSolanaSwapQuote, validateSolanaSwapSimulation, SOLANA_ASSOCIATED_TOKEN, SOLANA_COMPUTE_BUDGET, SOLANA_OKX_ROUTER } from "./solana-swap-validation.js";
 
 type RouterToken = { tokenContractAddress?: string; decimal?: string; taxRate?: string | number | null; isHoneyPot?: boolean };
 type RouterResult = {
@@ -39,7 +41,6 @@ type ExecutionState = {
   routeStatus: "ENABLED" | "MONITOR_ONLY" | "BLOCKED";
   instrument?: Instrument; feeRate?: Decimal; multiplier?: Decimal; book?: Book;
 };
-type CexBalance = { ccy: string; availBal: string };
 type CexOrder = {
   ordId?: string; clOrdId?: string; instId?: string; side?: string; sz?: string; px?: string; cTime?: string;
   sCode?: string; sMsg?: string; state?: string; accFillSz?: string; avgPx?: string;
@@ -127,11 +128,6 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const human = (raw: bigint, decimals: number) => new Decimal(raw.toString()).div(new Decimal(10).pow(decimals));
 const rawAmount = (amount: Decimal, decimals: number) => BigInt(amount.mul(new Decimal(10).pow(decimals)).floor().toFixed(0));
 const addressEqual = (asset: AssetConfig, left: string | undefined, right: string) => asset.chainIndex === SOLANA_CHAIN ? left === right : left?.toLowerCase() === right.toLowerCase();
-const SOLANA_OKX_ROUTER = "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u";
-const SOLANA_COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111";
-const SOLANA_ASSOCIATED_TOKEN = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const SOLANA_TOKEN_PROGRAMS = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"];
-const SOLANA_WRAPPED_SOL = "So11111111111111111111111111111111111111112";
 const SOLANA_MAX_TX_FEE_LAMPORTS = 1_000_000n;
 const fail = (message: string): never => { throw new Error(message); };
 
@@ -542,13 +538,15 @@ async function tryCexBuyDexSell(asset: AssetConfig, input: ExecutionInput): Prom
     const clOrdIdResult = (await query<Array<{ client_order_id: string }>>("SELECT client_order_id FROM trade_cycle WHERE id=?", [cycleId]))[0]?.client_order_id;
     if (!clOrdIdResult) throw new Error("Trade client order ID was not persisted");
     const clOrdId = clOrdIdResult;
-    await persistCexOrderIntent(cycleId, txHash, {
-      version: 1, instId: asset.instId, tdMode: "cash", clOrdId, side: "buy", ordType: "ioc",
-      px: limitPrice.toString(), sz: actualShares.toString(), bookExchangeTime: latestBook.exchangeTime,
-      bookReceivedAt: latestBook.receivedAt, bookSeqId: latestBook.seqId,
-      dexAssetDeltaRaw: deltas.assetDelta.toString(), dexQuoteDeltaRaw: deltas.quoteDelta.toString(), preparedAt: new Date().toISOString(),
-    });
-    const order = await placeIocOrder(input.okx, cycleId, clOrdId, asset.instId, "buy", actualShares, limitPrice);
+    const order = await persistBeforeSubmit(
+      () => persistCexOrderIntent(cycleId, txHash, {
+        version: 1, instId: asset.instId, tdMode: "cash", clOrdId, side: "buy", ordType: "ioc",
+        px: limitPrice.toString(), sz: actualShares.toString(), bookExchangeTime: latestBook.exchangeTime,
+        bookReceivedAt: latestBook.receivedAt, bookSeqId: latestBook.seqId,
+        dexAssetDeltaRaw: deltas.assetDelta.toString(), dexQuoteDeltaRaw: deltas.quoteDelta.toString(), preparedAt: new Date().toISOString(),
+      }),
+      () => placeIocOrder(input.okx, cycleId, clOrdId, asset.instId, "buy", actualShares, limitPrice),
+    );
     await persistCexOrderResult(cycleId, order);
     const filled = new Decimal(order.accFillSz ?? "0");
     const avgPrice = order.avgPx ? new Decimal(order.avgPx) : null;
@@ -753,13 +751,15 @@ async function tryDexBuyCexSell(asset: AssetConfig, input: ExecutionInput): Prom
 
     const clOrdId = (await query<Array<{ client_order_id: string }>>("SELECT client_order_id FROM trade_cycle WHERE id=?", [cycleId]))[0]?.client_order_id;
     if (!clOrdId) throw new Error("Trade client order ID was not persisted");
-    await persistCexOrderIntent(cycleId, txHash, {
-      version: 1, instId: asset.instId, tdMode: "cash", clOrdId, side: "sell", ordType: "ioc",
-      px: limitPrice.toString(), sz: actualShares.toString(), bookExchangeTime: latestBook.exchangeTime,
-      bookReceivedAt: latestBook.receivedAt, bookSeqId: latestBook.seqId,
-      dexAssetDeltaRaw: deltas.assetDelta.toString(), dexQuoteDeltaRaw: deltas.quoteDelta.toString(), preparedAt: new Date().toISOString(),
-    });
-    const order = await placeIocOrder(input.okx, cycleId, clOrdId, asset.instId, "sell", actualShares, limitPrice);
+    const order = await persistBeforeSubmit(
+      () => persistCexOrderIntent(cycleId, txHash, {
+        version: 1, instId: asset.instId, tdMode: "cash", clOrdId, side: "sell", ordType: "ioc",
+        px: limitPrice.toString(), sz: actualShares.toString(), bookExchangeTime: latestBook.exchangeTime,
+        bookReceivedAt: latestBook.receivedAt, bookSeqId: latestBook.seqId,
+        dexAssetDeltaRaw: deltas.assetDelta.toString(), dexQuoteDeltaRaw: deltas.quoteDelta.toString(), preparedAt: new Date().toISOString(),
+      }),
+      () => placeIocOrder(input.okx, cycleId, clOrdId, asset.instId, "sell", actualShares, limitPrice),
+    );
     await persistCexOrderResult(cycleId, order);
     const filled = new Decimal(order.accFillSz ?? "0");
     const avgPrice = order.avgPx ? new Decimal(order.avgPx) : null;
@@ -869,157 +869,6 @@ async function requestSwap(asset: AssetConfig, wallet: string, amount: bigint, f
   const bundle = Array.isArray(response) ? response[0] : response;
   if (!bundle || !bundle.routerResult || !bundle.instructionLists?.length) throw new Error("Solana DEX response has no swap instructions");
   return bundle;
-}
-
-async function okxAvailable(credentials: Credentials, currency: string): Promise<Decimal> {
-  const rows = await okxPrivateGet<Array<{ details?: CexBalance[] }>>(`/api/v5/account/balance?ccy=${encodeURIComponent(currency)}`, credentials);
-  const row = rows[0]?.details?.find((item) => item.ccy === currency);
-  const amount = new Decimal(row?.availBal ?? "0");
-  if (!amount.isFinite() || amount.lt(0)) fail(`OKX available ${currency} balance is unavailable`);
-  return amount;
-}
-
-function signer(chainIndex: string, xlayerKey: string, solanaKey: string): { address: string; evm?: Wallet; solana?: Keypair } | null {
-  try {
-    if (chainIndex === XLAYER_CHAIN && xlayerKey) {
-      const evm = new Wallet(xlayerKey);
-      return { address: evm.address, evm };
-    }
-    if (chainIndex === SOLANA_CHAIN && solanaKey) {
-      const secret = solanaKey.trim();
-      const bytes = secret.startsWith("[")
-        ? Uint8Array.from(JSON.parse(secret) as number[])
-        : bs58.decode(secret);
-      const solana = bytes.length === 32 ? Keypair.fromSeed(bytes) : Keypair.fromSecretKey(bytes);
-      return { address: solana.publicKey.toBase58(), solana };
-    }
-  } catch {
-    fail(`Invalid ${chainIndex === XLAYER_CHAIN ? "X Layer" : "Solana"} runtime private key`);
-  }
-  return null;
-}
-
-export function validateTradeSigners(assets: AssetConfig[], signers: Config["signers"]): void {
-  for (const asset of assets) {
-    if (signer(asset.chainIndex, signers.xlayerPrivateKey, signers.solanaPrivateKey)) continue;
-    const secretName = asset.chainIndex === XLAYER_CHAIN ? "XLAYER_PRIVATE_KEY" : "SOLANA_PRIVATE_KEY";
-    fail(`Trading is enabled but ${secretName} is required for ${asset.network} route (${asset.instId})`);
-  }
-}
-
-let sharedEvmProvider: JsonRpcProvider | undefined;
-function evmProvider(): JsonRpcProvider {
-  if (!sharedEvmProvider) {
-    const request = new FetchRequest(process.env.XLAYER_RPC_URL || "https://rpc.xlayer.tech");
-    request.timeout = 10_000;
-    sharedEvmProvider = new JsonRpcProvider(request, 196, { staticNetwork: true });
-  }
-  return sharedEvmProvider;
-}
-
-async function readChainBalances(asset: AssetConfig, owner: string, signers: Config["signers"]): Promise<{ asset: bigint; quote: bigint; native: bigint }> {
-  if (asset.chainIndex === XLAYER_CHAIN) {
-    const provider = evmProvider();
-    const [token, quote, native] = await Promise.all([
-      readEvmTokenBalance(provider, asset.tokenAddress, owner),
-      readEvmTokenBalance(provider, asset.quoteTokenAddress, owner),
-      provider.getBalance(owner),
-    ]);
-    return { asset: token, quote, native };
-  }
-  const connection = new Connection(signers.solanaRpcUrl, { commitment: "confirmed", fetch: solanaRpcFetch });
-  const ownerKey = new PublicKey(owner);
-  const tokenKey = new PublicKey(asset.tokenAddress);
-  const quoteKey = new PublicKey(asset.quoteTokenAddress);
-  const [token, quote, native] = await Promise.all([
-    readSolTokenBalance(connection, ownerKey, tokenKey, asset.tokenDecimals),
-    readSolTokenBalance(connection, ownerKey, quoteKey, asset.quoteTokenDecimals),
-    connection.getBalance(ownerKey, "confirmed"),
-  ]);
-  return { asset: token, quote, native: BigInt(native) };
-}
-
-export async function inspectRouteBalances(
-  asset: AssetConfig, credentials: Credentials, signers: Config["signers"],
-): Promise<{ walletAddress: string; cexUsdt: string; cexAsset: string; chainAssetRaw: string; chainQuoteRaw: string; chainNativeRaw: string }> {
-  const wallet = signer(asset.chainIndex, signers.xlayerPrivateKey, signers.solanaPrivateKey);
-  if (!wallet) throw new Error(`Wallet signer is unavailable for ${asset.network}`);
-  const [cexUsdt, cexAsset, chain] = await Promise.all([
-    okxAvailable(credentials, "USDT"),
-    okxAvailable(credentials, asset.okxCurrency),
-    readChainBalances(asset, wallet.address, signers),
-  ]);
-  return {
-    walletAddress: wallet.address,
-    cexUsdt: cexUsdt.toString(),
-    cexAsset: cexAsset.toString(),
-    chainAssetRaw: chain.asset.toString(),
-    chainQuoteRaw: chain.quote.toString(),
-    chainNativeRaw: chain.native.toString(),
-  };
-}
-
-async function readEvmTokenBalance(provider: JsonRpcProvider, token: string, owner: string): Promise<bigint> {
-  const data = `0x70a08231${owner.slice(2).toLowerCase().padStart(64, "0")}`;
-  const result = await provider.call({ to: token, data });
-  if (!/^0x[\da-f]{64}$/i.test(result)) fail("X Layer token balance response is invalid");
-  return BigInt(result);
-}
-
-async function readSolTokenBalance(connection: Connection, owner: PublicKey, mint: PublicKey, expectedDecimals: number): Promise<bigint> {
-  const result = await connection.getParsedTokenAccountsByOwner(owner, { mint }, "confirmed");
-  let total = 0n;
-  for (const account of result.value) {
-    const parsed = account.account.data as { parsed?: { info?: { tokenAmount?: { amount?: string; decimals?: number } } } };
-    const tokenAmount = parsed.parsed?.info?.tokenAmount;
-    const raw = tokenAmount?.amount;
-    if (!tokenAmount || raw === undefined || tokenAmount.decimals !== expectedDecimals || !/^\d+$/.test(raw)) throw new Error("Solana token account metadata does not match pinned decimals");
-    total += BigInt(raw);
-  }
-  return total;
-}
-
-async function readSwapDeltas(asset: AssetConfig, txHash: string, owner: string, solanaRpcUrl: string): Promise<{ assetDelta: bigint; quoteDelta: bigint }> {
-  if (asset.chainIndex === XLAYER_CHAIN) {
-    const receipt = await evmProvider().getTransactionReceipt(txHash);
-    if (!receipt || receipt.status !== 1) throw new Error("Confirmed X Layer swap receipt is unavailable");
-    const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-    const ownerTopic = `0x${owner.slice(2).toLowerCase().padStart(64, "0")}`;
-    let assetDelta = 0n;
-    let quoteDelta = 0n;
-    for (const log of receipt.logs) {
-      if (log.topics[0]?.toLowerCase() !== transferTopic || !log.topics[1] || !log.topics[2]) continue;
-      const from = log.topics[1].toLowerCase();
-      const to = log.topics[2].toLowerCase();
-      const amount = BigInt(log.data);
-      if (log.address.toLowerCase() === asset.tokenAddress.toLowerCase()) {
-        if (from === ownerTopic) assetDelta -= amount;
-        if (to === ownerTopic) assetDelta += amount;
-      }
-      if (log.address.toLowerCase() === asset.quoteTokenAddress.toLowerCase()) {
-        if (from === ownerTopic) quoteDelta -= amount;
-        if (to === ownerTopic) quoteDelta += amount;
-      }
-    }
-    return { assetDelta, quoteDelta };
-  }
-  const connection = new Connection(solanaRpcUrl, { commitment: "confirmed", fetch: solanaRpcFetch });
-  const transaction = await connection.getTransaction(txHash, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
-  const meta = transaction?.meta;
-  if (!meta || meta.err) throw new Error("Confirmed Solana swap metadata is unavailable");
-  const sumMint = (rows: typeof meta.preTokenBalances, mint: string) => (rows ?? [])
-    .filter((row) => row.mint === mint && row.owner === owner)
-    .reduce((sum, row) => sum + BigInt(row.uiTokenAmount.amount), 0n);
-  const tokenDelta = sumMint(meta.postTokenBalances, asset.tokenAddress) - sumMint(meta.preTokenBalances, asset.tokenAddress);
-  const stableDelta = sumMint(meta.postTokenBalances, asset.quoteTokenAddress) - sumMint(meta.preTokenBalances, asset.quoteTokenAddress);
-  return { assetDelta: tokenDelta, quoteDelta: stableDelta };
-}
-
-async function readEvmAllowance(provider: JsonRpcProvider, token: string, owner: string, spender: string): Promise<bigint> {
-  const data = `0xdd62ed3e${owner.slice(2).toLowerCase().padStart(64, "0")}${spender.slice(2).toLowerCase().padStart(64, "0")}`;
-  const result = await provider.call({ to: token, data });
-  if (!/^0x[\da-f]{64}$/i.test(result)) fail("X Layer token allowance response is invalid");
-  return BigInt(result);
 }
 
 function approvalDependency(symbol: string): string {
@@ -1182,155 +1031,6 @@ async function sendSolanaSwap(
     await updateChainTx(signature, "UNCERTAIN");
     throw error;
   }
-}
-
-function validateSolanaSwapQuote(
-  bundle: SwapBundle, owner: string,
-  expected: { fromToken: string; toToken: string; amount: bigint; maxSlippagePercent: number },
-): { fromMint: PublicKey; toMint: PublicKey; minOutput: bigint } {
-  const router = bundle.routerResult;
-  const tx = bundle.tx;
-  const input = new Decimal(router?.fromTokenAmount ?? "NaN");
-  const output = new Decimal(router?.toTokenAmount ?? "NaN");
-  const slippage = new Decimal(tx?.slippagePercent ?? "NaN");
-  if (!router || router.chainIndex !== SOLANA_CHAIN || !router.dexRouterList?.length
-    || router.fromToken?.tokenContractAddress !== expected.fromToken || router.toToken?.tokenContractAddress !== expected.toToken
-    || !input.isInteger() || !input.eq(expected.amount.toString()) || !output.isInteger() || !output.gt(0)) {
-    fail("Solana router quote does not match the expected chain, tokens, or input amount");
-  }
-  if (!tx || tx.from !== owner || tx.to !== SOLANA_OKX_ROUTER
-    || (tx.swapReceiverAddress !== undefined && tx.swapReceiverAddress !== owner)
-    || !/^\d+$/.test(tx.minReceiveAmount ?? "") || !slippage.isFinite() || slippage.lt(0)
-    || !Number.isFinite(expected.maxSlippagePercent) || expected.maxSlippagePercent < 0
-    || expected.maxSlippagePercent >= 100 || slippage.gt(expected.maxSlippagePercent)) {
-    fail("Solana swap transaction is not bound to the configured wallet, router, or slippage limit");
-  }
-  const minOutput = BigInt(tx!.minReceiveAmount!);
-  const safeMinimum = output.mul(new Decimal(100).minus(slippage)).div(100).floor();
-  if (minOutput <= 0n || new Decimal(minOutput.toString()).lt(safeMinimum) || new Decimal(minOutput.toString()).gt(output)) {
-    fail("Solana minimum output does not enforce the configured slippage limit");
-  }
-  return { fromMint: new PublicKey(expected.fromToken), toMint: new PublicKey(expected.toToken), minOutput };
-}
-
-type SolanaSwapTokenSnapshot = {
-  address: PublicKey; mint: PublicKey; tokenProgram: string; side: "input" | "output"; amount: bigint;
-};
-
-async function readSolanaSwapTokenSnapshots(
-  connection: Connection, owner: PublicKey, fromMint: PublicKey, toMint: PublicKey,
-  fromDecimals: number, toDecimals: number,
-): Promise<SolanaSwapTokenSnapshot[]> {
-  const readMint = async (mint: PublicKey, decimals: number, side: "input" | "output"): Promise<SolanaSwapTokenSnapshot[]> => {
-    const [mintInfo, parsed] = await Promise.all([
-      connection.getAccountInfo(mint, "confirmed"),
-      connection.getParsedTokenAccountsByOwner(owner, { mint }, "confirmed"),
-    ]);
-    const tokenProgram = mintInfo?.owner.toBase58();
-    if (!tokenProgram || !SOLANA_TOKEN_PROGRAMS.includes(tokenProgram)) throw new Error("Solana swap mint is not owned by a supported token program");
-    const existing = new Map<string, bigint>();
-    for (const account of parsed.value) {
-      const info = (account.account.data as { parsed?: { info?: { mint?: string; owner?: string; tokenAmount?: { amount?: string; decimals?: number } } } }).parsed?.info;
-      const tokenAmount = info?.tokenAmount;
-      if (info?.mint !== mint.toBase58() || info.owner !== owner.toBase58() || !tokenAmount
-        || tokenAmount.decimals !== decimals || !/^\d+$/.test(tokenAmount.amount ?? "")) {
-        throw new Error("Solana swap token account metadata does not match the expected owner or decimals");
-      }
-      existing.set(account.pubkey.toBase58(), BigInt(tokenAmount.amount!));
-    }
-    const associated = PublicKey.findProgramAddressSync([
-      owner.toBuffer(), new PublicKey(tokenProgram).toBuffer(), mint.toBuffer(),
-    ], new PublicKey(SOLANA_ASSOCIATED_TOKEN))[0];
-    const addresses = [...new Set([...existing.keys(), associated.toBase58()])].map((address) => new PublicKey(address));
-    const accountInfos = await connection.getMultipleAccountsInfo(addresses, "confirmed");
-    return addresses.map((address, index) => {
-      const accountInfo = accountInfos[index];
-      const wasExisting = existing.has(address.toBase58());
-      if (!accountInfo && wasExisting) throw new Error("Solana swap token account disappeared before simulation");
-      const amount = accountInfo ? readSolanaTokenAccountAmount(accountInfo.data, accountInfo.owner.toBase58(), mint, owner, tokenProgram) : 0n;
-      return { address, mint, tokenProgram, side, amount };
-    });
-  };
-  return [
-    ...(await readMint(fromMint, fromDecimals, "input")),
-    ...(await readMint(toMint, toDecimals, "output")),
-  ];
-}
-
-function readSolanaTokenAccountAmount(data: Buffer, program: string, mint: PublicKey, owner: PublicKey, tokenProgram: string): bigint {
-  if (program !== tokenProgram || data.length < 165 || !data.subarray(0, 32).equals(mint.toBuffer())
-    || !data.subarray(32, 64).equals(owner.toBuffer())) throw new Error("Solana swap token account does not match the expected mint, program, or owner");
-  return data.readBigUInt64LE(64);
-}
-
-function validateSolanaSwapSimulation(
-  accounts: (SimulatedTransactionAccountInfo | null)[] | null | undefined, snapshots: SolanaSwapTokenSnapshot[],
-  owner: PublicKey, expectedInput: bigint, minOutput: bigint,
-): void {
-  if (!accounts || accounts.length !== snapshots.length) fail("Solana RPC did not return the post-simulation token accounts");
-  let inputBefore = 0n;
-  let inputAfter = 0n;
-  let outputBefore = 0n;
-  let outputAfter = 0n;
-  snapshots.forEach((snapshot, index) => {
-    const account = accounts![index];
-    let amount = 0n;
-    if (account) {
-      if (!Array.isArray(account.data) || account.data[1] !== "base64") throw new Error("Solana RPC returned an unsupported simulated token account encoding");
-      amount = readSolanaTokenAccountAmount(Buffer.from(account.data[0]!, "base64"), account.owner, snapshot.mint, owner, snapshot.tokenProgram);
-    }
-    if (snapshot.side === "input") {
-      inputBefore += snapshot.amount;
-      inputAfter += amount;
-    } else {
-      outputBefore += snapshot.amount;
-      outputAfter += amount;
-    }
-  });
-  if (inputBefore - inputAfter !== expectedInput) fail("Solana simulation input debit differs from the exact-in quote");
-  if (outputAfter - outputBefore < minOutput) fail("Solana simulation output is below the quoted minimum receive amount");
-}
-
-function validateSolanaInstruction(programId: string, accounts: NonNullable<SolInstruction["accounts"]>, data: Buffer, owner: string, asset: AssetConfig, rentLimit: bigint): void {
-  if (programId === SOLANA_OKX_ROUTER) return;
-  if (programId === SOLANA_COMPUTE_BUDGET) {
-    const tag = data[0];
-    if (accounts.length !== 0) throw new Error("Solana Compute Budget instruction must not reference accounts");
-    if (tag === 2 && data.length === 5 && data.readUInt32LE(1) > 0 && data.readUInt32LE(1) <= 1_400_000) return;
-    if (tag === 3 && data.length === 9) return;
-    if (tag === 1 && data.length === 5 && data.readUInt32LE(1) >= 32_768 && data.readUInt32LE(1) <= 262_144) return;
-    if (tag === 4 && data.length === 5 && data.readUInt32LE(1) > 0 && data.readUInt32LE(1) <= 67_108_864) return;
-    throw new Error("Solana transaction contains an invalid or unsupported Compute Budget instruction");
-  }
-  const allowedMints = new Set([asset.tokenAddress, asset.quoteTokenAddress, SOLANA_WRAPPED_SOL]);
-  const associatedAddresses = new Set<string>();
-  for (const mint of allowedMints) {
-    for (const tokenProgram of SOLANA_TOKEN_PROGRAMS) {
-      associatedAddresses.add(PublicKey.findProgramAddressSync([
-        new PublicKey(owner).toBuffer(), new PublicKey(tokenProgram).toBuffer(), new PublicKey(mint).toBuffer(),
-      ], new PublicKey(SOLANA_ASSOCIATED_TOKEN))[0].toBase58());
-    }
-  }
-  if (programId === SOLANA_ASSOCIATED_TOKEN) {
-    const payer = accounts[0]?.pubkey;
-    const associated = accounts[1]?.pubkey;
-    const authority = accounts[2]?.pubkey;
-    const mint = accounts[3]?.pubkey;
-    const tokenProgram = accounts[5]?.pubkey;
-    if ((data.length > 1 || (data.length === 1 && data[0] !== 1)) || payer !== owner || authority !== owner
-      || !mint || !allowedMints.has(mint) || !tokenProgram || !SOLANA_TOKEN_PROGRAMS.includes(tokenProgram)
-      || !associated || !associatedAddresses.has(associated)) throw new Error("Solana transaction contains an unexpected associated-token instruction");
-    return;
-  }
-  if (programId === "11111111111111111111111111111111") {
-    const tag = data.length >= 4 ? data.readUInt32LE(0) : -1;
-    const source = accounts[0]?.pubkey;
-    const destination = accounts[1]?.pubkey;
-    if (tag !== 2 || data.length !== 12 || source !== owner || !destination || !associatedAddresses.has(destination)
-      || BigInt(data.readBigUInt64LE(4)) > rentLimit) throw new Error("Solana transaction contains an unexpected System Program instruction");
-    return;
-  }
-  throw new Error(`Solana transaction program is not allowlisted: ${programId}`);
 }
 
 async function placeIocOrder(credentials: Credentials, cycleId: number, clOrdId: string, instId: string, side: "buy" | "sell", size: Decimal, price: Decimal): Promise<CexOrder> {

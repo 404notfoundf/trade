@@ -12,7 +12,7 @@ import {
   parsePageNumber,
   parseUtc8Input,
   type WindowSample,
-} from "./direct-pool-windows.js";
+} from "./windows.js";
 
 const base = Date.UTC(2026, 9, 15, 0, 0, 0);
 const at = (offsetMs: number) => new Date(base + offsetMs);
@@ -62,6 +62,24 @@ test("window counts use start time in the selected half-open range", () => {
   assert.equal(isWindowCoverageComplete(at(10), at(10)), true);
   assert.equal(isWindowCoverageComplete(at(9), at(10)), false);
   assert.equal(isWindowCoverageComplete(at(10), null), false);
+});
+
+test("partial coverage hides a boundary window until two non-positive samples establish a clean start", () => {
+  const windows = collectPositiveWindows([
+    sample(1, 0, "1"), sample(2, 1, "1"), sample(3, 2, "0"), sample(4, 3, "-1"),
+    sample(5, 4, "2"), sample(6, 5, "3"),
+  ], at(6), false);
+  assert.equal(windows.length, 1);
+  assert.equal(windows[0]?.startAt.getTime(), at(4).getTime());
+});
+
+test("partial coverage can establish a clean start after an observation gap", () => {
+  const windows = collectPositiveWindows([
+    sample(1, 0, "1"), sample(2, 1, "1"),
+    sample(3, DIRECT_POOL_WINDOW_GAP_MS + 2, "1"), sample(4, DIRECT_POOL_WINDOW_GAP_MS + 3, "2"),
+  ], at(DIRECT_POOL_WINDOW_GAP_MS + 4), false);
+  assert.equal(windows.length, 1);
+  assert.equal(windows[0]?.startAt.getTime(), at(DIRECT_POOL_WINDOW_GAP_MS + 2).getTime());
 });
 
 test("pool, direction, instrument, chain, and normalized size do not merge unrelated streams", () => {

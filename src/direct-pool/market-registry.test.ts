@@ -6,10 +6,17 @@ import { loadMarketRegistry, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, pars
 import { createPoolAdapter } from "./pool-adapter-factory.js";
 
 const envKeys = ["XLAYER_RPC_HTTP", "XLAYER_RPC_WS"] as const;
+const solanaPoolEnvKeys = ["SOLANA_XSPCX_ORCA_RPC_HTTP", "SOLANA_XSPCX_ORCA_RPC_WS", "SOLANA_XSPCX_METEORA_RPC_HTTP", "SOLANA_XSPCX_METEORA_RPC_WS"] as const;
 const withRpcEnv = (run: () => void) => {
   const old = new Map(envKeys.map((key) => [key, process.env[key]]));
   process.env.XLAYER_RPC_HTTP = "https://rpc.example";
   process.env.XLAYER_RPC_WS = "wss://rpc.example";
+  try { run(); }
+  finally { for (const [key, value] of old) value === undefined ? delete process.env[key] : process.env[key] = value; }
+};
+const withSolanaPoolRpcEnv = (run: () => void) => {
+  const old = new Map(solanaPoolEnvKeys.map((key) => [key, process.env[key]]));
+  for (const key of solanaPoolEnvKeys) process.env[key] = key.endsWith("_WS") ? "wss://rpc.example" : "https://rpc.example";
   try { run(); }
   finally { for (const [key, value] of old) value === undefined ? delete process.env[key] : process.env[key] = value; }
 };
@@ -54,9 +61,7 @@ test("registry rejects Orca identity or fee/tick metadata drift", async () => {
 
 test("registry creates the fixed Orca adapter without changing observe-only eligibility", async () => {
   const raw = await readRawRegistry();
-  const old = process.env.SOLANA_RPC_URL;
-  process.env.SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com";
-  try {
+  withSolanaPoolRpcEnv(() => {
     const registry = parseMarketRegistry(raw);
     const pool = registry.pools.find((candidate) => candidate.id === ORCA_XSPCX_USDC_POOL.id)!;
     const adapter = createPoolAdapter(pool, registry);
@@ -64,14 +69,12 @@ test("registry creates the fixed Orca adapter without changing observe-only elig
     assert.equal(adapter.stateSource, "adapter_watch");
     assert.equal(typeof adapter.watch, "function");
     assert.equal(solveDirectPoolCandidates(registry, [{ enabled: true, instId: "XSPCX-USDT", okxCurrency: "XSPCX", chainIndex: "501", tokenAddress: ORCA_XSPCX_USDC_POOL.assetMint, quoteTokenAddress: ORCA_XSPCX_USDC_POOL.quoteMint }]).length, 0);
-  } finally { old === undefined ? delete process.env.SOLANA_RPC_URL : process.env.SOLANA_RPC_URL = old; }
+  });
 });
 
 test("registry pins the one Meteora DLMM pool and creates only an observe-only adapter", async () => {
   const raw = await readRawRegistry();
-  const old = process.env.SOLANA_RPC_URL;
-  process.env.SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com";
-  try {
+  withSolanaPoolRpcEnv(() => {
     const registry = parseMarketRegistry(raw);
     const pool = registry.pools.find((candidate) => candidate.id === METEORA_XSPCX_USDC_POOL.id)!;
     const adapter = createPoolAdapter(pool, registry);
@@ -80,7 +83,7 @@ test("registry pins the one Meteora DLMM pool and creates only an observe-only a
     assert.equal(typeof adapter.watch, "function");
     assert.deepEqual(solveDirectPoolCandidates(registry, [{ enabled: true, instId: "XSPCX-USDT", okxCurrency: "XSPCX", chainIndex: "501",
       tokenAddress: METEORA_XSPCX_USDC_POOL.assetMint, quoteTokenAddress: METEORA_XSPCX_USDC_POOL.quoteMint }]), []);
-  } finally { old === undefined ? delete process.env.SOLANA_RPC_URL : process.env.SOLANA_RPC_URL = old; }
+  });
 });
 
 test("registry rejects Meteora program, pool, mint, mode or bin-step drift", async () => {

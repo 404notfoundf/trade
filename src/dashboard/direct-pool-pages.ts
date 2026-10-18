@@ -1,8 +1,8 @@
 import Decimal from "decimal.js";
-import type { AssetConfig, Config } from "./config.js";
-import { query } from "./db.js";
-import type { PoolMonitorState } from "./fixed-pools.js";
-import { solveDirectPoolCandidates } from "./trading/market-registry.js";
+import type { AssetConfig, Config } from "../config.js";
+import { query } from "../db.js";
+import type { PoolMonitorState } from "../market/fixed-pools.js";
+import { solveDirectPoolCandidates } from "../direct-pool/market-registry.js";
 import {
   collectPositiveWindows,
   directPoolWindowReadStart,
@@ -16,7 +16,7 @@ import {
   rangeSearchParams,
   type DirectPoolRange,
   type WindowSample,
-} from "./trading/direct-pool-windows.js";
+} from "../direct-pool/windows.js";
 
 type Helpers = {
   escapeHtml: (value: unknown) => string;
@@ -401,10 +401,10 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
     const coverageStart = migrationRows[0] ? actualTime(migrationRows[0].applied_at, offsetSeconds) : null;
     const coverageComplete = isWindowCoverageComplete(range.from, coverageStart);
     let positiveWindows: ReturnType<typeof collectPositiveWindows> = [];
-    if (coverageComplete && coverageStart) {
+    if (coverageStart) {
       const windowRows = await query<WindowSample[]>(`SELECT id,created_at createdAt,instrument_id instrumentId,chain_index chainIndex,pool_id poolId,direction,CAST(size_usdt AS CHAR) sizeUsdt,CAST(net_profit_usdt AS CHAR) netProfitUsdt,valuation_status valuationStatus,selected_quote_id selectedQuoteId FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND pool_id IS NOT NULL AND ${validEstimateSql}${poolPredicate} ORDER BY created_at ASC,id ASC`, [storedTime(directPoolWindowReadStart(range.from, coverageStart), offsetSeconds), toStored, ...poolParameters]);
       const samples = windowRows.map((row) => ({ ...row, createdAt: actualTime(row.createdAt, offsetSeconds) }));
-      positiveWindows = collectPositiveWindows(samples, range.to).filter((item) => item.startAt >= range.from && item.startAt < range.to);
+      positiveWindows = collectPositiveWindows(samples, range.to, coverageComplete).filter((item) => item.startAt >= range.from && item.startAt < range.to);
     }
     const audit = directionAudit.map((row) => {
       const samePool = row.cexPoolId !== null && row.cexPoolId === row.dexPoolId;
@@ -418,7 +418,9 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
     const percentage = Number(stats.valid) ? `${(Number(stats.positive) / Number(stats.valid) * 100).toFixed(1)}%` : "—";
     const coverageCard = coverageComplete
       ? `<strong>${positiveWindows.length}</strong>`
-      : `<span class="coverage-status">数据不完整</span>${coverageStart ? `<span class="coverage-start">完整窗口统计始于<br>${escapeHtml(formatUtc8Minute(coverageStart))} UTC+8</span>` : ""}`;
+      : coverageStart
+        ? `<span class="coverage-status">部分覆盖</span><strong>${positiveWindows.length}</strong><span class="coverage-start">仅统计 ${escapeHtml(formatUtc8Minute(coverageStart))} UTC+8 之后可确认的窗口</span>`
+        : `<span class="coverage-status">覆盖起点未知</span>`;
     const orderedWindows = positiveWindows.slice().sort((a, b) => b.startAt.getTime() - a.startAt.getTime() || b.firstSampleId - a.firstSampleId);
     const renderWindowRows = (windows: typeof orderedWindows) => windows.map((window) => {
       const latestProfit = new Decimal(window.latestNetProfitUsdt);
@@ -435,23 +437,29 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
     }).join("");
     const windowTableHead = `<thead><tr><th>正收益观测区间 <small>(UTC+8)</small></th><th>资产 / 链 / 池</th><th>方向</th><th>规模</th><th>末次正收益 / 窗口峰值</th><th>正收益跨度 / 样本数</th><th>状态</th><th>详情</th></tr></thead>`;
     if (path === "/direct-pools/windows") {
-      if (!coverageComplete) return `${header}<p class="guard-alert">窗口历史覆盖不完整，暂不展示可能被截断的窗口；可在收益明细中查看逐条正收益样本。</p>${pageStyle()}`;
+      if (!coverageStart) return `${header}<p class="guard-alert">窗口历史覆盖起点未知，暂不展示窗口；请检查数据库迁移记录。</p>${pageStyle()}`;
       const page = parsePageNumber(url.searchParams.get("page"));
       const offset = (page - 1) * pageSize;
       const visibleWindows = orderedWindows.slice(offset, offset + pageSize);
       const recordRows = renderWindowRows(visibleWindows);
       const pageParams = poolId ? { pool: poolId } : undefined;
       const empty = orderedWindows.length === 0
-        ? "当前筛选范围没有满足连续性条件的正收益窗口；孤立正收益样本可在收益明细中查看。"
+        ? coverageComplete ? "当前筛选范围没有满足连续性条件的正收益窗口；孤立正收益样本可在收益明细中查看。" : "覆盖起点之后暂无可确认的正收益窗口；边界状态确认前的窗口不会计入摘要。"
         : `第 ${page} 页没有窗口。<a href="${directPoolHref(path, range, pageParams)}">返回第 1 页</a>`;
-      return `${header}<p class="direct-record-note">窗口是重复报价的观察估算，不代表成交、累计利润或可执行性。末次收益、峰值和样本数只统计正收益观测；非正收益样本仅用于连续性判断。</p><section class="overview"><div class="section-heading"><h3>正收益窗口</h3><span>共 ${orderedWindows.length} 个 · 每页 ${pageSize} 个</span></div><div class="table-wrap"><table class="direct-record-table">${windowTableHead}<tbody>${recordRows || `<tr><td colspan="8">${empty}</td></tr>`}</tbody></table></div>${pagination(path, fixedRange(range), page, orderedWindows.length, "全部正收益窗口分页", pageParams)}</section>${pageStyle()}`;
+      const coverageNote = coverageComplete ? "" : `<p class="guard-alert">所选范围早于完整覆盖起点；这里只展示 ${escapeHtml(formatUtc8Minute(coverageStart))} UTC+8 之后、经过连续性确认的窗口。</p>`;
+      return `${header}${coverageNote}<p class="direct-record-note">窗口是重复报价的观察估算，不代表成交、累计利润或可执行性。末次收益、峰值和样本数只统计正收益观测；非正收益样本仅用于连续性判断。</p><section class="overview"><div class="section-heading"><h3>正收益窗口</h3><span>共 ${orderedWindows.length} 个 · 每页 ${pageSize} 个</span></div><div class="table-wrap"><table class="direct-record-table">${windowTableHead}<tbody>${recordRows || `<tr><td colspan="8">${empty}</td></tr>`}</tbody></table></div>${pagination(path, fixedRange(range), page, orderedWindows.length, "全部正收益窗口分页", pageParams)}</section>${pageStyle()}`;
     }
     const windowRows = renderWindowRows(orderedWindows.slice(0, pageSize));
-    const windowTable = !coverageComplete
-      ? "窗口历史覆盖不完整，暂不展示窗口摘要；可在收益明细中查看逐条正收益样本。"
-      : windowRows || "当前范围没有满足连续性条件的正收益窗口；孤立正收益样本可在收益明细中查看。";
-    const allWindowsLink = coverageComplete && orderedWindows.length ? `<a href="${directPoolHref("/direct-pools/windows", fixedRange(range), poolId ? { pool: poolId } : undefined)}">查看全部 ${orderedWindows.length} 个窗口 →</a>` : "";
-    return `${header}<p>范围内的数字是重复报价的观察估算，不代表实际成交或累计利润；所有结果均为 <strong>NOT_EXECUTABLE</strong>。已登记交易候选：${candidates.length}。</p><section class="overview"><div class="direct-cards"><article><small>正收益估算样本</small><strong class="profit-positive">${Number(stats.positive)}</strong></article><article class="window-card"><small>正收益窗口</small>${coverageCard}</article><article><small>正收益率</small><strong>${percentage}</strong></article><article><small>单笔最高净收益估算</small><strong>${escapeHtml(stats.max_net === null ? "—" : `${formatReportDecimal(stats.max_net, 6)} USDT`)}</strong></article></div></section>${directionAuditSection}<section class="overview"><div class="section-heading"><h3>正收益窗口 <small>最近 20 个</small></h3>${allWindowsLink}</div><p class="direct-record-note">末次净收益、峰值和样本数只统计正收益观测；连续非正样本仅用于确认窗口结束，不计入这些指标。结束确认时间与末次正收益时间分开显示。所有结果均为观察估算，不代表可成交或实际收益。</p><div class="table-wrap"><table class="direct-record-table">${windowTableHead}<tbody>${windowRows ? windowRows : `<tr><td colspan="8">${escapeHtml(windowTable)}</td></tr>`}</tbody></table></div></section><details class="overview direct-pool-status"><summary><strong>已登记池与监控状态</strong><small>${config.marketRegistry.pools.length} 个登记池 · 点击展开</small></summary><div class="direct-pool-summary">${registered || "没有登记池。"}</div>${fixedPoolPanel(fixedPools)}</details>${pageStyle()}<style>.direct-audit-note{margin:8px 0 12px;color:#65738a;font-size:12px;line-height:1.6}.direct-record-table td small{display:block;color:#758198;font-size:11px;margin-top:3px}</style>`;
+    const windowTable = windowRows || (coverageComplete
+      ? "当前范围没有满足连续性条件的正收益窗口；孤立正收益样本可在收益明细中查看。"
+      : coverageStart
+        ? `覆盖起点 ${formatUtc8Minute(coverageStart)} 之后暂无可确认的窗口。`
+        : "窗口覆盖起点未知；可在收益明细中查看逐条正收益样本。");
+    const allWindowsLink = coverageStart && orderedWindows.length ? `<a href="${directPoolHref("/direct-pools/windows", fixedRange(range), poolId ? { pool: poolId } : undefined)}">查看全部 ${orderedWindows.length} 个窗口 →</a>` : "";
+    const coverageNote = coverageComplete ? "" : coverageStart
+      ? `<p class="direct-record-note">窗口摘要仅统计 ${escapeHtml(formatUtc8Minute(coverageStart))} UTC+8 之后可确认的区间；覆盖边界状态尚未确认的窗口会暂时略过。</p>`
+      : `<p class="guard-alert">窗口覆盖起点未知，暂不展示窗口摘要；可在收益明细中查看逐条正收益样本。</p>`;
+    return `${header}<p>范围内的数字是重复报价的观察估算，不代表实际成交或累计利润；所有结果均为 <strong>NOT_EXECUTABLE</strong>。已登记交易候选：${candidates.length}。</p><section class="overview"><div class="direct-cards"><article><small>正收益估算样本</small><strong class="profit-positive">${Number(stats.positive)}</strong></article><article class="window-card"><small>正收益窗口</small>${coverageCard}</article><article><small>正收益率</small><strong>${percentage}</strong></article><article><small>单笔最高净收益估算</small><strong>${escapeHtml(stats.max_net === null ? "—" : `${formatReportDecimal(stats.max_net, 6)} USDT`)}</strong></article></div></section>${directionAuditSection}<section class="overview"><div class="section-heading"><h3>正收益窗口 <small>最近 20 个</small></h3>${allWindowsLink}</div>${coverageNote}<p class="direct-record-note">末次净收益、峰值和样本数只统计正收益观测；连续非正样本仅用于确认窗口结束，不计入这些指标。结束确认时间与末次正收益时间分开显示。所有结果均为观察估算，不代表可成交或实际收益。</p><div class="table-wrap"><table class="direct-record-table">${windowTableHead}<tbody>${windowRows ? windowRows : `<tr><td colspan="8">${escapeHtml(windowTable)}</td></tr>`}</tbody></table></div></section><details class="overview direct-pool-status"><summary><strong>已登记池与监控状态</strong><small>${config.marketRegistry.pools.length} 个登记池 · 点击展开</small></summary><div class="direct-pool-summary">${registered || "没有登记池。"}</div>${fixedPoolPanel(fixedPools)}</details>${pageStyle()}<style>.direct-audit-note{margin:8px 0 12px;color:#65738a;font-size:12px;line-height:1.6}.direct-record-table td small{display:block;color:#758198;font-size:11px;margin-top:3px}</style>`;
   } catch {
     return `${header}<p class="guard-alert">指定池数据表尚不可用；请先执行 npm run db:migrate。</p>${pageStyle()}`;
   }

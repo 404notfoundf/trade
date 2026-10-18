@@ -1,9 +1,9 @@
 import Decimal from "decimal.js";
 import type { AssetConfig, Config } from "./config.js";
-import { bookMidpoint, bookObservationStale, bookStale, floorToStep, MAX_BOOK_AGE_MS, MAX_BOOK_STREAM_SILENCE_MS, vwap, type Instrument } from "./market.js";
-import { dexQuote, reserveDexRequestSlot, type Book, type Credentials, type DexQuoteTiming } from "./okx.js";
-import { decideValuation, XLAYER_CHAIN } from "./valuation.js";
-import { calculateProfit } from "./profit-calculation.js";
+import { bookMidpoint, bookObservationStale, bookStale, floorToStep, MAX_BOOK_AGE_MS, MAX_BOOK_STREAM_SILENCE_MS, vwap, type Instrument } from "./market/market.js";
+import { dexQuote, reserveDexRequestSlot, type Book, type Credentials, type DexQuoteTiming } from "./market/okx.js";
+import { decideValuation, XLAYER_CHAIN } from "./market/valuation.js";
+import { calculateProfit } from "./market/profit-calculation.js";
 import { closeOpportunityWindow, saveQuoteObservations, type QuoteObservation } from "./observations.js";
 import { recordBlockedObservation, type BlockedObservation } from "./risk.js";
 

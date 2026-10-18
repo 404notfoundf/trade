@@ -135,9 +135,9 @@ ArbBridge 最值得借鉴的不是语言、Redis 或其多进程目录结构，�
 ### 当前项目
 
 - 启动、健康、池状态持久化与优雅停机：`src/main.ts`。
-- Direct Pool 扫描、估值门槛、候选与观察记录：`src/trading/direct-pool-collector.ts`、`src/trading/direct-pool-storage.ts`。
+- Direct Pool 扫描、估值门槛、候选与观察记录：`src/direct-pool/collector.ts`、`src/direct-pool/storage.ts`。
 - 交易周期、锁、重报价、链上确认与人工对账暂停：`src/trading/executor.ts`、`src/trading/page.ts`、`src/trading/prepare.ts`。
-- 收益核算和估值状态：`src/profit-calculation.ts`、`src/valuation.ts`。
+- 收益核算和估值状态：`src/market/profit-calculation.ts`、`src/market/valuation.ts`。
 - 当前测试/脚本边界：`package.json`、`src/**/*.test.ts`、`src/valuation.check.ts`。
 
 ### ArbBridge

@@ -4,16 +4,13 @@ TypeScript 本机服务：读取配置中 OKX 现货交易对的盘口、X Layer
 
 ## 代码结构
 
-- `src/main.ts`：加载配置、启动依赖探测、WebSocket、HTTP 服务和定时任务。
-- `src/collector.ts`：计算双向观察规模、请求 DEX 报价并生成观察记录。
-- `src/fixed-pools.ts`：按 allowlist 监听 X Layer Uniswap V3 和 Solana Raydium CLMM 固定池，计算边际价并维护链状态版本。
-- `src/trading/market-registry.ts`、`direct-pool-collector.ts`、`pool-adapters.ts`：求解已审核的直接池路线、执行定额 exact-in 报价，并将独立决策写入 direct-pool 表。
-- `src/valuation.ts`：OKX Index Price 缓存、USDT/USDT0 偏离判断和折算决策。
-- `src/market.ts`、`src/okx.ts`：订单簿计算与 OKX/DEX API、WebSocket 适配。
-- `src/observations.ts`、`src/risk.ts`、`src/db.ts`：原始观察/机会事务写入、拦截记录、MySQL 初始化与查询。
-- `src/reports.ts`、`src/dashboard.ts`、`src/dashboard-server.ts`：UTC 汇总报告、机会/拦截页面和独立只读看板。
-- `src/dashboard-state.ts`：在 MySQL 保存最近一次采集状态，供独立看板读取。
-- `src/trading/`：库存预检、收益门槛、链上签名广播、CEX IOC 对冲和交易周期持久化。
+- `src/main.ts`、`src/collector.ts`：启动运行时并采集 Aggregator 观察数据。
+- `src/market/`：盘口、OKX 接口、估值、收益计算、机会分组和固定池状态监控。
+- `src/direct-pool/`：市场注册表、指定池报价、池状态与协议 adapters；只读观察与模拟归在这里。
+- `src/trading/`：真实执行、预检、收益门槛、CEX IOC 对冲和交易周期恢复。
+- `src/dashboard/`：页面、汇总报告、看板状态与独立看板入口。
+- `src/config.ts`、`src/db.ts`、`src/observations.ts`、`src/risk.ts`：配置、MySQL、机会记录与拦截记录。
+- `src/migrate.ts`、`src/logger.ts`：数据库迁移入口与日志。
 - `config.yaml`：服务端口、运行时间参数、MySQL 连接和标的白名单；`.env`：OKX API 凭证。
 
 ## 补充说明
@@ -23,6 +20,10 @@ TypeScript 本机服务：读取配置中 OKX 现货交易对的盘口、X Layer
 - [待办事项](docs/TODO.md)
 
 ## 运行
+
+### 质量检查
+
+安装依赖后，运行 `npm test` 执行离线回归，包含 `src/**/*.test.ts` 与 `src/**/*.check.ts`；运行 `npm run check` 同时执行 TypeScript 类型检查和离线回归。测试进程会屏蔽 OKX、RPC、钱包和数据库环境变量，并把 dotenv 文件路径指向不存在的临时路径；不启动采集器或 Dashboard，也不连接 MySQL 或外部 RPC。需要外部服务的人工 smoke test 不属于默认质量门。
 
 1. 安装 Node.js 20+、MySQL 8+，创建本地数据库和仅供本程序使用的 MySQL 用户。
 2. 复制 `config.example.yaml` 为本机 `config.yaml`，填写 MySQL 连接信息；复制 `.env.example` 为 `.env` 并填写 API 凭证。CEX API Key 需要 Read + Trade 权限，关闭 Withdraw 并绑定 IP；分别把专用低余额钱包私钥放入 `XLAYER_PRIVATE_KEY` 或 `SOLANA_PRIVATE_KEY`。启用 Solana 观察模拟时，另用 `SOLANA_SIMULATION_PRIVATE_KEY` 配置模拟专用钱包。Solana 私钥支持 base58 或 JSON 字节数组。私钥不会写入 YAML、数据库、页面或日志。

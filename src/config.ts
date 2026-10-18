@@ -1,9 +1,9 @@
 import "dotenv/config";
 import { readFile } from "node:fs/promises";
 import { parse } from "yaml";
-import { addressesMatch, pinnedQuote } from "./valuation.js";
+import { addressesMatch, pinnedQuote } from "./market/valuation.js";
 import { parseTrading, type TradingConfig } from "./trading/config.js";
-import { loadMarketRegistry, type MarketRegistry } from "./trading/market-registry.js";
+import { loadMarketRegistry, type MarketRegistry } from "./direct-pool/market-registry.js";
 
 export type AssetConfig = {
   enabled: boolean;

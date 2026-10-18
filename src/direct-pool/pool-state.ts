@@ -1,4 +1,4 @@
-import type { PoolMonitorState } from "../fixed-pools.js";
+import type { PoolMonitorState } from "../market/fixed-pools.js";
 import type { AdapterPoolState } from "./pool-adapters.js";
 
 type AdapterWatchState = {

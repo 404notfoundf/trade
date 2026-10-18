@@ -17,9 +17,9 @@ ArbBridge 的方向、收益公式和实现边界详见[定价与收益核算参
 - `config.yaml` 当前选择 `quote_provider: direct_pool`，`aggregator_shadow: false`。`market-registry.yaml` 中启用的池是 XSPCX/USDC Orca `observe_only`；没有 `trade_candidate`。
 - Direct Pool 候选扫描要求 `quoteValuationStatus === "VERIFIED"`，但 `main.ts` 传入的状态目前固定为 `UNKNOWN`。这是保守的关闭状态；在接入真实报价币估值前，不能只把状态改成 `VERIFIED`。
 - `DirectPoolCollector` 同时包含触发调度、两方向报价、候选池排序、收益计算、记录决策和模拟流程。观察路径的输入量根据开始时的 CEX 中间价计算，报价返回后又取最新盘口计算收益；记录的决策快照因此不一定是 sizing 使用的原始快照。
-- 收益算术已统一到 `src/profit-calculation.ts`：Aggregator 和交易执行经 `valuation.ts` 调用，Direct Pool 观察与候选直接调用。ROI 按买入腿本金计算；执行门槛另用包含费用的 `capitalAtRiskUsdt`。Direct Pool 与旧 Aggregator 使用独立表；`direct_pool` 模式会关闭旧交易执行器，两个路径没有自动混用。
+- 收益算术已统一到 `src/market/profit-calculation.ts`：Aggregator 和交易执行经 `src/market/valuation.ts` 调用，Direct Pool 观察与候选直接调用。ROI 按买入腿本金计算；执行门槛另用包含费用的 `capitalAtRiskUsdt`。Direct Pool 与旧 Aggregator 使用独立表；`direct_pool` 模式会关闭旧交易执行器，两个路径没有自动混用。
 - 已有的保护包括：各协议独立 Adapter、池身份和状态指纹校验、quote 与 decision 通过 `scan_id` 关联、观察收益标注估值状态、Direct Pool 固定 `NOT_EXECUTABLE`，以及交易执行前重报价、复核余额和状态。
-- 测试已有 registry、Adapter、pool state、prepare 等覆盖；当前没有 `collector`、`direct-pool-collector`、`valuation` 或 `executor` 的专用测试文件，`package.json` 也未提供统一 test script。
+- 测试已有 registry、Adapter、pool state、prepare 等覆盖；当前仍没有 `collector`、Direct Pool collector、`valuation` 或 `executor` 的专用测试。仓库提供离线 `npm test`，运行现有 `*.test.ts` 与 `*.check.ts`。
 
 ## 优先优化项
 
@@ -35,7 +35,7 @@ ArbBridge 的方向、收益公式和实现边界详见[定价与收益核算参
 
 **依据：** 此项实施前，主要重复计算位于 `direct-pool-collector.ts` 的观察路径和候选路径；ROI 投入额也有不同口径。当前没有发现方向符号反转。
 
-**实现：** 已在 `src/profit-calculation.ts` 抽出无 I/O 的纯函数，对已归一到同一计价单位的金额核算。`valuation.ts` 将 Aggregator、执行前检查和成交后估算委托给它；Direct Pool 观察与候选在报价币归一后直接调用。函数按方向推导买入腿本金，返回成本拆分、毛利、净利、投入额、总风险资金、ROI 和不可计算原因。Adapter 仍只负责协议报价，不计算跨市场收益。
+**实现：** 已在 `src/market/profit-calculation.ts` 抽出无 I/O 的纯函数，对已归一到同一计价单位的金额核算。`src/market/valuation.ts` 将 Aggregator、执行前检查和成交后估算委托给它；Direct Pool 观察与候选在报价币归一后直接调用。函数按方向推导买入腿本金，返回成本拆分、毛利、净利、投入额、总风险资金、ROI 和不可计算原因。Adapter 仍只负责协议报价，不计算跨市场收益。
 
 统一公式：
 
@@ -126,4 +126,4 @@ DEX 买入、CEX 卖出：毛利 = CEX 卖出额 − DEX quote 支出
 
 本次检查了运行入口、两条 Collector、估值与交易执行路径、Direct Pool Adapter/存储、配置、迁移、Dashboard 相关查询和现有文档；没有连接数据库核对线上样本，没有读取密钥，没有调用链 RPC，也没有运行测试或实盘模拟。因此本文可以定位代码路径和当前配置阻塞，不能确认生产环境的收益分布、调用延迟或链上报价误差。
 
-主要代码位置：[main.ts](../src/main.ts)、[collector.ts](../src/collector.ts)、[direct-pool-collector.ts](../src/trading/direct-pool-collector.ts)、[valuation.ts](../src/valuation.ts)、[executor.ts](../src/trading/executor.ts)、[market-registry.yaml](../market-registry.yaml)。
+主要代码位置：[main.ts](../src/main.ts)、[collector.ts](../src/collector.ts)、[direct-pool collector](../src/direct-pool/collector.ts)、[valuation.ts](../src/market/valuation.ts)、[executor.ts](../src/trading/executor.ts)、[market-registry.yaml](../market-registry.yaml)。

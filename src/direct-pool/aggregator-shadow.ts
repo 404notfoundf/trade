@@ -1,8 +1,8 @@
 import Decimal from "decimal.js";
 import type { AssetConfig } from "../config.js";
-import { bookStale } from "../market.js";
-import { dexQuote, reserveDexRequestSlot, type Book, type Credentials, type DexQuoteTiming } from "../okx.js";
-import { saveAggregatorShadowQuote } from "./direct-pool-storage.js";
+import { bookStale } from "../market/market.js";
+import { dexQuote, reserveDexRequestSlot, type Book, type Credentials, type DexQuoteTiming } from "../market/okx.js";
+import { saveAggregatorShadowQuote } from "./storage.js";
 
 export type AggregatorQuote = {
   chainIndex?: string; fromTokenAmount?: string; toTokenAmount?: string;

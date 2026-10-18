@@ -3,8 +3,8 @@ import Decimal from "decimal.js";
 import { PublicKey } from "@solana/web3.js";
 import { Interface } from "ethers";
 import WebSocket from "ws";
-import type { FixedPoolConfig } from "./config.js";
-import { solanaRpcFetch } from "./solana-rpc-logging.js";
+import type { FixedPoolConfig } from "../config.js";
+import { solanaRpcFetch } from "../solana-rpc-logging.js";
 
 const Q96 = new Decimal(2).pow(96);
 const Q64 = new Decimal(2).pow(64);

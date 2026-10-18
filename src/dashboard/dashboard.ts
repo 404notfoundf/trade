@@ -1,14 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import Decimal from "decimal.js";
-import type { AssetConfig, Config } from "./config.js";
-import { query, type Health } from "./db.js";
-import type { ValuationView } from "./valuation.js";
-import { logger } from "./logger.js";
-import type { PoolMonitorState } from "./fixed-pools.js";
-import { solveDirectPoolCandidates } from "./trading/market-registry.js";
+import type { AssetConfig, Config } from "../config.js";
+import { query, type Health } from "../db.js";
+import type { ValuationView } from "../market/valuation.js";
+import { logger } from "../logger.js";
+import type { PoolMonitorState } from "../market/fixed-pools.js";
 import { directPoolDexLabel, directPoolSimulationLabel, renderDirectPoolPage } from "./direct-pool-pages.js";
-import { directPoolQuoteBackUrl } from "./trading/direct-pool-windows.js";
-import { mapOpportunityQuoteBucketRows, type OpportunityQuoteBucketRow } from "./opportunity-clusters.js";
+import { directPoolQuoteBackUrl } from "../direct-pool/windows.js";
+import { mapOpportunityQuoteBucketRows, type OpportunityQuoteBucketRow } from "../market/opportunity-clusters.js";
 
 type OpportunityRow = { id: number; opened_at: Date; observed_at: Date; ended_at: Date | null; close_reason: string | null; executable_status: string; execution_reason: string | null; execution_buffer_usdt: string | null; executable_profit_usdt: string | null; peak_profit_usdt: string | null; inst_id: string; chain_index: string; route_status: string; direction: string; size_usdt: string; shares: string | null; cex_vwap: string | null; dex_usdt_amount: string | null; cex_fee_usdt: string | null; gas_usdt: string | null; gross_profit_usdt: string | null; net_profit_usdt: string | null; rebalance_cost_usdt: string | null; net_profit_after_rebalance_usdt: string | null; roi: string | null; price_impact_percent: string | null; is_stale: number; status: string; native_quote_amount: string | null; native_quote_symbol: string | null; valuation_status: string; usdt_estimate: string | null };
 type OpportunityListRow = Pick<OpportunityRow, "id" | "opened_at" | "ended_at" | "close_reason" | "executable_status" | "execution_reason" | "peak_profit_usdt" | "inst_id" | "chain_index" | "direction" | "size_usdt" | "net_profit_usdt" | "roi" | "is_stale" | "valuation_status"> & { last_updated_at: Date | null; duration_seconds: number | string; sample_count: number | string };
@@ -18,7 +17,6 @@ type BlockedRow = { id: string; observed_at: Date; inst_id: string; chain_index:
 type BlockedSummaryRow = Pick<BlockedRow, "id" | "observed_at" | "inst_id" | "chain_index" | "direction" | "size_usdt" | "reason_code">;
 type DirectQuoteRow = { id: number; scan_id: string; instrument_id: string; chain_index: string; pool_id: string; dex: string; direction: string; amount_in_raw: string | null; amount_out_raw: string | null; minimum_amount_out_raw: string | null; price_impact_percent: string | null; network_fee_usdt: string | null; block_number: string | null; slot: string | null; quoted_at: Date | null; cex_book_at: Date | null; cex_received_at: Date | null; request_ms: number | null; status: string; failure_code: string | null; failure_reason: string | null; raw_response: unknown; cex_vwap: string | null; gross_profit_usdt: string | null; net_profit_usdt: string | null; cex_fee_usdt: string | null; gas_budget_usdt: string | null; roi: string | null; valuation_status: string | null; decision_status: string | null; block_reason: string | null; simulation_status: string | null; simulation_reason: string | null; simulation_at: Date | null; simulation_input_debited_raw: string | null; simulation_output_credited_raw: string | null; simulation_network_fee_native_raw: string | null; simulation_compute_units: number | null };
 type DirectDecisionRow = { id: number; scan_id: string; instrument_id: string; chain_index: string; direction: string; size_usdt: string; selected_quote_id: number | null; cex_vwap: string | null; gross_profit_usdt: string | null; cex_fee_usdt: string | null; gas_budget_usdt: string | null; net_profit_usdt: string | null; roi: string | null; valuation_status: string; decision_status: string; block_reason: string | null; execution_status: string; created_at_utc8: string | null };
-type DirectPositiveRow = Pick<DirectDecisionRow, "instrument_id" | "chain_index" | "direction" | "size_usdt" | "selected_quote_id" | "net_profit_usdt" | "roi" | "block_reason" | "created_at_utc8"> & { pool_id: string | null };
 type DirectOverviewRow = Pick<DirectDecisionRow, "instrument_id" | "chain_index" | "direction" | "size_usdt" | "selected_quote_id" | "cex_vwap" | "gross_profit_usdt" | "cex_fee_usdt" | "gas_budget_usdt" | "net_profit_usdt" | "roi" | "valuation_status" | "decision_status" | "block_reason" | "created_at_utc8"> & { pool_id: string | null; slot: string | null; simulation_status: string; simulation_reason: string | null };
 export type RouteDashboardState = { asset: AssetConfig; status: "ENABLED" | "MONITOR_ONLY" | "BLOCKED" | "DISABLED" | "UNKNOWN"; reason: string | null; multiplier?: Decimal; instrumentReady: boolean; feeReady: boolean; bookReady: boolean };
 export type DashboardState = {
@@ -173,96 +171,6 @@ export function startDashboard(config: Config, assets: AssetConfig[], getState: 
         url, config, assets, dbOnline: state.dbOnline, fixedPools: state.fixedPools,
         helpers: { escapeHtml, formatUtc8, formatReportDecimal, formatRawTokenAmount, directQuoteAssetUiMultiplier, fixedPoolPanel },
       });
-    } else if (false) { // Old mixed Direct Pool page retained temporarily only to avoid a broad unrelated rewrite.
-      const candidates = solveDirectPoolCandidates(config.marketRegistry, assets);
-      const pageSize = 20;
-      const requestedPage = (key: string) => {
-        const value = Number(url.searchParams.get(key) ?? "1");
-        return Number.isSafeInteger(value) && value > 0 ? value : 1;
-      };
-      const quotePage = requestedPage("quote_page");
-      const decisionPage = requestedPage("decision_page");
-      const decisionExpanded = url.searchParams.get("decision_open") === "1";
-      let quotes: DirectQuoteRow[] = [];
-      let decisions: DirectDecisionRow[] = [];
-      let positiveDecisions: DirectPositiveRow[] = [];
-      let quoteHasNext = false;
-      let decisionHasNext = false;
-      let storageError = "";
-      if (state.dbOnline) {
-        try {
-          const [quotePageRows, decisionPageRows, positiveRows] = await Promise.all([
-            query<DirectQuoteRow[]>("SELECT q.id,q.scan_id,q.instrument_id,q.chain_index,q.pool_id,q.dex,q.direction,q.amount_in_raw,q.amount_out_raw,q.minimum_amount_out_raw,CAST(q.price_impact_percent AS CHAR) price_impact_percent,CAST(q.network_fee_usdt AS CHAR) network_fee_usdt,CAST(q.block_number AS CHAR) block_number,CAST(q.slot AS CHAR) slot,q.quoted_at,q.request_ms,q.status,q.failure_code,q.failure_reason,q.raw_response,CAST(d.gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(d.net_profit_usdt AS CHAR) net_profit_usdt,CAST(d.cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(d.gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(d.roi AS CHAR) roi,d.valuation_status,d.decision_status,d.block_reason FROM direct_pool_quote q LEFT JOIN direct_pool_decision d ON d.selected_quote_id=q.id ORDER BY q.id DESC LIMIT ? OFFSET ?", [pageSize + 1, (quotePage - 1) * pageSize]),
-            query<DirectDecisionRow[]>("SELECT id,scan_id,instrument_id,chain_index,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,DATE_FORMAT(CONVERT_TZ(created_at,@@session.time_zone,'+08:00'),'%Y-%m-%d %H:%i:%s') created_at_utc8 FROM direct_pool_decision ORDER BY id DESC LIMIT ? OFFSET ?", [pageSize + 1, (decisionPage - 1) * pageSize]),
-            query<DirectPositiveRow[]>("SELECT d.instrument_id,d.chain_index,d.direction,CAST(d.size_usdt AS CHAR) size_usdt,d.selected_quote_id,CAST(d.net_profit_usdt AS CHAR) net_profit_usdt,CAST(d.roi AS CHAR) roi,d.block_reason,q.pool_id,DATE_FORMAT(CONVERT_TZ(d.created_at,@@session.time_zone,'+08:00'),'%Y-%m-%d %H:%i:%s') created_at_utc8 FROM direct_pool_decision d LEFT JOIN direct_pool_quote q ON q.id=d.selected_quote_id WHERE d.net_profit_usdt>0 AND d.valuation_status NOT LIKE 'INVALIDATED_%' ORDER BY d.id DESC LIMIT 20"),
-          ]);
-          quoteHasNext = quotePageRows.length > pageSize;
-          decisionHasNext = decisionPageRows.length > pageSize;
-          quotes = quotePageRows.slice(0, pageSize);
-          decisions = decisionPageRows.slice(0, pageSize);
-          positiveDecisions = positiveRows;
-        } catch { storageError = "指定池数据表尚不可用；请先执行 npm run db:migrate。"; }
-      }
-      const poolRows = config.marketRegistry.pools.map((pool) => {
-        const monitor = state.fixedPools?.find((item) => item.poolId === pool.id);
-        const mode = `${pool.enabled ? "" : "已关闭 · "}${pool.mode === "trade_candidate" ? `候选 · priority ${pool.priority}` : `仅观察 · ${pool.reason}`}`;
-        const health = !pool.enabled ? "开关关闭" : monitor ? `${monitor.status} / ${monitor.connectionStatus}` : state.health.get(`direct_pool_${pool.id}`)?.status ?? "未启动监控";
-        return `<tr><td>${escapeHtml(pool.instrument_id)}</td><td>${escapeHtml(pool.chain)}</td><td>${escapeHtml(pool.id)}</td><td>${escapeHtml(mode)}</td><td>${escapeHtml(health)}</td><td><code>${escapeHtml(pool.address)}</code></td></tr>`;
-      }).join("");
-      const observeOnlyCount = config.marketRegistry.pools.filter((pool) => pool.enabled && pool.mode === "observe_only" && pool.verified).length;
-      const quoteRows = quotes.map((row) => {
-        const pool = config.marketRegistry.pools.find((item) => item.id === row.pool_id);
-        const direction = pool?.mode === "observe_only"
-          ? row.direction === "dex_buy_cex_sell" ? "quote → asset" : "asset → quote"
-          : row.direction;
-        const monitor = pool && state.fixedPools?.find((item) => item.poolId === pool.id);
-        const inputIsAsset = row.direction === "cex_buy_dex_sell";
-        const assetUiMultiplier = pool?.chain === "solana" ? directQuoteAssetUiMultiplier(row.raw_response) : "1";
-        const assetSymbol = monitor?.baseTokenSymbol ?? pool?.instrument_id ?? "asset";
-        const quoteSymbol = monitor?.quoteTokenSymbol ?? "quote";
-        const input = pool ? `${formatRawTokenAmount(row.amount_in_raw, inputIsAsset ? pool.token_in_out.asset_decimals : pool.token_in_out.quote_decimals, inputIsAsset ? assetUiMultiplier : "1")} ${inputIsAsset ? assetSymbol : quoteSymbol}` : "—";
-        const output = pool ? `${formatRawTokenAmount(row.amount_out_raw, inputIsAsset ? pool.token_in_out.quote_decimals : pool.token_in_out.asset_decimals, inputIsAsset ? "1" : assetUiMultiplier)} ${inputIsAsset ? quoteSymbol : assetSymbol}` : "—";
-        const chainLabel = pool?.chain === "xlayer" ? "X Layer" : pool?.chain === "solana" ? "Solana" : row.chain_index;
-        const dexLabel = directPoolDexLabel(pool?.dex ?? row.dex);
-        const quote = row.status === "OK" ? `${input} → ${output}` : "—";
-        const invalidated = row.valuation_status?.startsWith("INVALIDATED_") ?? false;
-        const outcome = row.status === "OK" ? `<span class="badge ${invalidated ? "unhealthy" : "fresh"}">${invalidated ? "估值失效" : "已报价"}</span>${row.valuation_status === "ASSUMED_1_TO_1" ? "<small>1:1 假设</small>" : ""}` : `<span class="badge unhealthy">失败</span>`;
-        const profit = invalidated || row.net_profit_usdt === null ? "—" : `${formatReportDecimal(row.net_profit_usdt, 6)} USDT${row.roi === null ? "" : ` · ${formatReportDecimal(new Decimal(row.roi).mul(100).toString(), 4)}%`}`;
-        const profitClass = invalidated || row.net_profit_usdt === null ? "" : new Decimal(row.net_profit_usdt).gte(0) ? "profit-positive" : "profit-negative";
-        const detailsParams = new URLSearchParams({ id: String(row.id), quote_page: String(quotePage), decision_page: String(decisionPage) });
-        if (decisionExpanded) detailsParams.set("decision_open", "1");
-        const details = `<a class="direct-detail-link" href="/direct-pools/quote?${detailsParams.toString()}">详情 →</a>`;
-        return `<tr><td class="direct-time">${escapeHtml(formatUtc8(row.quoted_at))}</td><td class="direct-route"><strong>${escapeHtml(row.instrument_id)} · ${escapeHtml(chainLabel)}</strong><small>${escapeHtml(dexLabel)} · ${escapeHtml(row.pool_id)}</small></td><td>${escapeHtml(direction)}</td><td class="numeric direct-quote">${escapeHtml(quote)}</td><td class="direct-outcome">${outcome}</td><td class="numeric direct-profit ${profitClass}"><strong>${escapeHtml(profit)}</strong></td><td>${details}</td></tr>`;
-      });
-      const quoteTable = (rows: string) => `<div class="table-wrap direct-quote-table-wrap"><table class="direct-quote-table"><thead><tr><th>时间</th><th>路线</th><th>方向</th><th>输入 → 输出</th><th>状态</th><th>净收益 / ROI</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="7">暂无 direct_pool quote。</td></tr>'}</tbody></table></div>`;
-      const recentQuoteRows = quoteRows.join("");
-      const decisionRows = decisions.map((row) => {
-        const invalidated = row.valuation_status.startsWith("INVALIDATED_");
-        const profit = invalidated || row.net_profit_usdt === null ? invalidated ? "估值失效" : "未估算" : `${formatReportDecimal(row.net_profit_usdt, 6)} USDT${row.roi === null ? "" : ` · ${formatReportDecimal(new Decimal(row.roi).mul(100).toString(), 4)}%`}`;
-        const profitClass = invalidated || row.net_profit_usdt === null ? "" : new Decimal(row.net_profit_usdt).gte(0) ? "profit-positive" : "profit-negative";
-        return `<tr><td>${escapeHtml(row.created_at_utc8 ?? "未知")}</td><td>${escapeHtml(row.instrument_id)} · ${escapeHtml(row.chain_index)}</td><td>${escapeHtml(row.direction)}</td><td>${escapeHtml(row.size_usdt)} USDT</td><td class="numeric">${escapeHtml(row.cex_vwap ?? "—")}</td><td class="numeric">${escapeHtml(row.gross_profit_usdt === null ? "—" : `${formatReportDecimal(row.gross_profit_usdt, 6)} USDT`)}</td><td class="numeric">${escapeHtml(row.cex_fee_usdt === null ? "—" : `${formatReportDecimal(row.cex_fee_usdt, 6)} USDT`)}</td><td class="numeric">${escapeHtml(row.gas_budget_usdt === null ? "—" : `${formatReportDecimal(row.gas_budget_usdt, 4)} USDT`)}</td><td class="numeric ${profitClass}"><strong>${escapeHtml(profit)}</strong></td><td>${escapeHtml(row.decision_status)}${row.block_reason ? ` · ${escapeHtml(row.block_reason)}` : ""}</td><td>${escapeHtml(row.valuation_status)}</td><td><span class="badge unhealthy">${escapeHtml(row.execution_status)}</span></td></tr>`;
-      }).join("");
-      const positiveRows = positiveDecisions.map((row) => {
-        const direction = row.direction === "dex_buy_cex_sell" ? "DEX 买入 → CEX 卖出" : "CEX 买入 → DEX 卖出";
-        const profit = `+${formatReportDecimal(row.net_profit_usdt, 6)} USDT${row.roi === null ? "" : ` · ${formatReportDecimal(new Decimal(row.roi).mul(100).toString(), 4)}%`}`;
-        const detail = row.selected_quote_id === null ? "—" : `<a class="direct-detail-link" href="/direct-pools/quote?id=${row.selected_quote_id}">报价详情 →</a>`;
-        return `<tr><td>${escapeHtml(row.created_at_utc8 ?? "未知")}</td><td><strong>${escapeHtml(row.instrument_id)}</strong><small>${escapeHtml(row.pool_id ?? row.chain_index)}</small></td><td>${escapeHtml(direction)}</td><td class="numeric">${escapeHtml(row.size_usdt)} USDT</td><td class="numeric profit-positive"><strong>${escapeHtml(profit)}</strong></td><td><span class="badge unknown">观察估算 · NOT_EXECUTABLE</span>${row.block_reason ? `<small>${escapeHtml(row.block_reason)}</small>` : ""}</td><td>${detail}</td></tr>`;
-      }).join("");
-      const positiveEmpty = !state.dbOnline ? "数据库未连接，无法读取正收益记录。" : storageError ? "数据库表不可用，无法读取正收益记录。" : "当前没有净收益大于 0 的观察记录。";
-      const pageUrl = (nextQuotePage: number, nextDecisionPage: number, keepDecisionOpen: boolean, anchor: string) => {
-        const params = new URLSearchParams({ quote_page: String(nextQuotePage), decision_page: String(nextDecisionPage) });
-        if (keepDecisionOpen) params.set("decision_open", "1");
-        return `/direct-pools?${params.toString()}#${anchor}`;
-      };
-      const quoteJump = `<form class="pagination-jump" action="/direct-pools#direct-quotes" method="get" style="display:flex;align-items:center;gap:6px;margin:0"><input type="hidden" name="decision_page" value="${decisionPage}">${decisionExpanded ? '<input type="hidden" name="decision_open" value="1">' : ""}<label>跳至第 <input type="number" name="quote_page" value="${quotePage}" min="1" step="1" required aria-label="跳转到报价页码" style="width:68px;padding:5px 7px"> 页</label><button type="submit">跳转</button></form>`;
-      const decisionJump = `<form class="pagination-jump" action="/direct-pools#decision-history" method="get" style="display:flex;align-items:center;gap:6px;margin:0"><input type="hidden" name="quote_page" value="${quotePage}"><input type="hidden" name="decision_open" value="1"><label>跳至第 <input type="number" name="decision_page" value="${decisionPage}" min="1" step="1" required aria-label="跳转到收益明细页码" style="width:68px;padding:5px 7px"> 页</label><button type="submit">跳转</button></form>`;
-      const quotePagination = `<nav class="direct-pagination" aria-label="Exact-In 报价分页"><span>第 ${quotePage} 页 · 每页 ${pageSize} 条</span><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${quotePage > 1 ? `<a href="${pageUrl(quotePage - 1, decisionPage, decisionExpanded, "direct-quotes")}">上一页</a>` : ""}${quoteHasNext ? `<a href="${pageUrl(quotePage + 1, decisionPage, decisionExpanded, "direct-quotes")}">下一页</a>` : ""}${quoteJump}</div></nav>`;
-      const decisionPagination = `<nav class="direct-pagination" aria-label="观察收益明细分页"><span>第 ${decisionPage} 页 · 每页 ${pageSize} 条</span><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${decisionPage > 1 ? `<a href="${pageUrl(quotePage, decisionPage - 1, true, "decision-history")}">上一页</a>` : ""}${decisionHasNext ? `<a href="${pageUrl(quotePage, decisionPage + 1, true, "decision-history")}">下一页</a>` : ""}${decisionJump}</div></nav>`;
-      const status = config.marketdata.quoteProvider === "direct_pool" ? candidates.length ? "配置了候选路线" : observeOnlyCount ? "仅观察池，无交易候选" : "not_configured" : "当前 provider 为 Aggregator";
-      const noCandidateNote = !candidates.length && config.marketdata.quoteProvider === "direct_pool"
-        ? `<p class="guard-alert">${observeOnlyCount ? `当前监控 ${observeOnlyCount} 个 observe_only 池，生成 1:1 假设下的观察收益；所有结果均为 NOT_EXECUTABLE。` : "当前没有符合已验证条件的池。"}旧 Aggregator 报价不会作为指定池回退。</p>` : "";
-      body = `<h2>指定池收益估算</h2><p>报价源：<strong>${escapeHtml(config.marketdata.quoteProvider)}</strong> · 路线状态：<strong>${escapeHtml(status)}</strong> · 已登记交易候选：${candidates.length} · 所有 direct-pool 结果固定为 <strong>NOT_EXECUTABLE</strong>。</p>${!state.dbOnline ? '<p class="guard-alert">数据库不可用，暂时无法读取指定池报价和决策。</p>' : storageError ? `<p class="guard-alert">${escapeHtml(storageError)}</p>` : ""}${noCandidateNote}<section class="overview"><h3>收益口径</h3><p>每条 Exact-In 按相同规模的 OKX VWAP 对比，扣 CEX 手续费和配置中的固定 Gas 预算。USDG、USDC 暂按 1:1 计 USDT；X Layer 的 XNVDA/wNVDAx 数量通过 ERC-4626 preview 实时换算。净收益是观察估算，不代表稳定币实际兑换、充值提现成本或可执行收益。</p></section><section class="overview"><h3>净收益估算为正 <small>最近 20 条</small></h3><p>仅列出净收益大于 0 且估值未失效的观察样本；这些记录仍是 <strong>NOT_EXECUTABLE</strong>，不代表实际可成交。</p><div class="table-wrap"><table class="direct-positive-table"><thead><tr><th>时间 <small>(UTC + 8)</small></th><th>资产 / 池</th><th>方向</th><th>规模</th><th>净收益 / ROI</th><th>状态</th><th>详情</th></tr></thead><tbody>${positiveRows || `<tr><td colspan="7">${positiveEmpty}</td></tr>`}</tbody></table></div></section><section class="overview"><h3>注册池</h3><div class="table-wrap"><table><thead><tr><th>资产</th><th>链</th><th>池 ID</th><th>模式 / 原因</th><th>监控状态</th><th>池地址</th></tr></thead><tbody>${poolRows || '<tr><td colspan="6">注册表没有池。</td></tr>'}</tbody></table></div></section><section class="overview" id="direct-quotes"><h3>最近 Exact-In 报价与观察收益 <small>第 ${quotePage} 页</small></h3>${quoteTable(recentQuoteRows)}${quotePagination}</section><section class="overview" id="decision-history"><details class="direct-decision-history"${decisionExpanded ? " open" : ""}><summary><strong>最近观察收益明细</strong><small>第 ${decisionPage} 页 · 每页 ${pageSize} 条</small></summary><div class="table-wrap"><table><thead><tr><th>时间</th><th>资产 / 链</th><th>方向</th><th>规模</th><th>CEX VWAP</th><th>毛收益</th><th>CEX 手续费</th><th>Gas 预算</th><th>净收益 / ROI</th><th>结论</th><th>估值</th><th>执行资格</th></tr></thead><tbody>${decisionRows || '<tr><td colspan="12">暂无 direct-pool 观察决策。</td></tr>'}</tbody></table></div>${decisionPagination}</details></section>`;
-      body += `<style>.direct-quote-table-wrap{overflow:visible}.direct-quote-table{table-layout:fixed;min-width:980px}.direct-quote-table th:nth-child(1){width:13%}.direct-quote-table th:nth-child(2){width:18%}.direct-quote-table th:nth-child(3){width:10%}.direct-quote-table th:nth-child(4){width:29%}.direct-quote-table th:nth-child(5){width:9%}.direct-quote-table th:nth-child(6){width:15%}.direct-quote-table th:nth-child(7){width:6%}.direct-quote-table td{white-space:normal;overflow-wrap:anywhere;vertical-align:middle}.direct-quote-table small{display:block;margin-top:3px;color:#758198;font-size:11px;line-height:1.35}.direct-route strong{display:block}.direct-outcome .badge{margin-bottom:2px}.direct-profit strong{display:block;white-space:nowrap}.direct-detail-link{font-size:12px;text-decoration:none;color:#52647e}.direct-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:12px 2px;color:#758198;font-size:12px}.direct-pagination>div{display:flex;gap:8px}.direct-pagination a{padding:6px 10px;border:1px solid #dfe5ef;border-radius:7px;background:#fff;text-decoration:none}.direct-pagination a:hover{background:#f0f5fc}.direct-decision-history{margin:0}.direct-decision-history>summary{padding:10px 12px;border:1px solid #e5eaf2;border-radius:8px;background:#f8fafd}.direct-decision-history>summary small{margin-left:10px}.profit-positive{color:#13815c}.profit-negative{color:#b42318}@media(max-width:980px){.direct-quote-table-wrap{overflow-x:auto}}</style>`;
     } else if (page === "/direct-pools/quote") {
       const id = url.searchParams.get("id");
       const backUrl = directPoolQuoteBackUrl(url.searchParams);

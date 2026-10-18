@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Config } from "./config.js";
+import type { Config } from "../config.js";
 import { directPoolDexLabel, renderDirectPoolPage } from "./direct-pool-pages.js";
 
 const registeredPools = [

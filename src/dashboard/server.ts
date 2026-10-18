@@ -1,8 +1,8 @@
-import { closeDatabase, initDatabase } from "./db.js";
+import { closeDatabase, initDatabase } from "../db.js";
 import { startDashboard } from "./dashboard.js";
-import { readDashboardState } from "./dashboard-state.js";
-import { loadConfig } from "./config.js";
-import { logger } from "./logger.js";
+import { readDashboardState } from "./state.js";
+import { loadConfig } from "../config.js";
+import { logger } from "../logger.js";
 
 async function main(): Promise<void> {
   const config = await loadConfig();

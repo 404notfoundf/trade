@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { PublicKey } from "@solana/web3.js";
 import { parse } from "yaml";
-import { pinnedQuote } from "../valuation.js";
+import { pinnedQuote } from "../market/valuation.js";
 
 export type RegistryChainName = "xlayer" | "solana";
 export const ORCA_WHIRLPOOL_PROGRAM_ADDRESS = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";

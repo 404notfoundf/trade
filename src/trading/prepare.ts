@@ -1,8 +1,8 @@
 import Decimal from "decimal.js";
 import type { AssetConfig, Config } from "../config.js";
-import { bookStale, floorToStep, vwap, type Instrument } from "../market.js";
-import { dexApproveTransaction, dexSwap, type Book, type Credentials } from "../okx.js";
-import { decideValuation, XLAYER_CHAIN } from "../valuation.js";
+import { bookStale, floorToStep, vwap, type Instrument } from "../market/market.js";
+import { dexApproveTransaction, dexSwap, type Book, type Credentials } from "../market/okx.js";
+import { decideValuation, XLAYER_CHAIN } from "../market/valuation.js";
 import { netMarginOk, selectCall, swapTxError, type SwapTx, type UnsignedCall } from "./gates.js";
 
 type RouterToken = { tokenContractAddress?: string; decimal?: string; taxRate?: string | number | null; isHoneyPot?: boolean };

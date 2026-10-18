@@ -63,7 +63,22 @@ docker compose ps
 docker compose logs -f app
 ```
 
-应用更新后运行 `docker compose up -d --build app`。Compose 会自动把应用和 MySQL 放在同一网络，应用始终使用 `mysql:3306`；MySQL 的 `3306:3306` 和应用的 `3000:3000` 仍发布到宿主机。远程客户端可访问 `<Ubuntu服务器公网IP>:3306`，网页访问 `http://<Ubuntu服务器地址>:3000`。云安全组应限制 3306 的来源 IP；Docker 发布的端口可能绕过 UFW 规则。公网开放 root 登录风险较高。若需保留旧版回滚，验证新服务前不要删除已停止的旧容器。
+#### 更新应用代码
+
+在 Ubuntu 项目目录执行。若项目是通过 Git 克隆的，先拉取代码；若通过其他方式上传代码，跳过 `git pull`：
+
+如果旧版是由当前 Compose 项目的 `app` 服务启动，最后的 `docker compose up -d app` 会自动停止并替换旧容器，不必手动停止。如果旧版是用 `docker run` 单独启动且占用 3000 端口，在执行 `up` 前先运行 `docker stop trade-observer`；不需要先删除旧容器。
+
+```sh
+git pull --ff-only
+docker compose build app
+docker compose run --rm app node dist/migrate.js
+docker compose up -d app
+docker compose ps
+docker compose logs --tail=100 -f app
+```
+
+迁移命令会检查并应用尚未执行的数据库迁移；没有新迁移时不会改动数据库。若 MySQL 容器未运行，先执行 `docker compose up -d mysql`。更新应用不需要删除数据库卷，也不要运行 `docker compose down -v`。Compose 会自动把应用和 MySQL 放在同一网络，应用始终使用 `mysql:3306`；MySQL 的 `3306:3306` 和应用的 `3000:3000` 仍发布到宿主机。远程客户端可访问 `<Ubuntu服务器公网IP>:3306`，网页访问 `http://<Ubuntu服务器地址>:3000`。云安全组应限制 3306 的来源 IP；Docker 发布的端口可能绕过 UFW 规则。公网开放 root 登录风险较高。若需保留旧版回滚，验证新服务前不要删除已停止的旧容器。
 
 ### 用新方法开始只读观察
 

@@ -168,6 +168,9 @@ pools:
     enabled: true
     instrument_id: XSPCX
     chain: solana
+    # Optional pool-specific endpoints; uncomment both to override chains.solana defaults.
+    rpc_http: env:SOLANA_XSPCX_BYREAL_RPC_HTTP
+    rpc_ws: env:SOLANA_XSPCX_BYREAL_RPC_WS
     dex: byreal_clmm_solana
     mode: observe_only
     reason: quote_asset_not_pinned

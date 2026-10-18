@@ -8,6 +8,8 @@ marketdata:
   direct_quote_retention_days: 7
   direct_decision_retention_days: 180
 # Fixed USDT gas budgets for read-only direct-pool profit observations.
+# Per-pool Solana RPC overrides are configured beside each pool in market-registry.yaml;
+# Byreal uses SOLANA_RPC_URL/WS unless its optional pool-specific HTTP/WS pair is enabled there.
 direct_pool_observation:
   # Solana observe-only simulation; default off, signer from SOLANA_SIMULATION_PRIVATE_KEY, never broadcasts.
   simulation_enabled: false

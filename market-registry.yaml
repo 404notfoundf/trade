@@ -115,7 +115,7 @@ pools:
     token_in_out: { asset_address: "0xa8ddb5cd96b5222afe198316e9a57caa642850d5", asset_decimals: 18, quote_address: "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8", quote_decimals: 6 }
     expected_fee_tier: 500
   - id: xspcx-xlayer-wspcxx-usdg-v3
-    enabled: true
+    enabled: false
     instrument_id: XSPCX
     chain: xlayer
     dex: uniswap_v3_xlayer

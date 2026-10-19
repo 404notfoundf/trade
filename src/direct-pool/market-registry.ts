@@ -129,7 +129,7 @@ function chainAsset(instrument: RegisteredInstrument, chain: RegistryChainName):
   return instrument.chain_assets.find((asset) => asset.chain === chain);
 }
 
-export function parseMarketRegistry(value: unknown): MarketRegistry {
+export function parseMarketRegistry(value: unknown, enabledObservePoolIds?: readonly string[]): MarketRegistry {
   if (!record(value) || value.schema_version !== 1) throw new Error("market-registry.yaml schema_version must be 1");
   if (!record(value.chains) || !record(value.cexes) || !record(value.cexes.okx) || !record(value.dexes)
     || !Array.isArray(value.instruments) || !Array.isArray(value.pools)) throw new Error("market-registry.yaml is missing chains, cexes, dexes, instruments or pools");
@@ -285,7 +285,16 @@ export function parseMarketRegistry(value: unknown): MarketRegistry {
       address: poolAddress, token_in_out: { asset_address: assetAddress, asset_decimals: assetDecimals, quote_address: quoteAddress, quote_decimals: quoteDecimals },
       expected_fee_tier, expected_fee_rate, expected_tick_spacing, expected_bin_step });
   }
-  return { schema_version: 1, chains, cexes: { okx: { kind: "cex", enabled: okx.enabled, book_source: "websocket" } }, dexes, instruments, pools };
+  const registry: MarketRegistry = { schema_version: 1, chains, cexes: { okx: { kind: "cex", enabled: okx.enabled, book_source: "websocket" } }, dexes, instruments, pools };
+  if (enabledObservePoolIds === undefined) return registry;
+  const selected = new Set(enabledObservePoolIds);
+  if (selected.size !== enabledObservePoolIds.length) throw new Error("MARKET_REGISTRY_OBSERVE_POOL_IDS contains duplicate pool ids");
+  const known = new Set(pools.map((pool) => pool.id));
+  const unknown = enabledObservePoolIds.find((id) => !known.has(id));
+  if (unknown) throw new Error(`MARKET_REGISTRY_OBSERVE_POOL_IDS references unknown pool id: ${unknown}`);
+  const tradeCandidate = enabledObservePoolIds.find((id) => pools.find((pool) => pool.id === id)?.mode !== "observe_only");
+  if (tradeCandidate) throw new Error(`MARKET_REGISTRY_OBSERVE_POOL_IDS cannot enable trade_candidate pool: ${tradeCandidate}`);
+  return { ...registry, pools: pools.map((pool) => pool.mode === "observe_only" ? { ...pool, enabled: selected.has(pool.id) } : pool) };
 }
 
 function sameAddress(chain: RegistryChainName, left: string, right: string): boolean {
@@ -294,7 +303,10 @@ function sameAddress(chain: RegistryChainName, left: string, right: string): boo
 
 export async function loadMarketRegistry(): Promise<MarketRegistry> {
   try {
-    return parseMarketRegistry(parse(await readFile(new URL("../../market-registry.yaml", import.meta.url), "utf8")));
+    const configuredPoolIds = process.env.MARKET_REGISTRY_OBSERVE_POOL_IDS;
+    const enabledObservePoolIds = configuredPoolIds === undefined ? undefined : configuredPoolIds === "" ? [] : configuredPoolIds.split(",").map((id) => id.trim());
+    if (enabledObservePoolIds?.some((id) => !id)) throw new Error("MARKET_REGISTRY_OBSERVE_POOL_IDS must be a comma-separated list of observe_only pool ids");
+    return parseMarketRegistry(parse(await readFile(new URL("../../market-registry.yaml", import.meta.url), "utf8")), enabledObservePoolIds);
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return emptyRegistry;
     throw error;

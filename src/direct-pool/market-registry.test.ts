@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { parse } from "yaml";
-import { BYREAL_CLMM_PROGRAM_ADDRESS, BYREAL_XSPCX_USDC_POOL, loadMarketRegistry, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, parseMarketRegistry, solveDirectPoolCandidates } from "./market-registry.js";
+import { BYREAL_CLMM_PROGRAM_ADDRESS, BYREAL_XSPCX_USDC_POOL, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, parseMarketRegistry, solveDirectPoolCandidates } from "./market-registry.js";
 import { createPoolAdapter } from "./pool-adapter-factory.js";
 
 const envKeys = ["XLAYER_RPC_HTTP", "XLAYER_RPC_WS"] as const;
@@ -26,7 +26,7 @@ async function readRawRegistry(): Promise<any> {
 }
 
 test("existing wrapped and non-pinned pools stay observe-only and produce no candidate route", async () => {
-  const registry = await loadMarketRegistry();
+  const registry = parseMarketRegistry(await readRawRegistry());
   assert.equal(registry.dexes.uniswap_v3_xlayer?.quoter_v2, "0xd1b797d92d87b688193a2b976efc8d577d204343");
   assert.equal(registry.dexes.uniswap_v3_xlayer?.swap_router, "0x4f0c28f5926afda16bf2506d5d9e57ea190f9bca");
   assert.equal(registry.dexes.uniswap_v3_xlayer?.factory, "0x4B2ab38DBF28D31D467aA8993f6c2585981D6804");
@@ -39,8 +39,9 @@ test("existing wrapped and non-pinned pools stay observe-only and produce no can
   ]);
   const wspcxx = registry.pools.find((pool) => pool.id === "xspcx-xlayer-wspcxx-usdg-v3")!;
   assert.deepEqual([wspcxx.enabled, wspcxx.address, wspcxx.token_in_out.asset_address, wspcxx.token_in_out.quote_address, wspcxx.expected_fee_tier], [
-    true, "0x535aabfaf9a6fbc1a04317b98885706dc6bf1650", "0x8e2eed8b8b5e13ea7bf38e50d7821d2c57309072", "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8", 500,
+    false, "0x535aabfaf9a6fbc1a04317b98885706dc6bf1650", "0x8e2eed8b8b5e13ea7bf38e50d7821d2c57309072", "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8", 500,
   ]);
+  assert.equal(registry.pools.find((pool) => pool.id === ORCA_XSPCX_USDC_POOL.id)?.enabled, false);
   const orca = registry.pools.find((pool) => pool.id === ORCA_XSPCX_USDC_POOL.id)!;
   assert.deepEqual([orca.address, orca.expected_fee_rate, orca.expected_tick_spacing], [ORCA_XSPCX_USDC_POOL.address, 500, 8]);
   const meteora = registry.pools.find((pool) => pool.id === METEORA_XSPCX_USDC_POOL.id)!;

@@ -71,7 +71,7 @@ Meteora DLMM 也由独立 Adapter 订阅固定 LbPair 并用官方 SDK 报价；
 
 ### 4.1 文件职责
 
-`config.yaml` 保留运行参数、数据库、Dashboard、交易总闸、市场数据开关和密钥引用。新增 `market-registry.yaml`，保存静态且可审核的市场能力注册表。
+`config.yaml` 保留运行参数、数据库、Dashboard、交易总闸、市场数据开关和密钥引用。`market-registry.yaml` 保存静态且可审核的市场能力注册表。池的 `enabled` 是共享默认值；部署可通过 `.env` 的 `MARKET_REGISTRY_OBSERVE_POOL_IDS` 设置只读观察池 allowlist，只覆盖 `observe_only` 池的运行启用状态，不覆盖地址、token、协议或费率等注册信息，也不能启用 `trade_candidate`。未设置该变量时使用注册表默认值；空值表示不启用任何只读观察池，未知、重复或交易候选池 ID 会导致启动失败。
 
 运行参数新增：
 

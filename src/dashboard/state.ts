@@ -3,8 +3,7 @@ import { execute, query, type Health } from "../db.js";
 import type { AssetConfig } from "../config.js";
 import type { DashboardState, RouteDashboardState } from "./dashboard.js";
 import type { ValuationView } from "../market/valuation.js";
-import type { FixedPoolConfig } from "../config.js";
-import { initialPoolState, type PoolMonitorState } from "../market/fixed-pools.js";
+import type { PoolMonitorState } from "../market/fixed-pools.js";
 
 type StoredRoute = Omit<RouteDashboardState, "multiplier"> & { multiplier?: string };
 type StoredState = { savedAt: number; collectorRunning: boolean; health: Health[]; routes: StoredRoute[]; fixedPools?: PoolMonitorState[]; valuation?: ValuationView };
@@ -24,7 +23,7 @@ export async function saveDashboardState(state: DashboardState): Promise<void> {
   );
 }
 
-export async function readDashboardState(assets: AssetConfig[], fixedPoolConfigs: FixedPoolConfig[] = []): Promise<DashboardState> {
+export async function readDashboardState(assets: AssetConfig[]): Promise<DashboardState> {
   const rows = await query<Array<{ snapshot: unknown }>>("SELECT snapshot FROM dashboard_state WHERE id=1");
   let snapshot: StoredState | undefined;
   try {
@@ -60,12 +59,9 @@ export async function readDashboardState(assets: AssetConfig[], fixedPoolConfigs
       bookReady: running && saved.bookReady,
     };
   });
-  const savedPools = new Map((snapshot?.fixedPools ?? []).map((pool) => [pool.poolId, pool] as const));
-  const fixedPools = fixedPoolConfigs.map((pool) => {
-    const saved = savedPools.get(pool.id);
-    if (!saved) return initialPoolState(pool, running ? "not_configured" : "unknown", running ? null : "采集进程未运行");
+  const fixedPools = (snapshot?.fixedPools ?? []).map((saved) => {
     return {
-      ...initialPoolState(pool), ...saved,
+      ...saved,
       status: running ? saved.status : saved.status === "disabled" ? "disabled" : "unknown",
       connectionStatus: running ? saved.connectionStatus ?? "unknown" : "unknown",
       rpcSnapshotStatus: saved.rpcSnapshotStatus ?? "unknown",

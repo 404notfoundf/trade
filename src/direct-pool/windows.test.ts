@@ -17,7 +17,7 @@ import {
 const base = Date.UTC(2026, 9, 15, 0, 0, 0);
 const at = (offsetMs: number) => new Date(base + offsetMs);
 const sample = (id: number, offsetMs: number, net: string | null, patch: Partial<WindowSample> = {}): WindowSample => ({
-  id, createdAt: at(offsetMs), instrumentId: "X", chainIndex: "1", poolId: "pool-a", direction: "buy", sizeUsdt: "100", netProfitUsdt: net, valuationStatus: "VERIFIED", ...patch,
+  id, createdAt: at(offsetMs), instrumentId: "X", chainIndex: "1", poolId: "pool-a", direction: "buy", sizeUsdt: "100", netProfitUsdt: net, roi: null, valuationStatus: "VERIFIED", ...patch,
 });
 
 test("two positive samples open once and two non-positive samples close", () => {
@@ -25,6 +25,16 @@ test("two positive samples open once and two non-positive samples close", () => 
   assert.equal(windows.length, 1);
   assert.equal(windows[0]?.startAt.getTime(), at(0).getTime());
   assert.equal(windows[0]?.endAt?.getTime(), at(3).getTime());
+});
+
+test("positive windows retain latest and peak sample ROI", () => {
+  const [window] = collectPositiveWindows([
+    sample(1, 0, "1", { roi: "0.01" }),
+    sample(2, 1, "2", { roi: "0.02" }),
+    sample(3, 2, "1.5", { roi: "0.015" }),
+  ]);
+  assert.equal(window?.latestRoi, "0.015");
+  assert.equal(window?.peakRoi, "0.02");
 });
 
 test("a non-positive sample breaks a pending positive and four positives remain one window", () => {

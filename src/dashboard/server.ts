@@ -7,7 +7,7 @@ import { logger } from "../logger.js";
 async function main(): Promise<void> {
   const config = await loadConfig();
   await initDatabase(config);
-  const server = startDashboard(config, config.assets, () => readDashboardState(config.assets, config.fixedPools));
+  const server = startDashboard(config, config.assets, () => readDashboardState(config.assets));
   let stopping = false;
   const shutdown = async () => {
     if (stopping) return;

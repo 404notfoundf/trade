@@ -9,12 +9,12 @@ export type DirectPoolRangePreset = "5m" | "1h" | "24h" | "custom";
 export type DirectPoolRange = { from: Date; to: Date; preset: DirectPoolRangePreset; invalid: boolean };
 export type WindowSample = {
   id: number; createdAt: Date; instrumentId: string; chainIndex: string; poolId: string | null;
-  direction: string; sizeUsdt: string; netProfitUsdt: string | null; valuationStatus: string | null; selectedQuoteId?: number | null;
+  direction: string; sizeUsdt: string; netProfitUsdt: string | null; roi: string | null; valuationStatus: string | null; selectedQuoteId?: number | null;
 };
 export type PositiveWindow = {
   startAt: Date; endAt: Date | null; key: string; instrumentId: string; chainIndex: string; poolId: string;
   direction: string; sizeUsdt: string; sampleCount: number; firstSampleId: number; lastSampleId: number; lastObservedAt: Date;
-  latestNetProfitUsdt: string; peakNetProfitUsdt: string; selectedQuoteId: number | null;
+  latestNetProfitUsdt: string; latestRoi: string | null; peakNetProfitUsdt: string; peakRoi: string | null; selectedQuoteId: number | null;
 };
 
 type Utc8Parts = { year: number; month: number; day: number; hour: number; minute: number; second: number };
@@ -166,7 +166,11 @@ function recordWindowSample(window: PositiveWindow, sample: WindowSample, profit
   window.sampleCount++;
   window.lastObservedAt = sample.createdAt;
   window.latestNetProfitUsdt = profit.toString();
-  window.peakNetProfitUsdt = Decimal.max(new Decimal(window.peakNetProfitUsdt), profit).toString();
+  window.latestRoi = sample.roi;
+  if (profit.gt(window.peakNetProfitUsdt)) {
+    window.peakNetProfitUsdt = profit.toString();
+    window.peakRoi = sample.roi;
+  }
   window.selectedQuoteId = sample.selectedQuoteId ?? null;
 }
 
@@ -177,7 +181,7 @@ function openWindow(first: WindowSample, second: WindowSample, key: string): Pos
     poolId: first.poolId!, direction: first.direction, sizeUsdt: first.sizeUsdt, sampleCount: 0,
     firstSampleId: first.id, lastSampleId: second.id,
     lastObservedAt: first.createdAt, latestNetProfitUsdt: firstProfit.toString(), peakNetProfitUsdt: firstProfit.toString(),
-    selectedQuoteId: null,
+    latestRoi: first.roi, peakRoi: first.roi, selectedQuoteId: null,
   };
   recordWindowSample(window, first, firstProfit);
   recordWindowSample(window, second, numericNet(second.netProfitUsdt)!);

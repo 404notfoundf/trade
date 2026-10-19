@@ -90,7 +90,6 @@ async function main(): Promise<void> {
   const tradingConfig = aggregatorSelected ? config.trading : { ...config.trading, enabled: false };
   const configuredAssets = config.assets;
   const assets = config.assets.filter((asset) => asset.enabled);
-  const disabledRegistryPoolIds = new Set(config.marketRegistry.pools.filter((pool) => !pool.enabled).map((pool) => pool.id));
   const observeOnlyPools = config.marketdata.quoteProvider === "direct_pool"
     ? config.marketRegistry.pools.filter((pool) => pool.enabled && pool.mode === "observe_only" && pool.verified) : [];
   const registeredPools = [...new Map([...directPoolCandidates, ...observeOnlyPools].map((pool) => [pool.id, pool] as const)).values()];
@@ -98,11 +97,7 @@ async function main(): Promise<void> {
   const adapterWatchPoolIds = new Set(adapterWatchPools.map((pool) => pool.id));
   const registryPoolsToMonitor = registeredPools
     .filter((pool) => !adapterWatchPoolIds.has(pool.id));
-  const registryMonitorConfigs = registryPoolsToMonitor.map((pool) => {
-    const configured = config.fixedPools.find((item) => item.id === pool.id);
-    return configured ? { ...configured, enabled: pool.enabled } : poolMonitorConfig(pool, config);
-  });
-  const monitorPools = [...new Map([...config.fixedPools.filter((pool) => !disabledRegistryPoolIds.has(pool.id) && !adapterWatchPoolIds.has(pool.id)), ...registryMonitorConfigs].map((pool) => [pool.id, pool] as const)).values()];
+  const monitorPools = registryPoolsToMonitor.map((pool) => poolMonitorConfig(pool, config));
   const adapterWatchStateConfigs = adapterWatchPools.map((pool) => poolMonitorConfig(pool, config));
   const directRpcEndpoints = new Map(registryPoolsToMonitor.map((pool) => [pool.id, {
     http: pool.rpc_http, ws: pool.rpc_ws,

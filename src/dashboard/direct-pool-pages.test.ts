@@ -16,7 +16,6 @@ const helpers = {
   formatReportDecimal: () => "",
   formatRawTokenAmount: () => "",
   directQuoteAssetUiMultiplier: () => "1",
-  fixedPoolPanel: () => "",
 };
 
 test("direct-pool pages show registered Solana adapters by readable name", () => {

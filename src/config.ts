@@ -59,7 +59,6 @@ export type Config = {
   dex: { key: string; secret: string; passphrase: string };
   signers: { xlayerPrivateKey: string; solanaPrivateKey: string; solanaSimulationPrivateKey: string; solanaRpcUrl: string };
   assets: AssetConfig[];
-  fixedPools: FixedPoolConfig[];
   marketRegistry: MarketRegistry;
   trading: TradingConfig;
 };
@@ -84,7 +83,6 @@ export async function loadConfig(): Promise<Config> {
     mysql?: Config["mysql"];
     assets?: AssetDefinition[];
     trading?: unknown;
-    fixedPools?: FixedPoolConfig[];
   };
   if (!Array.isArray(settings.assets)) throw new Error("config.yaml must contain an assets list");
   if (settings.assets.some((asset) => asset.enabled !== undefined && typeof asset.enabled !== "boolean")) throw new Error("Each asset enabled flag must be a boolean");
@@ -149,27 +147,6 @@ export async function loadConfig(): Promise<Config> {
     ...route,
     enabled: definition.enabled !== false && route.enabled,
   })));
-  const fixedPools = settings.fixedPools ?? [];
-  if (!Array.isArray(fixedPools)) throw new Error("fixedPools must be a list");
-  const poolIds = new Set<string>();
-  const poolAddresses = new Set<string>();
-  for (const pool of fixedPools) {
-    const addressPattern = pool.chainIndex === "196" ? /^0x[\da-f]{40}$/i : /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-    const familyMetadataValid = pool.chainIndex === "196"
-      ? Number.isSafeInteger(pool.expectedFee) && !!pool.expectedFactory && /^0x[\da-f]{40}$/i.test(pool.expectedFactory)
-      : !!pool.expectedProgramId && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(pool.expectedProgramId);
-    const addressKey = `${pool.chainIndex}:${pool.chainIndex === "196" ? pool.address?.toLowerCase() : pool.address}`;
-    if (typeof pool.enabled !== "boolean" || !pool.id || pool.id.length > 27 || poolIds.has(pool.id) || poolAddresses.has(addressKey) || !pool.instId
-      || !settings.assets.some((asset) => asset.instId === pool.instId) || !pool.baseTokenSymbol || !pool.quoteTokenSymbol
-      || (pool.chainIndex !== "196" && pool.chainIndex !== "501")
-      || pool.baseTokenAddress === pool.quoteTokenAddress
-      || !addressPattern.test(pool.address) || !addressPattern.test(pool.baseTokenAddress) || !addressPattern.test(pool.quoteTokenAddress)
-      || (pool.chainIndex === "196" && pool.dex !== "uniswap-v3") || (pool.chainIndex === "501" && pool.dex !== "raydium-clmm")
-      || !familyMetadataValid || !Number.isSafeInteger(pool.baseTokenDecimals) || !Number.isSafeInteger(pool.quoteTokenDecimals) || pool.baseTokenDecimals < 0 || pool.baseTokenDecimals > 255 || pool.quoteTokenDecimals < 0 || pool.quoteTokenDecimals > 255
-      || !/^(?:\d+\.?\d*|\.\d+)$/.test(pool.baseTokenToCexAssetRatio) || !Number.isFinite(Number(pool.baseTokenToCexAssetRatio)) || Number(pool.baseTokenToCexAssetRatio) <= 0) throw new Error(`Invalid fixed pool ${pool.id || "(missing id)"}`);
-    poolIds.add(pool.id);
-    poolAddresses.add(addressKey);
-  }
   const routeKeys = new Set<string>();
   for (const asset of assets) {
     const addressPattern = asset.chainIndex === "196" ? /^0x[\da-f]{40}$/i : asset.chainIndex === "501" ? /^[1-9A-HJ-NP-Za-km-z]{32,44}$/ : null;
@@ -215,7 +192,6 @@ export async function loadConfig(): Promise<Config> {
       solanaRpcUrl: process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
     },
     assets,
-    fixedPools,
     marketRegistry: await loadMarketRegistry(),
     trading: parseTrading(settings.trading, assets),
   };

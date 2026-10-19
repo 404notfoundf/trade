@@ -153,38 +153,3 @@ assets:
         quoteTokenAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
         quoteTokenDecimals: 6
         quoteTokenSymbol: USDT
-
-# 独立只读固定池 allowlist；与 assets/routes 及交易开关分开。
-# USDG、USDC、USDT 的 1:1 仅用于监控展示，固定池观察不会进入收益或下单。
-fixedPools:
-  - enabled: true
-    id: xnvda-xlayer-uniswap-v3
-    instId: XNVDA-USDT
-    chainIndex: "196"
-    dex: uniswap-v3
-    address: "0x2a2b11730c2b6d99a58034a869dd810d7300a7b2"
-    # wNVDAx / USDG；比例是池 base token 到 XNVDA 的配置值。
-    baseTokenSymbol: wNVDAx
-    baseTokenAddress: "0xa8ddb5cd96b5222afe198316e9a57caa642850d5"
-    baseTokenDecimals: 18
-    quoteTokenSymbol: USDG
-    quoteTokenAddress: "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8"
-    quoteTokenDecimals: 6
-    baseTokenToCexAssetRatio: "1"
-    expectedFee: 500
-    expectedFactory: "0x4b2ab38dbf28d31d467aa8993f6c2585981d6804"
-  - enabled: true
-    id: xnvda-solana-raydium-clmm
-    instId: XNVDA-USDT
-    chainIndex: "501"
-    dex: raydium-clmm
-    address: "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
-    # XNVDA / USDC
-    baseTokenSymbol: XNVDA
-    baseTokenAddress: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
-    baseTokenDecimals: 8
-    quoteTokenSymbol: USDC
-    quoteTokenAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-    quoteTokenDecimals: 6
-    baseTokenToCexAssetRatio: "1"
-    expectedProgramId: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"

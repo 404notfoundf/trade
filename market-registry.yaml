@@ -101,6 +101,8 @@ instruments:
 # These manually monitored pools are deliberately ineligible for direct-pool decisions.
 # Optional per-pool rpc_http/rpc_ws values override the chain defaults above. Use env:NAME references.
 pools:
+  # X Layer
+  # Uniswap V3
   - id: xnvda-xlayer-uniswap-v3
     enabled: false
     instrument_id: XNVDA
@@ -112,6 +114,19 @@ pools:
     address: "0x2a2b11730c2b6d99a58034a869dd810d7300a7b2"
     token_in_out: { asset_address: "0xa8ddb5cd96b5222afe198316e9a57caa642850d5", asset_decimals: 18, quote_address: "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8", quote_decimals: 6 }
     expected_fee_tier: 500
+  - id: xspcx-xlayer-wspcxx-usdg-v3
+    enabled: true
+    instrument_id: XSPCX
+    chain: xlayer
+    dex: uniswap_v3_xlayer
+    mode: observe_only
+    reason: wrapper_required
+    verified: true
+    address: "0x535aabfaf9a6fbc1a04317b98885706dc6bf1650"
+    token_in_out: { asset_address: "0x8e2eed8b8b5e13ea7bf38e50d7821d2c57309072", asset_decimals: 18, quote_address: "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8", quote_decimals: 6 }
+    expected_fee_tier: 500
+  # Solana
+  # Raydium CLMM
   - id: xnvda-solana-raydium-clmm
     enabled: false
     instrument_id: XNVDA
@@ -123,7 +138,7 @@ pools:
     address: "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
     token_in_out: { asset_address: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
   - id: xspcx-solana-raydium-usdc-clmm
-    enabled: true
+    enabled: false
     instrument_id: XSPCX
     chain: solana
     # Optional pool-specific endpoints; omit both to use chains.solana defaults.
@@ -135,8 +150,9 @@ pools:
     verified: true
     address: "AHNN6JmvaGG6XUoSg7sEr38gRYDB2jTbUvqXVuqaRHpq"
     token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
+  # Orca Whirlpool
   - id: xspcx-solana-orca-whirlpool-usdc
-    enabled: true
+    enabled: false
     instrument_id: XSPCX
     chain: solana
     # Optional pool-specific endpoints; omit both to use chains.solana defaults.
@@ -150,8 +166,9 @@ pools:
     token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
     expected_fee_rate: 500
     expected_tick_spacing: 8
+  # Meteora DLMM
   - id: xspcx-solana-meteora-dlmm-usdc
-    enabled: true
+    enabled: false
     instrument_id: XSPCX
     chain: solana
     # Optional pool-specific endpoints; omit both to use chains.solana defaults.
@@ -164,8 +181,9 @@ pools:
     address: "5whNk71ua6aRtNKazDqEeAimmfzuX9epJcjh4isQKprn"
     token_in_out: { asset_address: "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8", asset_decimals: 8, quote_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", quote_decimals: 6 }
     expected_bin_step: 8
+  # Byreal CLMM
   - id: xspcx-solana-byreal-clmm-usdc
-    enabled: true
+    enabled: false
     instrument_id: XSPCX
     chain: solana
     # Optional pool-specific endpoints; uncomment both to override chains.solana defaults.

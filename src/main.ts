@@ -587,15 +587,7 @@ async function main(): Promise<void> {
       }
     } catch (error) { markDatabaseUnavailable(error); }
   }
-  const checkpointBlocks = new Map<string, number>();
-  if (dbOnline) {
-    try {
-      const checkpoints = await query<Array<{ pool_id: string; confirmed_block_number: string }>>("SELECT pool_id,CAST(confirmed_block_number AS CHAR) confirmed_block_number FROM dex_pool_state WHERE chain_index='196' AND confirmed_block_number IS NOT NULL");
-      for (const row of checkpoints) checkpointBlocks.set(row.pool_id, Number(row.confirmed_block_number));
-    } catch (error) { markDatabaseUnavailable(error); }
-  }
   const stopFixedPoolMonitors = await startFixedPoolMonitors(monitorPools, {
-    checkpointBlocks,
     rpcEndpoints: directRpcEndpoints,
     onState: enqueuePoolState,
     onHistoryGap: recordFixedPoolHistoryGap,

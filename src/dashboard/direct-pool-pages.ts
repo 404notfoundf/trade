@@ -3,6 +3,7 @@ import type { AssetConfig, Config } from "../config.js";
 import { query } from "../db.js";
 import type { PoolMonitorState } from "../market/fixed-pools.js";
 import { solveDirectPoolCandidates } from "../direct-pool/market-registry.js";
+import { positiveWindowCache } from "./positive-window-cache.js";
 import {
   collectPositiveWindows,
   directPoolWindowReadStart,
@@ -96,7 +97,11 @@ function subNav(path: string, range: DirectPoolRange, poolId: string, filters?: 
   return `<nav class="direct-subnav" aria-label="指定池收益页面">${items.map(([href, label]) => `<a href="${directPoolHref(href, range, { ...(poolId ? { pool: poolId } : {}), ...(href === path ? decisionFilterParams(filters) : {}) })}"${path === href ? ' aria-current="page"' : ""}>${label}</a>`).join("")}</nav>`;
 }
 
-function rangeControl(path: string, range: DirectPoolRange, poolId: string, pools: Config["marketRegistry"]["pools"], escapeHtml: Helpers["escapeHtml"], filters?: DecisionFilters): string {
+function directionControl(direction: string): string {
+  return `<label>交易方向<select name="direction"><option value="">全部方向</option><option value="cex_buy_dex_sell"${direction === "cex_buy_dex_sell" ? " selected" : ""}>CEX 买入 · DEX 卖出</option><option value="dex_buy_cex_sell"${direction === "dex_buy_cex_sell" ? " selected" : ""}>DEX 买入 · CEX 卖出</option></select></label>`;
+}
+
+function rangeControl(path: string, range: DirectPoolRange, poolId: string, pools: Config["marketRegistry"]["pools"], escapeHtml: Helpers["escapeHtml"], filters?: DecisionFilters, windowDirection = ""): string {
   const positiveOnly = filters?.positiveOnly ?? false;
   const knownPool = pools.some((pool) => pool.id === poolId);
   const poolOptions = pools.map((pool) => {
@@ -106,7 +111,7 @@ function rangeControl(path: string, range: DirectPoolRange, poolId: string, pool
   }).join("");
   const missingPool = poolId && !knownPool ? `<option value="${escapeHtml(poolId)}" selected>未登记 / 历史池 · ${escapeHtml(poolId.length > 20 ? `${poolId.slice(0, 8)}…${poolId.slice(-6)}` : poolId)}</option>` : "";
   const poolField = `<label>池子<select name="pool"><option value=""${poolId ? "" : " selected"}>所有池</option>${poolOptions}${missingPool}</select></label>`;
-  const decisionFields = filters ? `<label>资产 / 池地址<input type="search" name="assetPool" value="${escapeHtml(filters.assetPool)}" maxlength="128" placeholder="输入资产代码或池地址片段"></label><label>交易方向<select name="direction"><option value="">全部方向</option><option value="cex_buy_dex_sell"${filters.direction === "cex_buy_dex_sell" ? " selected" : ""}>CEX 买入 · DEX 卖出</option><option value="dex_buy_cex_sell"${filters.direction === "dex_buy_cex_sell" ? " selected" : ""}>DEX 买入 · CEX 卖出</option></select></label>` : "";
+  const decisionFields = filters ? `<label>资产 / 池地址<input type="search" name="assetPool" value="${escapeHtml(filters.assetPool)}" maxlength="128" placeholder="输入资产代码或池地址片段"></label>${directionControl(filters.direction)}` : path === "/direct-pools/windows" ? directionControl(windowDirection) : "";
   const dateTimeField = (name: "from" | "to", label: string, date: Date) => {
     return `<input class="direct-datetime-input" type="datetime-local" name="${name}" step="1" value="${escapeHtml(formatUtc8Input(date))}" aria-label="${label}（UTC+8）">`;
   };
@@ -200,12 +205,14 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
   const range = parseDirectPoolRange(url.searchParams);
   const poolId = (url.searchParams.get("pool") ?? "").trim().slice(0, 128);
   const requestedDirection = url.searchParams.get("direction");
+  const selectedDirection = requestedDirection === "cex_buy_dex_sell" || requestedDirection === "dex_buy_cex_sell" ? requestedDirection : "";
   const filters: DecisionFilters | undefined = path === "/direct-pools/decisions" ? {
     positiveOnly: url.searchParams.get("profit") === "positive",
     assetPool: (url.searchParams.get("assetPool") ?? "").trim().slice(0, 128),
-    direction: requestedDirection === "cex_buy_dex_sell" || requestedDirection === "dex_buy_cex_sell" ? requestedDirection : "",
+    direction: selectedDirection,
     poolId,
   } : undefined;
+  const windowDirection = path === "/direct-pools/windows" ? selectedDirection : "";
   const positiveOnly = filters?.positiveOnly ?? false;
   const filterParams = decisionFilterParams(filters);
   const invalidRange = range.invalid ? '<p class="guard-alert">时间范围无效，已回退为最近 1 小时。</p>' : "";
@@ -213,7 +220,7 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
   const header = path === "/direct-pools/window"
     ? `<h2>正收益窗口样本</h2><p><a href="${directPoolHref("/direct-pools", range, poolId ? { pool: poolId } : undefined)}">← 返回收益总览</a></p>`
     : path === "/direct-pools/windows"
-      ? `<h2>全部正收益窗口</h2><p><a href="${directPoolHref("/direct-pools", range, poolId ? { pool: poolId } : undefined)}">← 返回收益总览</a></p>${rangeControl(path, range, poolId, config.marketRegistry.pools, escapeHtml)}${invalidRange}`
+      ? `<h2>全部正收益窗口</h2><p><a href="${directPoolHref("/direct-pools", range, poolId ? { pool: poolId } : undefined)}">← 返回收益总览</a></p>${rangeControl(path, range, poolId, config.marketRegistry.pools, escapeHtml, undefined, windowDirection)}${invalidRange}`
     : `<h2>${path === "/direct-pools/quotes" ? "Exact-In 报价记录" : path === "/direct-pools/decisions" ? "收益明细" : "指定池收益总览"}</h2>${subNav(path, range, poolId, filters)}${rangeControl(path, range, poolId, config.marketRegistry.pools, escapeHtml, filters)}${positiveShortcut}${invalidRange}`;
   if (!dbOnline) return `${header}<p class="guard-alert">数据库不可用，暂时无法读取 Direct Pool 观察数据。</p>${pageStyle()}`;
 
@@ -349,9 +356,9 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
         AND selected.size_usdt=d.size_usdt AND selected.pool_id=?
     )` : "";
     const [statsRows, migrationRows, auditRows] = await Promise.all([
-      query<StatRow[]>(`SELECT COALESCE(SUM(net_profit_usdt > 0),0) positive,COUNT(*) valid,CAST(MAX(net_profit_usdt) AS CHAR) max_net FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND ${validEstimateSql}${poolPredicate}`, [fromStored, toStored, ...poolParameters]),
+      path === "/direct-pools/windows" ? Promise.resolve<StatRow[]>([]) : query<StatRow[]>(`SELECT COALESCE(SUM(net_profit_usdt > 0),0) positive,COUNT(*) valid,CAST(MAX(net_profit_usdt) AS CHAR) max_net FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND ${validEstimateSql}${poolPredicate}`, [fromStored, toStored, ...poolParameters]),
       query<MigrationRow[]>("SELECT applied_at FROM schema_migrations WHERE version=? LIMIT 1", [DIRECT_POOL_POOL_ID_MIGRATION]),
-      query<DirectionAuditSummaryRow[]>(`WITH per_scan AS (
+      path === "/direct-pools/windows" ? Promise.resolve<DirectionAuditSummaryRow[]>([]) : query<DirectionAuditSummaryRow[]>(`WITH per_scan AS (
           SELECT d.scan_id,d.instrument_id,d.chain_index,d.size_usdt,
             MAX(CASE WHEN d.direction='cex_buy_dex_sell' THEN d.pool_id END) cex_pool_id,
             MAX(CASE WHEN d.direction='dex_buy_cex_sell' THEN d.pool_id END) dex_pool_id,
@@ -402,9 +409,17 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
     const coverageComplete = isWindowCoverageComplete(range.from, coverageStart);
     let positiveWindows: ReturnType<typeof collectPositiveWindows> = [];
     if (coverageStart) {
-      const windowRows = await query<WindowSample[]>(`SELECT id,created_at createdAt,instrument_id instrumentId,chain_index chainIndex,pool_id poolId,direction,CAST(size_usdt AS CHAR) sizeUsdt,CAST(net_profit_usdt AS CHAR) netProfitUsdt,valuation_status valuationStatus,selected_quote_id selectedQuoteId FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND pool_id IS NOT NULL AND ${validEstimateSql}${poolPredicate} ORDER BY created_at ASC,id ASC`, [storedTime(directPoolWindowReadStart(range.from, coverageStart), offsetSeconds), toStored, ...poolParameters]);
-      const samples = windowRows.map((row) => ({ ...row, createdAt: actualTime(row.createdAt, offsetSeconds) }));
-      positiveWindows = collectPositiveWindows(samples, range.to, coverageComplete).filter((item) => item.startAt >= range.from && item.startAt < range.to);
+      const cacheKey = JSON.stringify([fromStored.getTime(), toStored.getTime(), offsetSeconds, poolId, windowDirection, coverageStart.getTime(), coverageComplete]);
+      const cachedWindows = positiveWindowCache.get(cacheKey);
+      if (cachedWindows) positiveWindows = cachedWindows;
+      else {
+        const windowDirectionPredicate = windowDirection ? " AND direction = ?" : "";
+        const windowParameters = [storedTime(directPoolWindowReadStart(range.from, coverageStart), offsetSeconds), toStored, ...poolParameters, ...(windowDirection ? [windowDirection] : [])];
+        const windowRows = await query<WindowSample[]>(`SELECT id,created_at createdAt,instrument_id instrumentId,chain_index chainIndex,pool_id poolId,direction,CAST(size_usdt AS CHAR) sizeUsdt,CAST(net_profit_usdt AS CHAR) netProfitUsdt,valuation_status valuationStatus,selected_quote_id selectedQuoteId FROM direct_pool_decision WHERE created_at >= ? AND created_at < ? AND pool_id IS NOT NULL AND ${validEstimateSql}${poolPredicate}${windowDirectionPredicate} ORDER BY created_at ASC,id ASC`, windowParameters);
+        const samples = windowRows.map((row) => ({ ...row, createdAt: actualTime(row.createdAt, offsetSeconds) }));
+        positiveWindows = collectPositiveWindows(samples, range.to, coverageComplete).filter((item) => item.startAt >= range.from && item.startAt < range.to);
+        positiveWindowCache.set(cacheKey, positiveWindows);
+      }
     }
     const audit = directionAudit.map((row) => {
       const samePool = row.cexPoolId !== null && row.cexPoolId === row.dexPoolId;
@@ -442,7 +457,7 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
       const offset = (page - 1) * pageSize;
       const visibleWindows = orderedWindows.slice(offset, offset + pageSize);
       const recordRows = renderWindowRows(visibleWindows);
-      const pageParams = poolId ? { pool: poolId } : undefined;
+      const pageParams = { ...(poolId ? { pool: poolId } : {}), ...(windowDirection ? { direction: windowDirection } : {}) };
       const empty = orderedWindows.length === 0
         ? coverageComplete ? "当前筛选范围没有满足连续性条件的正收益窗口；孤立正收益样本可在收益明细中查看。" : "覆盖起点之后暂无可确认的正收益窗口；边界状态确认前的窗口不会计入摘要。"
         : `第 ${page} 页没有窗口。<a href="${directPoolHref(path, range, pageParams)}">返回第 1 页</a>`;

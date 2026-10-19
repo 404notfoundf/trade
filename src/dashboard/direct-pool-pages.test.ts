@@ -47,3 +47,13 @@ test("pool selector is shared across pages and keeps missing historical pool sel
   assert.match(html, /name="direction"/);
   assert.match(html, /value="dex_buy_cex_sell" selected/);
 });
+
+test("all positive windows page exposes and retains the selected direction filter", async () => {
+  const html = await renderDirectPoolPage({
+    url: new URL("http://localhost/direct-pools/windows?range=24h&pool=byreal-pool&direction=dex_buy_cex_sell"),
+    config: pageConfig, assets: [], dbOnline: false, fixedPools: undefined, helpers,
+  });
+  assert.match(html, /name="direction"/);
+  assert.match(html, /value="dex_buy_cex_sell" selected/);
+  assert.match(html, /value="byreal-pool" selected/);
+});

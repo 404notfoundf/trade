@@ -37,7 +37,7 @@ Meteora DLMM 也由独立 Adapter 订阅固定 LbPair 并用官方 SDK 报价；
 | Solana quote | 使用锁定版本的 Raydium SDK，在一致的 Pool State/Tick Array 快照上本地计算 exact-in。 |
 | CEX/DEX 关联 | `instrument_id` 为跨场所业务主键；地址、交易对和显示 symbol 都只是 listing 属性。 |
 | 稳定币 | 交易候选必须为资产与该链固定报价币的直接池：X Layer 为 USDT0，Solana 为 USDT。USDG/USDC 等池只可观察，观察估值按配置口径标记 1:1 假设。 |
-| 包装资产 | 包装 token 池必须 `observe_only`，理由为 `wrapper_required`；CEX 买入后以 `previewDeposit` 估算可得 wrapper 份额、以 `previewMint` 折算目标份额所需底层资产，DEX 买入后以 `previewRedeem` 折算底层资产。X Layer EVM XNVDA 数量已含 Backed multiplier，不重复相乘；结果仍不可执行。 |
+| 包装资产 | 包装 token 池必须 `observe_only`，理由为 `wrapper_required`；CEX 买入后以 `previewMint` 折算目标份额所需底层资产，DEX 买入后以 `previewRedeem` 折算底层资产。转换率按同一 X Layer 区块读取，不假设包装份额与底层资产恒为 1:1；结果仍不可执行。 |
 | 新鲜度 | 池价格不变不等于失效。连接、回补、RPC 快照和状态版本决定池健康；CEX 继续使用独立订单簿新鲜度规则。 |
 | 触发 | CEX 簿或池状态变化时标记 dirty；每条路线经 200--250ms 合并窗口后报价。每轮只轮换一个配置规模。 |
 | 失败 | 单池失败局部熔断与退避，继续尝试下一优先池。身份失配必须人工修正注册表并显式 re-arm；不得自动恢复。 |
@@ -195,7 +195,7 @@ pools:
 
 不配置真实、已验证的直接池时，该资产不生成 direct-pool 路线；进程正常运行，并报告 `not_configured`。
 
-在 `quote_provider: direct_pool` 下，已登记且 `verified: true` 的 `observe_only` 池会进入只读监控，并按观测规模记录 Exact-In 与同规模 CEX VWAP 观察决策。USDG/USDC 当前明确按 1:1 假设折成 USDT；固定 Gas 预算按配置扣除，收益状态标记 `ASSUMED_1_TO_1`。X Layer Wrapper 通过 `asset()` 校验底层 XNVDA：CEX 买入、存入路径用 `previewMint` 将目标 wrapper 份额折成所需底层资产，DEX 买入、赎回路径用 `previewRedeem` 将 wrapper 份额折成底层资产；EVM XNVDA 余额已反映 Backed multiplier，不再手动重复换算。用于收益换算的预览与 DEX Exact-In 报价使用同一 X Layer 区块；换算失败只阻断 X Layer 收益估算，原始池报价与 Solana 路线独立运行。`direct_pool_observation.simulation_enabled` 打开时，合格的 Solana observe-only 报价会由 `SOLANA_SIMULATION_PRIVATE_KEY` 对应的钱包签名并调用模拟 RPC；缺少钱包库存或手续费余额时记录跳过。模拟不广播，也不会改变 `NOT_EXECUTABLE` 执行资格。池 token decimals 必须在注册表中填写并由链上身份核对确认。
+在 `quote_provider: direct_pool` 下，已登记且 `verified: true` 的 `observe_only` 池会进入只读监控，并按观测规模记录 Exact-In 与同规模 CEX VWAP 观察决策。USDG/USDC 当前明确按 1:1 假设折成 USDT；固定 Gas 预算按配置扣除，收益状态标记 `ASSUMED_1_TO_1`。X Layer Wrapper 通过 `asset()` 校验底层地址是否等于对应 instrument 的 X Layer `chain_assets`，再用 `previewMint` 将目标 wrapper 份额折成所需底层资产，并用 `previewRedeem` 将 wrapper 份额折成底层资产；转换与 DEX Exact-In 报价使用同一 X Layer 区块，不假设 wrapper share 与底层资产恒为 1:1。XNVDA 底层余额已反映 Backed multiplier，不再手动重复换算；wSPCXx/USDG 也保持 `wrapper_required`，不会成为交易候选。换算失败只阻断 X Layer 收益估算，原始池报价与 Solana 路线独立运行。`direct_pool_observation.simulation_enabled` 打开时，合格的 Solana observe-only 报价会由 `SOLANA_SIMULATION_PRIVATE_KEY` 对应的钱包签名并调用模拟 RPC；缺少钱包库存或手续费余额时记录跳过。模拟不广播，也不会改变 `NOT_EXECUTABLE` 执行资格。池 token decimals 必须在注册表中填写并由链上身份核对确认。
 
 ## 5. 运行时架构
 
@@ -260,7 +260,7 @@ interface PoolAdapter {
 ### 5.3 X Layer Uniswap V3 Adapter
 
 - 启动验证 `chainId`、factory、`token0`、`token1`、token decimals、fee tier、QuoterV2 和 Router。
-- WebSocket 监听 `Swap`、`Mint`、`Burn`，断线后通过 RPC 快照和日志回补恢复；沿用池事件的幂等和重组处理。
+- WebSocket 监听 `Swap`、`Mint`、`Burn`；启动或断线重连后，在订阅确认后读取最新 RPC 快照恢复当前池状态，不回放离线期间的历史日志；运行中检测到的 WebSocket 断线仍记录为 history gap，并清理过期的未确认事件。
 - exact-in 报价调用已验证的 `QuoterV2.quoteExactInputSingle`，请求固定为登记的池 token 对与 fee tier。
 - quote 记录 RPC block number/hash；交易模拟与第二阶段执行前必须重新读取并检查版本仍可接受。
 - 网络费使用 Quoter gas estimate 与配置的 gas price 上限/安全系数估算；无法可靠估算即不得进入可执行资格。

@@ -35,7 +35,11 @@ test("existing wrapped and non-pinned pools stay observe-only and produce no can
   assert.equal(registry.dexes.meteora_dlmm_solana?.adapter, "meteora_dlmm");
   assert.deepEqual([registry.dexes.byreal_clmm_solana?.adapter, registry.dexes.byreal_clmm_solana?.program_id], ["byreal_clmm", BYREAL_CLMM_PROGRAM_ADDRESS]);
   assert.deepEqual(registry.pools.map((pool) => [pool.mode, pool.reason]), [
-    ["observe_only", "wrapper_required"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"],
+    ["observe_only", "wrapper_required"], ["observe_only", "wrapper_required"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"], ["observe_only", "quote_asset_not_pinned"],
+  ]);
+  const wspcxx = registry.pools.find((pool) => pool.id === "xspcx-xlayer-wspcxx-usdg-v3")!;
+  assert.deepEqual([wspcxx.enabled, wspcxx.address, wspcxx.token_in_out.asset_address, wspcxx.token_in_out.quote_address, wspcxx.expected_fee_tier], [
+    true, "0x535aabfaf9a6fbc1a04317b98885706dc6bf1650", "0x8e2eed8b8b5e13ea7bf38e50d7821d2c57309072", "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8", 500,
   ]);
   const orca = registry.pools.find((pool) => pool.id === ORCA_XSPCX_USDC_POOL.id)!;
   assert.deepEqual([orca.address, orca.expected_fee_rate, orca.expected_tick_spacing], [ORCA_XSPCX_USDC_POOL.address, 500, 8]);

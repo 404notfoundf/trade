@@ -9,7 +9,6 @@ import { solanaRpcFetch } from "../solana-rpc-logging.js";
 const Q96 = new Decimal(2).pow(96);
 const Q64 = new Decimal(2).pow(64);
 const XLAYER_CONFIRMATION_DEPTH = 5;
-const XLAYER_LOG_BLOCK_RANGE = 100;
 const POOL_SNAPSHOT_INTERVAL_MS = 30_000;
 const RAYDIUM_POOL_STATE_LEN = 1544;
 const RAYDIUM_POOL_STATE_DISCRIMINATOR = createHash("sha256").update("account:PoolState").digest().subarray(0, 8);
@@ -43,11 +42,15 @@ type MonitorOptions = {
   onHistoryGap: (poolId: string, startedAt: number, recoveredAt: number, reason: "websocket_disconnect" | "database_unavailable") => Promise<void>;
   onRevert: (poolId: string, fingerprint: string) => Promise<void>;
   onRevertAfter: (poolId: string, blockNumber: number) => Promise<void>;
-  checkpointBlocks?: Map<string, number>;
   rpcEndpoints?: Map<string, { http: string | null; ws: string | null }>;
 };
 type EvmLog = { address: string; topics: string[]; data: string; blockNumber: string; blockHash: string; transactionHash: string; logIndex: string; removed?: boolean };
 class PoolIdentityError extends Error {}
+class EvmRpcHttpError extends Error {
+  constructor(readonly method: string, readonly status: number) {
+    super(`X Layer RPC ${method} HTTP ${status}`);
+  }
+}
 
 export function initialPoolState(pool: FixedPoolConfig, status: PoolMonitorState["status"] = "not_configured", lastError: string | null = null): PoolMonitorState {
   return {
@@ -114,9 +117,7 @@ async function startEvmPool(pool: FixedPoolConfig, options: MonitorOptions): Pro
   let subscriptionId: string | undefined;
   let hadInitialSync = false;
   let disconnectedAt: number | null = null;
-  const currentHead = Number(BigInt(headResult));
-  const checkpoint = options.checkpointBlocks?.get(pool.id);
-  let lastBlock = Math.min(checkpoint ?? Math.max(0, currentHead - XLAYER_CONFIRMATION_DEPTH), currentHead);
+  let lastBlock = 0;
   let latestPosition = { block: lastBlock, logIndex: Number.MAX_SAFE_INTEGER };
   let serial = Promise.resolve();
   let latest = initialPoolState(pool);
@@ -198,20 +199,10 @@ async function startEvmPool(pool: FixedPoolConfig, options: MonitorOptions): Pro
     });
     latestPosition = { block: blockNumber, logIndex };
   };
-  const backfill = async () => {
+  const syncSnapshot = async () => {
     const head = Number(BigInt(await evmRpc(httpUrl, "eth_blockNumber", []) as string));
     const confirmedHead = Math.max(0, head - XLAYER_CONFIRMATION_DEPTH);
-    const checkpointBlock = Math.min(lastBlock, confirmedHead);
-    await options.onRevertAfter(pool.id, checkpointBlock);
-    lastBlock = checkpointBlock;
-    latestPosition = { block: checkpointBlock, logIndex: Number.MAX_SAFE_INTEGER };
-    for (let from = lastBlock + 1; from <= head; from += XLAYER_LOG_BLOCK_RANGE) {
-      const to = Math.min(head, from + XLAYER_LOG_BLOCK_RANGE - 1);
-      const logs = await evmRpc(httpUrl, "eth_getLogs", [{
-        address: pool.address, fromBlock: "0x" + from.toString(16), toBlock: "0x" + to.toString(16), topics: [eventTopics],
-      }]) as EvmLog[];
-      for (const log of logs) await processLog(log, confirmedHead);
-    }
+    await options.onRevertAfter(pool.id, confirmedHead);
     lastBlock = confirmedHead;
     await saveSnapshot("resync", head);
     if (hadInitialSync && disconnectedAt !== null) {
@@ -233,7 +224,7 @@ async function startEvmPool(pool: FixedPoolConfig, options: MonitorOptions): Pro
     socket.on("open", () => {
       reconnectDelay = 1000;
       lastPongAt = Date.now();
-      emit({ ...latest, status: "unavailable", connectionStatus: "connected", lastError: "X Layer subscription is synchronizing" });
+      emit({ ...latest, status: "unknown", connectionStatus: "connected", lastError: "X Layer subscription is synchronizing" });
       socket?.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["logs", { address: pool.address, topics: [eventTopics] }] }));
       heartbeat = setInterval(() => {
         if (socket?.readyState !== WebSocket.OPEN) return;
@@ -251,7 +242,7 @@ async function startEvmPool(pool: FixedPoolConfig, options: MonitorOptions): Pro
           socket?.close();
         } else {
           subscriptionId = message.result;
-          enqueue(backfill);
+          enqueue(syncSnapshot);
         }
       }
       if (message.params?.result) enqueue(() => processLog(message.params!.result!));
@@ -267,7 +258,7 @@ async function startEvmPool(pool: FixedPoolConfig, options: MonitorOptions): Pro
       reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
     });
   };
-  emit({ ...latest, status: "unavailable", connectionStatus: "connecting", lastError: "Waiting for X Layer WebSocket subscription" });
+  emit({ ...latest, status: "unknown", connectionStatus: "connecting", lastError: "Waiting for X Layer WebSocket subscription" });
   connect();
   finalityTimer = setInterval(() => {
     if (socket?.readyState === WebSocket.OPEN && subscriptionId) enqueue(refreshFinality);
@@ -490,7 +481,7 @@ function readU128LE(data: Buffer, offset: number): bigint {
 
 async function evmRpc<T = unknown>(url: string, method: string, params: unknown[]): Promise<T> {
   const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new Error("X Layer RPC HTTP " + response.status);
+  if (!response.ok) throw new EvmRpcHttpError(method, response.status);
   const payload = await response.json() as { result?: T; error?: { message?: string } };
   if (payload.error) throw new Error(payload.error.message ?? "X Layer RPC " + method + " failed");
   return payload.result as T;

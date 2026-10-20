@@ -100,7 +100,7 @@ export class XLayerWrapperAdapter {
     const rpc = pool.rpc_http;
     const underlying = registry.instruments.find((item) => item.instrument_id === pool.instrument_id)?.chain_assets.find((item) => item.chain === "xlayer");
     if (!rpc || !underlying) throw new Error("X Layer wrapper RPC or underlying asset registration is missing");
-    this.provider = new JsonRpcProvider(rpc);
+    this.provider = new JsonRpcProvider(rpc, 196, { staticNetwork: true });
     this.wrapperAddress = pool.token_in_out.asset_address;
     this.underlyingAddress = underlying.address;
     this.wrapperDecimals = pool.token_in_out.asset_decimals;
@@ -112,7 +112,7 @@ export class XLayerWrapperAdapter {
 
   async verify(): Promise<void> {
     if (this.verified) return;
-    if (BigInt((await this.provider.getNetwork()).chainId) !== 196n) throw new PoolIdentityMismatchError("X Layer wrapper RPC chain ID mismatch");
+    if (BigInt(await this.provider.send("eth_chainId", [])) !== 196n) throw new PoolIdentityMismatchError("X Layer wrapper RPC chain ID mismatch");
     if (await this.provider.getCode(this.wrapperAddress) === "0x") throw new PoolIdentityMismatchError(`X Layer wrapper has no contract code: ${this.poolId}`);
     const block = await this.provider.getBlockNumber();
     const [underlying, wrapperDecimals, underlyingDecimals] = await Promise.all([

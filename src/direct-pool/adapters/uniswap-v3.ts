@@ -12,13 +12,14 @@ export class UniswapV3Adapter implements PoolAdapter {
   private quoteAddress = "";
   private assetDecimals = 0;
   private quoteDecimals = 0;
+  private rpcChainValidated = false;
 
   constructor(private readonly registry: MarketRegistry, pool: RegisteredPool) {
     const dex = registry.dexes[pool.dex];
     const rpc = pool.rpc_http;
     if (!dex || !rpc) throw new Error("X Layer direct-pool RPC or DEX registration is not configured");
     this.dex = dex;
-    this.provider = new JsonRpcProvider(rpc);
+    this.provider = new JsonRpcProvider(rpc, 196, { staticNetwork: true });
   }
 
   async verify(pool: RegisteredPool): Promise<void> {
@@ -29,7 +30,10 @@ export class UniswapV3Adapter implements PoolAdapter {
     this.assetAddress = pool.token_in_out.asset_address;
     this.quoteAddress = pool.token_in_out.quote_address;
     if (pool.mode === "trade_candidate" && (!sameAddress(this.assetAddress, asset.address) || !sameAddress(this.quoteAddress, asset.quote_asset.address))) throw new Error("X Layer trade candidate does not match the registered direct token pair");
-    if (BigInt((await this.provider.getNetwork()).chainId) !== 196n) throw new PoolIdentityMismatchError("X Layer RPC chain ID mismatch");
+    if (!this.rpcChainValidated) {
+      if (BigInt(await this.provider.send("eth_chainId", [])) !== 196n) throw new PoolIdentityMismatchError("X Layer RPC chain ID mismatch");
+      this.rpcChainValidated = true;
+    }
     const block = await this.provider.getBlockNumber();
     const [factory, token0, token1, fee] = await Promise.all([
       readAddress(this.provider, pool.address, evmPoolInterface, "factory", block),

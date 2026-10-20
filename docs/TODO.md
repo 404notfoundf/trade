@@ -18,7 +18,8 @@
 
 - [ ] 只有在采集器与 Dashboard 需要跨进程共享高频最新盘口/池状态，或需要多实例协调时再评估 Redis；当前单实例使用进程内缓存、MySQL 保存历史报价与决策即可。
 - [ ] 按目标规模持续验证 USDG、USDC、USDT 间的真实兑换/赎回成本与可用深度；当前观察收益按明确标注的 `USDG/USDC = 1 USDT` 假设计算，不代表可成交 USDT 收益。2026-10-14 的一次 X Layer QuoterV2 抽查确认 USDT0/USDG、USDT0/USDC、USDG/USDC 三个 0.01% 池存在且 $100/$500 Exact-In 可报价，但不是持续成本模型。
-- [ ] 将固定 Gas 预算替换为实时 OKB/SOL 价格折算与链上交易费估算；当前预算为 X Layer 两方向各 0.05 USDT（Wrapper + Swap），Solana 每次 Swap 0.01 USDT。替换时保留预算值与实际估算的来源、时间和差异记录。
+- [x] Solana 观察 Gas 改为按每笔签名 5,000 lamports 乘带时效校验的 OKX SOL-USDT 中间价估算；不含优先费或 ATA 租金，价格不可用时不计算净收益。
+- [ ] 将 X Layer 固定 Gas 预算替换为实时 OKB 价格折算，并在需要时基于具体交易消息估算链上费用；保留估算来源与时间。Solana 的交易级费用及 ATA 租金仍由独立模拟成本方案处理。
 - [ ] 如后续需要逐笔 swap 审计或回测，将原始池事件归档到适合高频写入的存储；MySQL 当前只保留按池采样的状态历史。
 - [ ] 若固定池数量增长或历史分析负载明显增加，再评估按分钟/小时聚合或分区；当前每池最多每 10 秒采样并保留 7 天。
 - [x] 实现 X Layer QuoterV2 固定金额 `Exact-In`，结果携带 block/hash 与池状态指纹；报价使用指定 token 对和 fee tier。
@@ -27,7 +28,7 @@
 - [x] 接入注册表固定的 XSPCX/USDC Meteora DLMM observe-only 池：锁定 LbPair/program/mints/decimals/bin step；使用官方 SDK bin-array exact-in、拒绝 partial fill、校验 unsigned swap 并仅模拟；Token-2022 例外精确限定到该 pool/program/mint 组合。Orca 与 Meteora 现由各自 Adapter 订阅池账户，断线 fail-closed，重连先快照/复核再触发报价。
 - [ ] 在已配置主网 RPC/WS 环境完成人工 Meteora 双向 quote、断线恢复和 simulation-only 验收；CI 单测不依赖主网或密钥。
 - [ ] 将 Raydium Pool State、配置、bitmap 和 Tick Array 改为单一 RPC context 校验；当前 SDK 多次 RPC 读取期间 slot 会正常推进，因此 slot 仅作读取完成标记，报价/构建/模拟通过状态指纹检查变化。
-- [x] 在 `direct_pool` 模式观察已登记的 `observe_only` 池：记录 raw Exact-In、状态版本、同规模 CEX VWAP、毛收益、CEX 手续费、固定 Gas 预算、正负观察净收益与 ROI；X Layer 按存入/赎回方向校验 ERC-4626 `asset()` 并调用 `previewDeposit`、`previewMint` 或 `previewRedeem`，不重复应用 EVM multiplier；结果写入独立决策表且保持 `NOT_EXECUTABLE`。
+- [x] 在 `direct_pool` 模式观察已登记的 `observe_only` 池：记录 raw Exact-In、状态版本、同规模 CEX VWAP、毛收益、CEX 手续费、Gas 预算/基础费估算、正负观察净收益与 ROI；X Layer 按存入/赎回方向校验 ERC-4626 `asset()` 并调用 `previewDeposit`、`previewMint` 或 `previewRedeem`，不重复应用 EVM multiplier；结果写入独立决策表且保持 `NOT_EXECUTABLE`。
 - [ ] 对两链 exact-in 与独立链上只读报价执行同池、同规模交叉验证；目前没有活跃的资产/固定报价币候选，Solana Raydium 与 Meteora 稳定币池仍需人工核验报价对账。完成前观察收益保持 1:1 假设标签，不作为可实现净收益，数据不写入旧 Aggregator `quote_observation` / `opportunity` 表。
 - [x] 固定池决策写入独立 direct-pool 表并固定为 `NOT_EXECUTABLE`；两链 unsigned swap 构造和不广播模拟接口已实现。Solana observe-only 模拟由 `config.yaml` 开关控制，并用独立 `SOLANA_SIMULATION_PRIVATE_KEY` 签名。
 

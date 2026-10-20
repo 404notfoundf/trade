@@ -7,7 +7,9 @@ marketdata:
   coalesce_window_ms: 250
   direct_quote_retention_days: 7
   direct_decision_retention_days: 180
-# Fixed USDT gas budgets for read-only direct-pool profit observations.
+# X Layer read-only observations use fixed USDT gas budgets.
+# Solana read-only observations estimate the 5,000-lamport base fee from OKX SOL-USDT;
+# solana_swap_gas_usdt is retained for configuration compatibility and does not affect that estimate.
 # Per-pool Solana RPC overrides are configured beside each pool in market-registry.yaml;
 # Byreal uses SOLANA_RPC_URL/WS unless its optional pool-specific HTTP/WS pair is enabled there.
 direct_pool_observation:

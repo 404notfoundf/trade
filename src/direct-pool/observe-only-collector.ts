@@ -4,7 +4,7 @@ import Decimal from "decimal.js";
 import { Keypair } from "@solana/web3.js";
 import type { AssetConfig, Config } from "../config.js";
 import { bookObservationStale, floorToStep, vwap, type Instrument } from "../market/market.js";
-import type { Book } from "../market/okx.js";
+import { estimateSolanaBaseFeeUsdt, okxSolUsdtTicker, SOLANA_BASE_FEE_LAMPORTS, type Book } from "../market/okx.js";
 import type { PoolMonitorState } from "../market/fixed-pools.js";
 import { logger } from "../logger.js";
 import { calculateProfit } from "../market/profit-calculation.js";
@@ -39,6 +39,7 @@ export const messageOf = (error: unknown) => error instanceof Error ? error.mess
 export const directDirection = (direction: Direction) => direction === "cex_buy_dex_sell" ? "asset_to_quote" as const : "quote_to_asset" as const;
 export const rawAmount = (amount: Decimal, decimals: number) => BigInt(amount.mul(new Decimal(10).pow(decimals)).floor().toFixed(0));
 const solanaQuoteLogHeartbeatMs = 60_000;
+// shortcut: one signature, no priority fee or ATA rent; use final-message fees when exact execution cost is needed.
 const lastSolanaQuoteLogs = new Map<string, { signature: string; loggedAt: number; suppressed: number; changed: boolean }>();
 
 export class ObserveOnlyCollector {
@@ -257,8 +258,24 @@ export class ObserveOnlyCollector {
     let net: Decimal | null = null;
     let invested: Decimal | null = null;
     let calculation: ReturnType<typeof calculateProfit> | null = null;
-    const gasBudget = new Decimal(pool.chain === "solana" ? this.options.observationGas.solanaSwapGasUsdt
-      : direction === "cex_buy_dex_sell" ? this.options.observationGas.xlayerWrapThenSwapGasUsdt : this.options.observationGas.xlayerSwapThenUnwrapGasUsdt);
+    let gasBudget: Decimal | null = null;
+    let gasSource = "config.direct_pool_observation";
+    let solanaGasPricing: Record<string, string | number> | null = null;
+    let gasPriceFailure: string | null = null;
+    if (pool.chain === "solana") {
+      gasSource = "okx_public_ticker:SOL-USDT";
+      try {
+        const ticker = await okxSolUsdtTicker();
+        gasBudget = estimateSolanaBaseFeeUsdt(ticker.midPx);
+        solanaGasPricing = {
+          feeLamports: SOLANA_BASE_FEE_LAMPORTS.toString(), bidPx: ticker.bidPx.toString(), askPx: ticker.askPx.toString(), midPx: ticker.midPx.toString(),
+          sourceAt: ticker.sourceAt, receivedAt: ticker.receivedAt,
+        };
+      } catch (error) { gasPriceFailure = `SOLANA_GAS_PRICE_UNAVAILABLE: ${messageOf(error)}`; }
+    } else {
+      gasBudget = new Decimal(direction === "cex_buy_dex_sell"
+        ? this.options.observationGas.xlayerWrapThenSwapGasUsdt : this.options.observationGas.xlayerSwapThenUnwrapGasUsdt);
+    }
     const rebalanceCost = asset.rebalanceCostUsdtPerTrade === undefined ? null : new Decimal(asset.rebalanceCostUsdtPerTrade);
     let conversion: Record<string, string> = {};
     let underlyingRaw = direction === "cex_buy_dex_sell" ? quote.amountInRaw : quote.amountOutRaw;
@@ -312,17 +329,18 @@ export class ObserveOnlyCollector {
             direction, cexNotionalUsdt: cexFill.notional, dexQuoteAmountUsdt: quoteAmount, valuationStatus: "ASSUMED",
             costs: [
               { kind: "cex_fee", amountUsdt: cexFee, source: "cex_fee_rate" },
-              { kind: "network_fee", amountUsdt: gasBudget, source: "config.direct_pool_observation" },
+              { kind: "network_fee", amountUsdt: gasBudget, source: gasSource },
               ...(rebalanceCost === null ? [] : [{ kind: "rebalance" as const, amountUsdt: rebalanceCost, source: "config.rebalanceCostUsdtPerTrade" }]),
             ],
           });
           gross = calculation.grossProfitUsdt;
           net = calculation.netProfitUsdt;
           invested = calculation.investedUsdt;
-          if (calculation.uncomputableReason) reason = `PROFIT_CALCULATION_${calculation.uncomputableReason}`;
+          if (calculation.uncomputableReason) reason = gasPriceFailure ?? `PROFIT_CALCULATION_${calculation.uncomputableReason}`;
         }
       }
     }
+    if (gasPriceFailure && reason !== gasPriceFailure) reason = reason ? `${gasPriceFailure}; ${reason}` : gasPriceFailure;
     const highImpact = new Decimal(quote.priceImpactPercent).abs().gt(this.options.guardrails.maxDexPriceImpactPercent);
     const simulation = await this.simulateObservedSwap(route, direction, size, quote, net, invested, reason, highImpact);
     if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) return;
@@ -337,8 +355,8 @@ export class ObserveOnlyCollector {
       selectedQuoteId: quoteId, cexBookAt: book ? new Date(book.exchangeTime) : null, cexReceivedAt: book ? new Date(book.receivedAt) : null,
       cexSeqId: book?.seqId ?? null, cexBid: book?.bids[0]?.price ?? null, cexAsk: book?.asks[0]?.price ?? null,
       cexVwap: cexFill?.vwap.toString() ?? null, cexFeeUsdt: cexFee?.toString() ?? null,
-      dexNetworkFeeUsdt: null, gasBudgetUsdt: gasBudget.toString(),
-      valuationInputs: { quoteMint: pool.token_in_out.quote_address, quoteToUsdt: "ASSUMED_1_TO_1", wrapper: conversion, cex: cexSnapshot, cexBookLiveness: book ? { receivedAt: book.receivedAt, exchangeTime: book.exchangeTime, streamAliveAt: book.streamAliveAt ?? null } : null, assetUiMultiplier: quote.assetUiMultiplier, backedMultiplierApplied: pool.chain === "xlayer" ? null : "1", gasBudgetUsdt: gasBudget.toString(), gasSource: "config.direct_pool_observation", rebalanceCostUsdt: rebalanceCost?.toString() ?? null, costBreakdown: calculation?.costBreakdown ?? [], calculationReasonCode: calculation?.uncomputableReason ?? null, priceImpactPercent: quote.priceImpactPercent },
+      dexNetworkFeeUsdt: null, gasBudgetUsdt: gasBudget?.toString() ?? null,
+      valuationInputs: { quoteMint: pool.token_in_out.quote_address, quoteToUsdt: "ASSUMED_1_TO_1", wrapper: conversion, cex: cexSnapshot, cexBookLiveness: book ? { receivedAt: book.receivedAt, exchangeTime: book.exchangeTime, streamAliveAt: book.streamAliveAt ?? null } : null, assetUiMultiplier: quote.assetUiMultiplier, backedMultiplierApplied: pool.chain === "xlayer" ? null : "1", gasBudgetUsdt: gasBudget?.toString() ?? null, gasSource, solanaGasPricing, rebalanceCostUsdt: rebalanceCost?.toString() ?? null, costBreakdown: calculation?.costBreakdown ?? [], calculationReasonCode: calculation?.uncomputableReason ?? null, priceImpactPercent: quote.priceImpactPercent },
       grossProfitUsdt: gross?.toString() ?? null, netProfitUsdt: net?.toString() ?? null,
       roi: calculation?.roi?.toString() ?? null,
       valuationStatus: "ASSUMED_1_TO_1",

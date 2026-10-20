@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import Decimal from "decimal.js";
 import WebSocket from "ws";
 
 export type Level = { price: string; size: string };
@@ -66,6 +67,55 @@ export async function okxPublicGet<T>(path: string): Promise<T> {
   const json = await response.json() as { code: string; msg: string; data: T };
   if (json.code !== "0") throw new Error(`OKX public API ${json.code}: ${json.msg}`);
   return json.data;
+}
+
+export type OkxPublicTicker = { bidPx: Decimal; askPx: Decimal; midPx: Decimal; sourceAt: number; receivedAt: number };
+type RawOkxPublicTicker = { instId: string; bidPx: string; askPx: string; ts: string };
+type CachedSolUsdtTicker = { value: OkxPublicTicker; expiresAt: number } | { error: string; expiresAt: number };
+export const SOLANA_BASE_FEE_LAMPORTS = 5_000n;
+const solUsdtTickerTtlMs = 30_000;
+const solUsdtTickerMaxAgeMs = 60_000;
+let solUsdtTickerCache: CachedSolUsdtTicker | undefined;
+let solUsdtTickerRequest: Promise<OkxPublicTicker> | undefined;
+
+export async function okxSolUsdtTicker(): Promise<OkxPublicTicker> {
+  const now = Date.now();
+  if (solUsdtTickerCache && now < solUsdtTickerCache.expiresAt) {
+    if ("error" in solUsdtTickerCache) throw new Error(solUsdtTickerCache.error);
+    const cached = solUsdtTickerCache.value;
+    if (now - cached.sourceAt <= solUsdtTickerMaxAgeMs && cached.sourceAt <= now + 5_000) return cached;
+    solUsdtTickerCache = undefined;
+  }
+  if (solUsdtTickerRequest) return solUsdtTickerRequest;
+  const request = (async () => {
+    try {
+      const rows = await okxPublicGet<RawOkxPublicTicker[]>("/api/v5/market/ticker?instId=SOL-USDT");
+      const row = rows[0];
+      if (!row || row.instId !== "SOL-USDT") throw new Error("OKX SOL-USDT ticker is unavailable");
+      const bidPx = new Decimal(row.bidPx);
+      const askPx = new Decimal(row.askPx);
+      const sourceAt = Number(row.ts);
+      const receivedAt = Date.now();
+      if (!bidPx.isFinite() || !askPx.isFinite() || !bidPx.gt(0) || !askPx.gte(bidPx)
+        || !Number.isSafeInteger(sourceAt) || sourceAt > receivedAt + 5_000 || receivedAt - sourceAt > solUsdtTickerMaxAgeMs) {
+        throw new Error("OKX SOL-USDT ticker is invalid or stale");
+      }
+      const value = { bidPx, askPx, midPx: bidPx.plus(askPx).div(2), sourceAt, receivedAt };
+      solUsdtTickerCache = { value, expiresAt: receivedAt + solUsdtTickerTtlMs };
+      return value;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown OKX SOL-USDT ticker error";
+      solUsdtTickerCache = { error: message, expiresAt: Date.now() + 5_000 };
+      throw error;
+    }
+  })();
+  solUsdtTickerRequest = request;
+  try { return await request; }
+  finally { if (solUsdtTickerRequest === request) solUsdtTickerRequest = undefined; }
+}
+
+export function estimateSolanaBaseFeeUsdt(solUsdtMidPx: Decimal): Decimal {
+  return new Decimal(SOLANA_BASE_FEE_LAMPORTS.toString()).div(1_000_000_000).mul(solUsdtMidPx);
 }
 
 async function dexSignedGet<T>(path: string, credentials: Credentials, label: string, onResponse?: (timing: DexQuoteTiming) => void, reserved?: Promise<void>): Promise<T> {

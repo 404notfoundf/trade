@@ -195,7 +195,7 @@ pools:
 
 不配置真实、已验证的直接池时，该资产不生成 direct-pool 路线；进程正常运行，并报告 `not_configured`。
 
-在 `quote_provider: direct_pool` 下，已登记且 `verified: true` 的 `observe_only` 池会进入只读监控，并按观测规模记录 Exact-In 与同规模 CEX VWAP 观察决策。USDG/USDC 当前明确按 1:1 假设折成 USDT；固定 Gas 预算按配置扣除，收益状态标记 `ASSUMED_1_TO_1`。X Layer Wrapper 通过 `asset()` 校验底层地址是否等于对应 instrument 的 X Layer `chain_assets`，再用 `previewMint` 将目标 wrapper 份额折成所需底层资产，并用 `previewRedeem` 将 wrapper 份额折成底层资产；转换与 DEX Exact-In 报价使用同一 X Layer 区块，不假设 wrapper share 与底层资产恒为 1:1。XNVDA 底层余额已反映 Backed multiplier，不再手动重复换算；wSPCXx/USDG 也保持 `wrapper_required`，不会成为交易候选。换算失败只阻断 X Layer 收益估算，原始池报价与 Solana 路线独立运行。`direct_pool_observation.simulation_enabled` 打开时，合格的 Solana observe-only 报价会由 `SOLANA_SIMULATION_PRIVATE_KEY` 对应的钱包签名并调用模拟 RPC；缺少钱包库存或手续费余额时记录跳过。模拟不广播，也不会改变 `NOT_EXECUTABLE` 执行资格。池 token decimals 必须在注册表中填写并由链上身份核对确认。
+在 `quote_provider: direct_pool` 下，已登记且 `verified: true` 的 `observe_only` 池会进入只读监控，并按观测规模记录 Exact-In 与同规模 CEX VWAP 观察决策。USDG/USDC 当前明确按 1:1 假设折成 USDT；X Layer 固定 Gas 预算按配置扣除，Solana 按每笔签名 5,000 lamports 基础费乘 OKX SOL-USDT 中间价估算，价格最多缓存 30 秒且最大允许年龄为 60 秒；价格不可用时保留报价但不计算净收益。Solana 估算不含优先费或 ATA 租金，收益估值状态标记 `ASSUMED_1_TO_1`。X Layer Wrapper 通过 `asset()` 校验底层地址是否等于对应 instrument 的 X Layer `chain_assets`，再用 `previewMint` 将目标 wrapper 份额折成所需底层资产，并用 `previewRedeem` 将 wrapper 份额折成底层资产；转换与 DEX Exact-In 报价使用同一 X Layer 区块，不假设 wrapper share 与底层资产恒为 1:1。XNVDA 底层余额已反映 Backed multiplier，不再手动重复换算；wSPCXx/USDG 也保持 `wrapper_required`，不会成为交易候选。换算失败只阻断 X Layer 收益估算，原始池报价与 Solana 路线独立运行。`direct_pool_observation.simulation_enabled` 打开时，合格的 Solana observe-only 报价会由 `SOLANA_SIMULATION_PRIVATE_KEY` 对应的钱包签名并调用模拟 RPC；缺少钱包库存或手续费余额时记录跳过。模拟不广播，也不会改变 `NOT_EXECUTABLE` 执行资格。池 token decimals 必须在注册表中填写并由链上身份核对确认。
 
 ## 5. 运行时架构
 
@@ -323,7 +323,7 @@ Raydium 固定监听器只解析 Raydium CLMM `PoolState`；不得复用来读�
 - CEX 手续费、DEX 协议费（已反映于 quote）和 Adapter 网络费；
 - 稳定币估值、multiplier、预置库存和 instrument/chain 风险限额。
 
-候选交易路线的净收益必须基于已核验的估值和所有已知成本。观察路线另行保存假设收益：扣除 CEX 手续费和配置的固定 Gas 预算，估值标记 `ASSUMED_1_TO_1`；CEX 深度不足、订单簿变化或 Wrapper 预览失败时只保存报价并记录收益阻断原因。USDG/USDC 真实兑换成本与 OKB/SOL 实时 Gas 折算仍待接入，因此观察收益不代表可成交净收益。
+候选交易路线的净收益必须基于已核验的估值和所有已知成本。观察路线另行保存假设收益：扣除 CEX 手续费、X Layer 配置的固定 Gas 预算，或 Solana 单签名基础费的 SOL-USDT 估值；估值标记 `ASSUMED_1_TO_1`。CEX 深度不足、订单簿变化、Wrapper 预览失败或 SOL-USDT 价格不可用时只保存报价并记录收益阻断原因。Solana 优先费、ATA 租金、USDG/USDC 真实兑换成本及 X Layer 实时 Gas 折算仍未纳入，因此观察收益不代表可成交净收益。
 
 ### 7.2 成交前复核（第二阶段的强制契约）
 

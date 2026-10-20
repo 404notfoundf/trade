@@ -8,7 +8,7 @@ import { solanaRpcFetch } from "../../solana-rpc-logging.js";
 import { BYREAL_CLMM_PROGRAM_ADDRESS, BYREAL_XSPCX_USDC_POOL, type MarketRegistry, type RegisteredPool } from "../market-registry.js";
 import { simulateSolanaSwap } from "../raydium-simulator.js";
 import { PoolIdentityMismatchError, UnsupportedTokenError, assertExecutionInput, byrealQuotePerAsset, errorMessage, expectedDecimals, extensionName, impactFromMarginalPrice, isScopedToken2022Pool, minimumOut, readSolanaTokenState, solanaPairMatches, startSolanaAccountWatch, validateSolanaTokenSupport } from "../pool-adapters.js";
-import type { ExactInQuote, PoolAdapter, PoolWatchCallbacks, QuoteInput, SolanaMintState, SwapBuildInput, SwapSimulationResult, UnsignedSwap } from "../pool-adapters.js";
+import type { ExactInQuote, PoolAdapter, PoolWatchCallbacks, QuoteInput, SolanaMintState, SolanaTokenState, SwapBuildInput, SwapSimulationResult, UnsignedSwap } from "../pool-adapters.js";
 
 export class ByrealClmmAdapter implements PoolAdapter {
   readonly stateSource = "adapter_watch" as const;
@@ -93,8 +93,10 @@ export class ByrealClmmAdapter implements PoolAdapter {
     }
   }
 
-  async getAssetUiMultiplier(pool: RegisteredPool): Promise<string> {
-    const state = await readSolanaTokenState(this.connection, pool);
+  async readSolanaTokenState(pool: RegisteredPool): Promise<SolanaTokenState> { return readSolanaTokenState(this.connection, pool); }
+
+  async getAssetUiMultiplier(pool: RegisteredPool, tokenState?: SolanaTokenState): Promise<string> {
+    const state = tokenState ?? await this.readSolanaTokenState(pool);
     const asset = state.mints.get(pool.token_in_out.asset_address);
     if (!asset) throw new PoolIdentityMismatchError("Byreal registered asset mint is missing");
     return this.validateToken(pool, asset, state.blockTimestamp).uiMultiplier;
@@ -148,7 +150,7 @@ export class ByrealClmmAdapter implements PoolAdapter {
     quoteToken: ReturnType<ByrealClmmAdapter["validateToken"]>;
   }> {
     const poolInfo = await this.loadPoolInfo(pool);
-    const tokenState = await readSolanaTokenState(this.connection, pool);
+    const tokenState = input.solanaTokenState ?? await this.readSolanaTokenState(pool);
     const assetToken = this.validateToken(pool, tokenState.mints.get(pool.token_in_out.asset_address)!, tokenState.blockTimestamp);
     const quoteToken = this.validateToken(pool, tokenState.mints.get(pool.token_in_out.quote_address)!, tokenState.blockTimestamp);
     if (assetToken.mint.decimals !== pool.token_in_out.asset_decimals || quoteToken.mint.decimals !== pool.token_in_out.quote_decimals) {

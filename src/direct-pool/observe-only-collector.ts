@@ -113,7 +113,9 @@ export class ObserveOnlyCollector {
         adapterState.retryDelayMs = 1_000;
         this.options.onHealth(pool.id, "healthy");
       }
-      const assetUiMultiplier = new Decimal(await adapterState.adapter.getAssetUiMultiplier(pool));
+      const tokenState = pool.chain === "solana" ? await adapterState.adapter.readSolanaTokenState?.(pool) : undefined;
+      if (pool.chain === "solana" && !tokenState) throw new Error("Solana pool adapter cannot read token state");
+      const assetUiMultiplier = new Decimal(await adapterState.adapter.getAssetUiMultiplier(pool, tokenState));
       if (!assetUiMultiplier.isFinite() || !assetUiMultiplier.gt(0)) throw new Error("Asset UI multiplier is invalid");
       const quoteAmount = new Decimal(size);
       const amountByDirection: Array<{ direction: ExactInQuote["direction"]; amountInRaw: bigint; expectedAssetUiMultiplier?: string }> = [
@@ -149,6 +151,7 @@ export class ObserveOnlyCollector {
         try {
           const quote = await adapterState.adapter.quoteExactIn(pool, {
             ...input, slippageBps: this.options.slippageBps ?? 50,
+            solanaTokenState: tokenState,
             xlayerSnapshot: pool.chain === "xlayer" && state.pool ? state.pool : undefined,
           });
           if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) {

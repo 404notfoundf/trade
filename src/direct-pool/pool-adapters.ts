@@ -56,7 +56,8 @@ export type ExactInQuote = {
   mintTokenPrograms?: { asset: string; quote: string };
 };
 export type XLayerQuoteSnapshot = Pick<PoolMonitorState, "blockNumber" | "blockHash" | "sqrtPriceRaw" | "observedAt">;
-export type QuoteInput = { direction: ExactInQuote["direction"]; amountInRaw: bigint; slippageBps: number; expectedAssetUiMultiplier?: string; xlayerSnapshot?: XLayerQuoteSnapshot };
+export type SolanaTokenState = { mints: Map<string, SolanaMintState>; blockTimestamp: bigint };
+export type QuoteInput = { direction: ExactInQuote["direction"]; amountInRaw: bigint; slippageBps: number; expectedAssetUiMultiplier?: string; solanaTokenState?: SolanaTokenState; xlayerSnapshot?: XLayerQuoteSnapshot };
 export type SwapBuildInput = { quote: ExactInQuote; wallet: string; deadlineSeconds?: number; simulationOnly?: boolean };
 export type UnsignedSwap = {
   chain: "xlayer" | "solana"; poolId: string; direction: ExactInQuote["direction"]; wallet: string;
@@ -90,7 +91,8 @@ export function usableXLayerQuoteSnapshot(snapshot?: XLayerQuoteSnapshot, now = 
 export interface PoolAdapter {
   stateSource: "fixed_monitor" | "adapter_watch";
   verify(pool: RegisteredPool): Promise<void>;
-  getAssetUiMultiplier(pool: RegisteredPool): Promise<string>;
+  readSolanaTokenState?(pool: RegisteredPool): Promise<SolanaTokenState>;
+  getAssetUiMultiplier(pool: RegisteredPool, tokenState?: SolanaTokenState): Promise<string>;
   quoteExactIn(pool: RegisteredPool, input: QuoteInput): Promise<ExactInQuote>;
   buildSwap(pool: RegisteredPool, input: SwapBuildInput): Promise<UnsignedSwap>;
   simulateSwap(pool: RegisteredPool, swap: UnsignedSwap, signer?: Keypair): Promise<SwapSimulationResult>;
@@ -193,7 +195,7 @@ export function assertUniswapSwapMatchesRegistry(pool: RegisteredPool, dex: NonN
     || BigInt(params.sqrtPriceLimitX96) !== 0n) throw new Error("Unsigned X Layer swap calldata does not match the pinned pool and quote");
 }
 
-export async function readSolanaTokenState(connection: Connection, pool: RegisteredPool): Promise<{ mints: Map<string, SolanaMintState>; blockTimestamp: bigint }> {
+export async function readSolanaTokenState(connection: Connection, pool: RegisteredPool): Promise<SolanaTokenState> {
   const assetKey = new PublicKey(pool.token_in_out.asset_address);
   const quoteKey = new PublicKey(pool.token_in_out.quote_address);
   const { value } = await connection.getMultipleAccountsInfoAndContext([assetKey, quoteKey, SYSVAR_CLOCK_PUBKEY], "confirmed");

@@ -8,7 +8,7 @@ import { solanaRpcFetch } from "../../solana-rpc-logging.js";
 import type { MarketRegistry, RegisteredPool } from "../market-registry.js";
 import { simulateSolanaSwap } from "../raydium-simulator.js";
 import { PoolIdentityMismatchError, UnsupportedTokenError, assertExecutionInput, createSolanaSimulationTransaction, errorMessage, expectedDecimals, extensionName, fingerprintRaydiumState, impactFromMarginalPrice, isScopedToken2022Pool, jsonSafe, minimumOut, readSolanaTokenState, solanaPairMatches, validateSolanaTokenSupport } from "../pool-adapters.js";
-import type { ExactInQuote, PoolAdapter, QuoteInput, SolanaMintState, SwapBuildInput, SwapSimulationResult, UnsignedSwap } from "../pool-adapters.js";
+import type { ExactInQuote, PoolAdapter, QuoteInput, SolanaMintState, SolanaTokenState, SwapBuildInput, SwapSimulationResult, UnsignedSwap } from "../pool-adapters.js";
 
 export class RaydiumClmmAdapter implements PoolAdapter {
   readonly stateSource = "fixed_monitor" as const;
@@ -36,7 +36,7 @@ export class RaydiumClmmAdapter implements PoolAdapter {
 
   async verify(pool: RegisteredPool): Promise<void> {
     const snapshot = await (await this.sdk()).clmm.getRpcClmmPoolInfo({ poolId: pool.address });
-    const tokenState = await this.readTokenState(pool);
+    const tokenState = await this.readSolanaTokenState(pool);
     const mintA = tokenState.mints.get(snapshot.mintA.toBase58());
     const mintB = tokenState.mints.get(snapshot.mintB.toBase58());
     const asset = this.registry.instruments.find((item) => item.instrument_id === pool.instrument_id)?.chain_assets.find((item) => item.chain === "solana");
@@ -53,8 +53,10 @@ export class RaydiumClmmAdapter implements PoolAdapter {
     this.validateTokenSupport(pool, mintB, tokenState.blockTimestamp);
   }
 
-  async getAssetUiMultiplier(pool: RegisteredPool): Promise<string> {
-    const state = await this.readTokenState(pool);
+  async readSolanaTokenState(pool: RegisteredPool): Promise<SolanaTokenState> { return readSolanaTokenState(this.connection, pool); }
+
+  async getAssetUiMultiplier(pool: RegisteredPool, tokenState?: SolanaTokenState): Promise<string> {
+    const state = tokenState ?? await this.readSolanaTokenState(pool);
     const asset = state.mints.get(pool.token_in_out.asset_address);
     if (!asset) throw new PoolIdentityMismatchError("Raydium registered asset mint is missing");
     return this.validateTokenSupport(pool, asset, state.blockTimestamp).uiMultiplier;
@@ -65,7 +67,7 @@ export class RaydiumClmmAdapter implements PoolAdapter {
     const { poolInfo, computePoolInfo, tickData } = await (await this.sdk()).clmm.getPoolInfoFromRpc(pool.address);
     const after = await this.connection.getSlot("confirmed");
     if (poolInfo.programId !== this.dex.program_id) throw new PoolIdentityMismatchError("Raydium quote rejected: unexpected CLMM program");
-    const tokenState = await this.readTokenState(pool);
+    const tokenState = input.solanaTokenState ?? await this.readSolanaTokenState(pool);
     const mintA = tokenState.mints.get(poolInfo.mintA.address);
     const mintB = tokenState.mints.get(poolInfo.mintB.address);
     if (!mintA || !mintB || mintA.mint.decimals !== poolInfo.mintA.decimals || mintB.mint.decimals !== poolInfo.mintB.decimals
@@ -112,8 +114,6 @@ export class RaydiumClmmAdapter implements PoolAdapter {
         assetTokenProgram: assetToken.owner.toBase58(), quoteTokenProgram: quoteToken.owner.toBase58(), assetExtensions: assetToken.extensions.map(extensionName) },
     };
   }
-
-  private readTokenState(pool: RegisteredPool) { return readSolanaTokenState(this.connection, pool); }
 
   private validateTokenSupport(pool: RegisteredPool, state: SolanaMintState, blockTimestamp: bigint) {
     return validateSolanaTokenSupport(pool, state, blockTimestamp, "raydium_clmm", this.dex.program_id);

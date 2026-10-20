@@ -9,7 +9,7 @@ import { solanaRpcFetch } from "../../solana-rpc-logging.js";
 import { ORCA_WHIRLPOOL_PROGRAM_ADDRESS, ORCA_XSPCX_USDC_POOL, type MarketRegistry, type RegisteredPool } from "../market-registry.js";
 import { simulateSolanaSwap } from "../raydium-simulator.js";
 import { PoolIdentityMismatchError, UnsupportedTokenError, assertExecutionInput, assertOrcaSwapTransaction, createSolanaSimulationTransaction, errorMessage, expectedDecimals, extensionName, fingerprintOrcaState, impactFromOrcaSqrtPrice, isScopedToken2022Pool, minimumOut, orcaInputMint, orcaQuotePerAsset, orcaTickArrayAddresses, readSolanaTokenState, startSolanaAccountWatch, validateSolanaTokenSupport } from "../pool-adapters.js";
-import type { ExactInQuote, PoolAdapter, PoolWatchCallbacks, QuoteInput, SolanaMintState, SwapBuildInput, SwapSimulationResult, UnsignedSwap } from "../pool-adapters.js";
+import type { ExactInQuote, PoolAdapter, PoolWatchCallbacks, QuoteInput, SolanaMintState, SolanaTokenState, SwapBuildInput, SwapSimulationResult, UnsignedSwap } from "../pool-adapters.js";
 
 export function createOrcaContext(connection: Connection, wallet: ReadOnlyWallet) {
   const orcaFetcher = buildDefaultAccountFetcher(connection);
@@ -146,8 +146,10 @@ export class OrcaWhirlpoolAdapter implements PoolAdapter {
     }, callbacks);
   }
 
-  async getAssetUiMultiplier(pool: RegisteredPool): Promise<string> {
-    const state = await readSolanaTokenState(this.connection, pool);
+  async readSolanaTokenState(pool: RegisteredPool): Promise<SolanaTokenState> { return readSolanaTokenState(this.connection, pool); }
+
+  async getAssetUiMultiplier(pool: RegisteredPool, tokenState?: SolanaTokenState): Promise<string> {
+    const state = tokenState ?? await this.readSolanaTokenState(pool);
     const asset = state.mints.get(pool.token_in_out.asset_address);
     if (!asset) throw new PoolIdentityMismatchError("Orca registered asset mint is missing");
     return this.validateToken(pool, asset, state.blockTimestamp).uiMultiplier;
@@ -173,7 +175,7 @@ export class OrcaWhirlpoolAdapter implements PoolAdapter {
   async quoteExactIn(pool: RegisteredPool, input: QuoteInput): Promise<ExactInQuote> {
     if (input.amountInRaw <= 0n || !Number.isSafeInteger(input.slippageBps) || input.slippageBps < 0 || input.slippageBps >= 10_000) throw new Error("Invalid exact-in amount or slippage");
     const { data, quote } = await this.exactInQuote(this.client, this.context, pool, input.direction, input.amountInRaw);
-    const tokenState = await readSolanaTokenState(this.connection, pool);
+    const tokenState = input.solanaTokenState ?? await this.readSolanaTokenState(pool);
     const assetToken = this.validateToken(pool, tokenState.mints.get(pool.token_in_out.asset_address)!, tokenState.blockTimestamp);
     const quoteToken = this.validateToken(pool, tokenState.mints.get(pool.token_in_out.quote_address)!, tokenState.blockTimestamp);
     if (input.direction === "asset_to_quote" && input.expectedAssetUiMultiplier !== undefined

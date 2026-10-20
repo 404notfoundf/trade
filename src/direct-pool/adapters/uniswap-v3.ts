@@ -1,10 +1,11 @@
 import Decimal from "decimal.js";
 import { Interface, JsonRpcProvider } from "ethers";
-import { PoolIdentityMismatchError, assertExecutionInput, assertUniswapSwapMatchesRegistry, encodeUniswapV3Swap, errorMessage, evmPoolInterface, factoryGetterInterface, impactFromSqrtPrice, minimumOut, pairMatches, quoterInterface, readAddress, readBigInt, sameAddress, swapRouterInterface, erc20Interface } from "../pool-adapters.js";
+import { PoolIdentityMismatchError, assertExecutionInput, assertUniswapSwapMatchesRegistry, encodeUniswapV3Swap, errorMessage, evmPoolInterface, factoryGetterInterface, impactFromSqrtPrice, minimumOut, pairMatches, quoterInterface, readAddress, readBigInt, sameAddress, swapRouterInterface, erc20Interface, usableXLayerQuoteSnapshot } from "../pool-adapters.js";
 import type { ExactInQuote, PoolAdapter, QuoteInput, SwapBuildInput, SwapSimulationResult, UnsignedSwap } from "../pool-adapters.js";
 import type { MarketRegistry, RegisteredPool } from "../market-registry.js";
 
 export class UniswapV3Adapter implements PoolAdapter {
+  private static readonly feeDataTtlMs = 10_000;
   readonly stateSource = "fixed_monitor" as const;
   private readonly provider: JsonRpcProvider;
   private readonly dex: NonNullable<MarketRegistry["dexes"][string]>;
@@ -13,6 +14,8 @@ export class UniswapV3Adapter implements PoolAdapter {
   private assetDecimals = 0;
   private quoteDecimals = 0;
   private rpcChainValidated = false;
+  private feeDataCache?: { expiresAt: number; gasPrice: bigint | null; maxFeePerGas: bigint | null };
+  private feeDataPending?: Promise<NonNullable<UniswapV3Adapter["feeDataCache"]>>;
 
   constructor(private readonly registry: MarketRegistry, pool: RegisteredPool) {
     const dex = registry.dexes[pool.dex];
@@ -73,17 +76,28 @@ export class UniswapV3Adapter implements PoolAdapter {
     if (!dex.quoter_v2 || pool.expected_fee_tier === undefined) throw new Error("X Layer QuoterV2 or pool fee tier is not configured");
     const tokenIn = input.direction === "asset_to_quote" ? this.assetAddress : this.quoteAddress;
     const tokenOut = input.direction === "asset_to_quote" ? this.quoteAddress : this.assetAddress;
-    const block = await this.provider.getBlock("latest");
-    if (!block?.hash) throw new Error("X Layer quote block is unavailable");
-    const blockNumber = block.number;
+    const snapshot = usableXLayerQuoteSnapshot(input.xlayerSnapshot);
+    let blockNumber: number;
+    let blockHash: string;
+    let sqrtPriceX96: bigint;
+    if (snapshot) {
+      blockNumber = Number(snapshot.blockNumber);
+      blockHash = snapshot.blockHash;
+      sqrtPriceX96 = snapshot.sqrtPriceX96;
+    } else {
+      const block = await this.provider.getBlock("latest");
+      if (!block?.hash) throw new Error("X Layer quote block is unavailable");
+      blockNumber = block.number;
+      blockHash = block.hash;
+      const slot0Data = await this.provider.send("eth_call", [{ to: pool.address, data: evmPoolInterface.encodeFunctionData("slot0") }, `0x${blockNumber.toString(16)}`]) as string;
+      sqrtPriceX96 = BigInt(evmPoolInterface.decodeFunctionResult("slot0", slot0Data)[0]);
+    }
     const blockTag = `0x${blockNumber.toString(16)}`;
     const callData = quoterInterface.encodeFunctionData("quoteExactInputSingle", [{ tokenIn, tokenOut, amountIn: input.amountInRaw, fee: pool.expected_fee_tier, sqrtPriceLimitX96: 0n }]);
-    const [slot0Data, raw, feeData] = await Promise.all([
-      this.provider.send("eth_call", [{ to: pool.address, data: evmPoolInterface.encodeFunctionData("slot0") }, blockTag]) as Promise<string>,
+    const [raw, feeData] = await Promise.all([
       this.provider.send("eth_call", [{ to: dex.quoter_v2, data: callData }, blockTag]) as Promise<string>,
-      this.provider.getFeeData(),
+      this.cachedFeeData(),
     ]);
-    const sqrtPriceX96 = BigInt(evmPoolInterface.decodeFunctionResult("slot0", slot0Data)[0]);
     const [amountOutRaw, , , gasEstimate] = quoterInterface.decodeFunctionResult("quoteExactInputSingle", raw) as unknown as [bigint, bigint, number, bigint];
     if (amountOutRaw <= 0n) throw new Error("QuoterV2 returned a non-positive amountOut");
     const networkFeeNativeRaw = feeData.gasPrice === null ? null : BigInt(gasEstimate) * feeData.gasPrice;
@@ -92,8 +106,8 @@ export class UniswapV3Adapter implements PoolAdapter {
       minimumAmountOutRaw: minimumOut(amountOutRaw, input.slippageBps),
       priceImpactPercent: impactFromSqrtPrice(sqrtPriceX96, input.direction, input.amountInRaw, amountOutRaw, this.assetDecimals, this.quoteDecimals, pool),
       networkFeeNativeRaw, networkFeeUsdt: null, assetUiMultiplier: "1",
-      version: { chain: "xlayer", blockNumber: BigInt(blockNumber), blockHash: block.hash, observedAt: Date.now(), stateFingerprint: `block:${blockNumber}:${block.hash}` },
-      quotedAt: Date.now(), raw: { blockNumber, blockHash: block.hash, amountOutRaw: amountOutRaw.toString(), gasEstimate: String(gasEstimate) },
+      version: { chain: "xlayer", blockNumber: BigInt(blockNumber), blockHash, observedAt: Date.now(), stateFingerprint: `block:${blockNumber}:${blockHash}` },
+      quotedAt: Date.now(), raw: { blockNumber, blockHash, amountOutRaw: amountOutRaw.toString(), gasEstimate: String(gasEstimate) },
     };
   }
 
@@ -133,13 +147,25 @@ export class UniswapV3Adapter implements PoolAdapter {
       const result = await this.provider.send("eth_call", [request, `0x${blockNumber.toString(16)}`]) as string;
       const amountOut = BigInt(swapRouterInterface.decodeFunctionResult("exactInputSingle", result)[0]);
       if (amountOut < swap.minimumAmountOutRaw) throw new Error("Simulated output is below amountOutMinimum");
-      const [gasEstimate, feeData] = await Promise.all([this.provider.estimateGas(request), this.provider.getFeeData()]);
+      const [gasEstimate, feeData] = await Promise.all([this.provider.estimateGas(request), this.cachedFeeData()]);
       const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice;
       return { chain: "xlayer", ok: true, amountOutRaw: amountOut.toString(),
         networkFeeNativeRaw: gasPrice === null ? undefined : (gasEstimate * gasPrice).toString() };
     } catch (error) {
       return { chain: "xlayer", ok: false, error: errorMessage(error) };
     }
+  }
+
+  private async cachedFeeData(): Promise<{ gasPrice: bigint | null; maxFeePerGas: bigint | null }> {
+    const now = Date.now();
+    if (this.feeDataCache && this.feeDataCache.expiresAt > now) return this.feeDataCache;
+    if (!this.feeDataPending) {
+      this.feeDataPending = this.provider.getFeeData().then((feeData) => {
+        this.feeDataCache = { expiresAt: Date.now() + UniswapV3Adapter.feeDataTtlMs, gasPrice: feeData.gasPrice, maxFeePerGas: feeData.maxFeePerGas };
+        return this.feeDataCache;
+      }).finally(() => { this.feeDataPending = undefined; });
+    }
+    return this.feeDataPending;
   }
 }
 

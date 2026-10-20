@@ -169,7 +169,10 @@ export class DirectPoolCollector {
           const amountInRaw = direction === "cex_buy_dex_sell"
             ? BigInt(assetAmountRaw)
             : BigInt(quoteAmountRaw);
-          const quote = await adapterState.adapter.quoteExactIn(pool, { direction: directDirection(direction), amountInRaw, slippageBps: this.options.slippageBps ?? 50 });
+          const quote = await adapterState.adapter.quoteExactIn(pool, {
+            direction: directDirection(direction), amountInRaw, slippageBps: this.options.slippageBps ?? 50,
+            xlayerSnapshot: pool.chain === "xlayer" && state.pool ? state.pool : undefined,
+          });
           const requestMs = Date.now() - startedAt;
           let quoteId: number;
           try {

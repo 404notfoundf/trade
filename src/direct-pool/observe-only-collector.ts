@@ -147,7 +147,10 @@ export class ObserveOnlyCollector {
         const direction: Direction = input.direction === "asset_to_quote" ? "cex_buy_dex_sell" : "dex_buy_cex_sell";
         let observed: { quote: ExactInQuote; quoteId: number } | null = null;
         try {
-          const quote = await adapterState.adapter.quoteExactIn(pool, { ...input, slippageBps: this.options.slippageBps ?? 50 });
+          const quote = await adapterState.adapter.quoteExactIn(pool, {
+            ...input, slippageBps: this.options.slippageBps ?? 50,
+            xlayerSnapshot: pool.chain === "xlayer" && state.pool ? state.pool : undefined,
+          });
           if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) {
             return;
           }

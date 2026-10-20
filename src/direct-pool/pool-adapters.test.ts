@@ -6,7 +6,7 @@ import Decimal from "decimal.js";
 import { Interface } from "ethers";
 import { Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { WebSocketServer } from "ws";
-import { assertMeteoraFullFill, byrealQuotePerAsset, createSolanaSimulationTransaction, encodeUniswapV3Swap, impactFromMarginalPrice, impactFromOrcaSqrtPrice, impactFromSqrtPrice, isScopedToken2022Pool, meteoraSwapForY, minimumOut, orcaInputMint, startSolanaAccountWatch } from "./pool-adapters.js";
+import { assertMeteoraFullFill, byrealQuotePerAsset, createSolanaSimulationTransaction, encodeUniswapV3Swap, impactFromMarginalPrice, impactFromOrcaSqrtPrice, impactFromSqrtPrice, isScopedToken2022Pool, meteoraSwapForY, minimumOut, orcaInputMint, startSolanaAccountWatch, usableXLayerQuoteSnapshot } from "./pool-adapters.js";
 import { BYREAL_CLMM_PROGRAM_ADDRESS, BYREAL_XSPCX_USDC_POOL, METEORA_DLMM_PROGRAM_ADDRESS, METEORA_XSPCX_USDC_POOL, ORCA_XSPCX_USDC_POOL, type RegisteredPool } from "./market-registry.js";
 
 const pool = {
@@ -135,4 +135,22 @@ test("Solana simulation uses an unsigned versioned message and validates its fee
   assert.equal(simulated.signatures.length, 1);
   assert.ok(simulated.signatures[0]!.every((value) => value === 0));
   assert.throws(() => createSolanaSimulationTransaction(encoded, Keypair.generate().publicKey.toBase58(), PublicKey.default.toBase58()), /fee payer/);
+});
+
+test("X Layer quote snapshot accepts a complete fixed-monitor version", () => {
+  const blockHash = `0x${"a".repeat(64)}`;
+  const now = Date.now();
+  assert.deepEqual(usableXLayerQuoteSnapshot({ blockNumber: 123, blockHash, sqrtPriceRaw: "79228162514264337593543950336", observedAt: now }, now), {
+    blockNumber: 123n, blockHash, sqrtPriceX96: 79228162514264337593543950336n,
+  });
+});
+
+test("X Layer quote snapshot rejects incomplete or invalid state", () => {
+  const blockHash = `0x${"a".repeat(64)}`;
+  const now = Date.now();
+  assert.equal(usableXLayerQuoteSnapshot(undefined), undefined);
+  assert.equal(usableXLayerQuoteSnapshot({ blockNumber: null, blockHash, sqrtPriceRaw: "1", observedAt: now }, now), undefined);
+  assert.equal(usableXLayerQuoteSnapshot({ blockNumber: 123, blockHash: "0x1", sqrtPriceRaw: "1", observedAt: now }, now), undefined);
+  assert.equal(usableXLayerQuoteSnapshot({ blockNumber: 123, blockHash, sqrtPriceRaw: "0", observedAt: now }, now), undefined);
+  assert.equal(usableXLayerQuoteSnapshot({ blockNumber: 123, blockHash, sqrtPriceRaw: "1", observedAt: now + 1 }, now), undefined);
 });

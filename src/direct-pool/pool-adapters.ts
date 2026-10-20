@@ -7,6 +7,7 @@ import { AccountState, ASSOCIATED_TOKEN_PROGRAM_ID, ExtensionType, TOKEN_2022_PR
 import { ComputeBudgetProgram, Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, SystemProgram, Transaction } from "@solana/web3.js";
 import { ORCA_WHIRLPOOL_PROGRAM_ID, WhirlpoolContext, type SwapQuote, type WhirlpoolData } from "@orca-so/whirlpools-sdk";
 import WebSocket from "ws";
+import type { PoolMonitorState } from "../market/fixed-pools.js";
 import { BYREAL_CLMM_PROGRAM_ADDRESS, BYREAL_XSPCX_USDC_POOL, METEORA_DLMM_PROGRAM_ADDRESS, METEORA_XSPCX_USDC_POOL, ORCA_WHIRLPOOL_PROGRAM_ADDRESS, ORCA_XSPCX_USDC_POOL, type MarketRegistry, type RegisteredPool } from "./market-registry.js";
 export { createSolanaSimulationTransaction } from "./raydium-simulator.js";
 
@@ -54,7 +55,8 @@ export type ExactInQuote = {
   assetUiMultiplier: string; version: PoolVersion; quotedAt: number; raw: unknown;
   mintTokenPrograms?: { asset: string; quote: string };
 };
-export type QuoteInput = { direction: ExactInQuote["direction"]; amountInRaw: bigint; slippageBps: number; expectedAssetUiMultiplier?: string };
+export type XLayerQuoteSnapshot = Pick<PoolMonitorState, "blockNumber" | "blockHash" | "sqrtPriceRaw" | "observedAt">;
+export type QuoteInput = { direction: ExactInQuote["direction"]; amountInRaw: bigint; slippageBps: number; expectedAssetUiMultiplier?: string; xlayerSnapshot?: XLayerQuoteSnapshot };
 export type SwapBuildInput = { quote: ExactInQuote; wallet: string; deadlineSeconds?: number; simulationOnly?: boolean };
 export type UnsignedSwap = {
   chain: "xlayer" | "solana"; poolId: string; direction: ExactInQuote["direction"]; wallet: string;
@@ -75,6 +77,14 @@ export type SolanaMintState = { mint: ReturnType<typeof unpackMint>; owner: Publ
 export class PoolIdentityMismatchError extends Error {}
 export class UnsupportedTokenError extends Error {
   constructor(readonly failureCode: "TOKEN_PROGRAM_UNSUPPORTED" | "TOKEN_EXTENSION_UNSUPPORTED", message: string) { super(message); }
+}
+
+export function usableXLayerQuoteSnapshot(snapshot?: XLayerQuoteSnapshot, now = Date.now()): { blockNumber: bigint; blockHash: string; sqrtPriceX96: bigint } | undefined {
+  if (!snapshot || snapshot.blockNumber === null || snapshot.blockHash === null || snapshot.sqrtPriceRaw === null
+    || !Number.isSafeInteger(snapshot.blockNumber) || snapshot.blockNumber < 0
+    || snapshot.observedAt === null || !Number.isFinite(snapshot.observedAt) || snapshot.observedAt > now
+    || !/^0x[\da-f]{64}$/i.test(snapshot.blockHash) || !/^\d+$/.test(snapshot.sqrtPriceRaw) || BigInt(snapshot.sqrtPriceRaw) <= 0n) return undefined;
+  return { blockNumber: BigInt(snapshot.blockNumber), blockHash: snapshot.blockHash, sqrtPriceX96: BigInt(snapshot.sqrtPriceRaw) };
 }
 
 export interface PoolAdapter {

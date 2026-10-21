@@ -3,7 +3,7 @@ import bs58 from "bs58";
 import Decimal from "decimal.js";
 import { Keypair } from "@solana/web3.js";
 import type { AssetConfig, Config } from "../config.js";
-import { bookObservationStale, floorToStep, vwap, type Instrument } from "../market/market.js";
+import { bookObservationStale, bookStale, floorToStep, vwap, type Instrument } from "../market/market.js";
 import { estimateSolanaBaseFeeUsdt, okxSolUsdtTicker, SOLANA_BASE_FEE_LAMPORTS, type Book } from "../market/okx.js";
 import type { PoolMonitorState } from "../market/fixed-pools.js";
 import { logger } from "../logger.js";
@@ -130,7 +130,7 @@ export class ObserveOnlyCollector {
       const cexAssetMultiplier = pool.chain === "solana"
         ? assetUiMultiplier
         : new Decimal(1);
-      const targetShares = book?.ready && !bookObservationStale(book) && instrument
+      const targetShares = book?.ready && !bookStale(book) && !bookObservationStale(book) && instrument
         && book.asks[0] && book.bids[0]
         ? floorToStep(quoteAmount.div(new Decimal(book.asks[0]!.price).plus(book.bids[0]!.price).div(2)), instrument.lotSz)
         : null;
@@ -299,7 +299,7 @@ export class ObserveOnlyCollector {
     const feeRate = current.feeRate;
     if (!reason) {
       if (!book?.ready) reason = "CEX_BOOK_UNAVAILABLE";
-      else if (bookObservationStale(book)) reason = "CEX_BOOK_STALE";
+      else if (bookStale(book) || bookObservationStale(book)) reason = "CEX_BOOK_STALE";
       else if (!instrument) reason = "CEX_INSTRUMENT_UNAVAILABLE";
       else if (!feeRate?.isFinite() || feeRate.lt(0)) reason = "CEX_FEE_UNAVAILABLE";
       else if (initial.instrument && (current.instrument?.instId !== initial.instrument.instId || current.instrument.lotSz !== initial.instrument.lotSz || current.instrument.minSz !== initial.instrument.minSz)) reason = "CEX_INSTRUMENT_CHANGED";

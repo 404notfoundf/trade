@@ -15,6 +15,7 @@ import type { AggregatorShadowRequest } from "./aggregator-shadow.js";
 import { netMarginOk } from "../trading/gates.js";
 import type { MarketRegistry, RegisteredPool } from "./market-registry.js";
 import { poolStateView, type AdapterPoolStateEvent } from "./pool-state.js";
+import { isObservedMinimumProfitTarget, minimumProfitStatus, OBSERVED_MINIMUM_PROFIT_FLOOR, type MinimumProfitStatus } from "./minimum-profit-floor.js";
 
 export type MarketSnapshot = { instrument?: Instrument; feeRate?: Decimal; multiplier?: Decimal; book?: Book; pool?: PoolMonitorState; dbOnline: boolean; quoteValuationStatus: "VERIFIED" | "UNKNOWN" };
 export type AdapterState = { adapter: PoolAdapter; verified: boolean; identityMismatch: boolean; retryAt: number; retryDelayMs: number; watchStatus: "not_required" | "healthy" | "unavailable"; watchGeneration: number; marginalPrice?: string; watchError?: string };
@@ -148,10 +149,11 @@ export class ObserveOnlyCollector {
       }
       for (const input of amountByDirection) {
         const direction: Direction = input.direction === "asset_to_quote" ? "cex_buy_dex_sell" : "dex_buy_cex_sell";
+        const floorTarget = isObservedMinimumProfitTarget(pool.id, direction, size);
         let observed: { quote: ExactInQuote; quoteId: number } | null = null;
         try {
           const quote = await adapterState.adapter.quoteExactIn(pool, {
-            ...input, slippageBps: this.options.slippageBps ?? 50,
+            ...input, slippageBps: floorTarget ? OBSERVED_MINIMUM_PROFIT_FLOOR.slippageBps : this.options.slippageBps ?? 50,
             solanaTokenState: tokenState,
             xlayerSnapshot: pool.chain === "xlayer" && state.pool ? state.pool : undefined,
           });
@@ -248,6 +250,7 @@ export class ObserveOnlyCollector {
 
   private async recordObserveDecision(route: ObserveRoute, scanId: string, size: number, direction: Direction, quoteId: number, quote: ExactInQuote, initial: MarketSnapshot, intendedCexShares: Decimal | null, watchGeneration: number): Promise<void> {
     const { asset, pool } = route;
+    const floorTarget = isObservedMinimumProfitTarget(pool.id, direction, size);
     const adapterState = this.adapters.get(pool.id)!;
     const adapterOwnsPoolState = adapterState.adapter.stateSource === "adapter_watch";
     if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) return;
@@ -256,9 +259,16 @@ export class ObserveOnlyCollector {
     let cexFee: Decimal | null = null;
     let gross: Decimal | null = null;
     let net: Decimal | null = null;
+    let worstCaseNet: Decimal | null = null;
+    let floorStatus: MinimumProfitStatus = floorTarget ? "UNCOMPUTABLE" : "NOT_APPLICABLE";
+    let floorReason: string | null = null;
+    let floorCexShares: Decimal | null = null;
+    let floorCexFill: ReturnType<typeof vwap> = null;
+    let floorCexFee: Decimal | null = null;
     let invested: Decimal | null = null;
     let calculation: ReturnType<typeof calculateProfit> | null = null;
     let gasBudget: Decimal | null = null;
+    let floorGasBudget: Decimal | null = null;
     let gasSource = "config.direct_pool_observation";
     let solanaGasPricing: Record<string, string | number> | null = null;
     let gasPriceFailure: string | null = null;
@@ -267,6 +277,7 @@ export class ObserveOnlyCollector {
       try {
         const ticker = await okxSolUsdtTicker();
         gasBudget = estimateSolanaBaseFeeUsdt(ticker.midPx);
+        floorGasBudget = estimateSolanaBaseFeeUsdt(ticker.askPx);
         solanaGasPricing = {
           feeLamports: SOLANA_BASE_FEE_LAMPORTS.toString(), bidPx: ticker.bidPx.toString(), askPx: ticker.askPx.toString(), midPx: ticker.midPx.toString(),
           sourceAt: ticker.sourceAt, receivedAt: ticker.receivedAt,
@@ -275,6 +286,7 @@ export class ObserveOnlyCollector {
     } else {
       gasBudget = new Decimal(direction === "cex_buy_dex_sell"
         ? this.options.observationGas.xlayerWrapThenSwapGasUsdt : this.options.observationGas.xlayerSwapThenUnwrapGasUsdt);
+      floorGasBudget = gasBudget;
     }
     const rebalanceCost = asset.rebalanceCostUsdtPerTrade === undefined ? null : new Decimal(asset.rebalanceCostUsdtPerTrade);
     let conversion: Record<string, string> = {};
@@ -340,7 +352,43 @@ export class ObserveOnlyCollector {
         }
       }
     }
+    if (floorTarget) {
+      floorReason = reason;
+      if (!reason && book && instrument && feeRate && floorGasBudget !== null) {
+        if (quote.minimumAmountOutRaw <= 0n || quote.minimumAmountOutRaw > quote.amountOutRaw) floorReason = "MINIMUM_OUTPUT_INVALID";
+        else {
+          const minimumAssetUi = new Decimal(quote.minimumAmountOutRaw.toString())
+            .div(new Decimal(10).pow(asset.tokenDecimals)).mul(quote.assetUiMultiplier);
+          floorCexShares = floorToStep(minimumAssetUi, instrument.lotSz);
+          if (!floorCexShares.gte(instrument.minSz)) floorReason = "CEX_MINIMUM_SIZE_AT_MINIMUM_OUTPUT";
+          else {
+            floorCexFill = vwap(book.bids, floorCexShares);
+            if (!floorCexFill) floorReason = "CEX_DEPTH_INSUFFICIENT_AT_MINIMUM_OUTPUT";
+            else {
+              floorCexFee = floorCexFill.notional.mul(feeRate);
+              const floorCalculation = calculateProfit({
+                direction,
+                cexNotionalUsdt: floorCexFill.notional,
+                dexQuoteAmountUsdt: new Decimal(quote.amountInRaw.toString()).div(new Decimal(10).pow(pool.token_in_out.quote_decimals)),
+                valuationStatus: "ASSUMED",
+                costs: [
+                  { kind: "cex_fee", amountUsdt: floorCexFee, source: "cex_fee_rate" },
+                  { kind: "network_fee", amountUsdt: floorGasBudget, source: `${gasSource}:ask_price` },
+                  ...(rebalanceCost === null ? [] : [{ kind: "rebalance" as const, amountUsdt: rebalanceCost, source: "config.rebalanceCostUsdtPerTrade" }]),
+                ],
+              });
+              if (floorCalculation.uncomputableReason) floorReason = `PROFIT_CALCULATION_${floorCalculation.uncomputableReason}`;
+              else {
+                worstCaseNet = floorCalculation.netProfitUsdt;
+                floorStatus = minimumProfitStatus(worstCaseNet);
+              }
+            }
+          }
+        }
+      }
+    }
     if (gasPriceFailure && reason !== gasPriceFailure) reason = reason ? `${gasPriceFailure}; ${reason}` : gasPriceFailure;
+    if (floorTarget && !worstCaseNet && !floorReason) floorReason = reason ?? "MINIMUM_PROFIT_UNAVAILABLE";
     const highImpact = new Decimal(quote.priceImpactPercent).abs().gt(this.options.guardrails.maxDexPriceImpactPercent);
     const simulation = await this.simulateObservedSwap(route, direction, size, quote, net, invested, reason, highImpact);
     if (adapterOwnsPoolState && (adapterState.watchStatus !== "healthy" || adapterState.watchGeneration !== watchGeneration)) return;
@@ -356,8 +404,27 @@ export class ObserveOnlyCollector {
       cexSeqId: book?.seqId ?? null, cexBid: book?.bids[0]?.price ?? null, cexAsk: book?.asks[0]?.price ?? null,
       cexVwap: cexFill?.vwap.toString() ?? null, cexFeeUsdt: cexFee?.toString() ?? null,
       dexNetworkFeeUsdt: null, gasBudgetUsdt: gasBudget?.toString() ?? null,
-      valuationInputs: { quoteMint: pool.token_in_out.quote_address, quoteToUsdt: "ASSUMED_1_TO_1", wrapper: conversion, cex: cexSnapshot, cexBookLiveness: book ? { receivedAt: book.receivedAt, exchangeTime: book.exchangeTime, streamAliveAt: book.streamAliveAt ?? null } : null, assetUiMultiplier: quote.assetUiMultiplier, backedMultiplierApplied: pool.chain === "xlayer" ? null : "1", gasBudgetUsdt: gasBudget?.toString() ?? null, gasSource, solanaGasPricing, rebalanceCostUsdt: rebalanceCost?.toString() ?? null, costBreakdown: calculation?.costBreakdown ?? [], calculationReasonCode: calculation?.uncomputableReason ?? null, priceImpactPercent: quote.priceImpactPercent },
+      valuationInputs: {
+        quoteMint: pool.token_in_out.quote_address, quoteToUsdt: "ASSUMED_1_TO_1", wrapper: conversion, cex: cexSnapshot,
+        cexBookLiveness: book ? { receivedAt: book.receivedAt, exchangeTime: book.exchangeTime, streamAliveAt: book.streamAliveAt ?? null } : null,
+        assetUiMultiplier: quote.assetUiMultiplier, backedMultiplierApplied: pool.chain === "xlayer" ? null : "1",
+        gasBudgetUsdt: gasBudget?.toString() ?? null, gasSource, solanaGasPricing, rebalanceCostUsdt: rebalanceCost?.toString() ?? null,
+        costBreakdown: calculation?.costBreakdown ?? [], calculationReasonCode: calculation?.uncomputableReason ?? null,
+        priceImpactPercent: quote.priceImpactPercent,
+        minimumProfitFloor: floorTarget ? {
+          thresholdUsdt: OBSERVED_MINIMUM_PROFIT_FLOOR.minimumNetProfitUsdt,
+          slippageBps: OBSERVED_MINIMUM_PROFIT_FLOOR.slippageBps,
+          gasBudgetUsdt: floorGasBudget?.toString() ?? null,
+          minimumAmountOutRaw: quote.minimumAmountOutRaw.toString(),
+          cexShares: floorCexShares?.toString() ?? null,
+          cexVwap: floorCexFill?.vwap.toString() ?? null,
+          cexFeeUsdt: floorCexFee?.toString() ?? null,
+          status: floorStatus,
+          reason: floorReason,
+        } : null,
+      },
       grossProfitUsdt: gross?.toString() ?? null, netProfitUsdt: net?.toString() ?? null,
+      worstCaseNetProfitUsdt: worstCaseNet?.toString() ?? null, minimumProfitStatus: floorStatus,
       roi: calculation?.roi?.toString() ?? null,
       valuationStatus: "ASSUMED_1_TO_1",
       decisionStatus: reason ? "BLOCKED" : highImpact ? "HIGH_PRICE_IMPACT" : "OBSERVED",

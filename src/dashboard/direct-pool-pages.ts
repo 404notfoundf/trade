@@ -3,6 +3,7 @@ import type { AssetConfig, Config } from "../config.js";
 import { query } from "../db.js";
 import type { PoolMonitorState } from "../market/fixed-pools.js";
 import { solveDirectPoolCandidates } from "../direct-pool/market-registry.js";
+import { OBSERVED_MINIMUM_PROFIT_FLOOR } from "../direct-pool/minimum-profit-floor.js";
 import { positiveWindowCache } from "./positive-window-cache.js";
 import {
   collectPositiveWindows,
@@ -39,7 +40,8 @@ type PageOptions = {
 type DecisionRow = {
   id: number; instrument_id: string; chain_index: string; pool_id: string | null; direction: string; size_usdt: string;
   selected_quote_id: number | null; cex_vwap: string | null; gross_profit_usdt: string | null; cex_fee_usdt: string | null;
-  gas_budget_usdt: string | null; net_profit_usdt: string | null; roi: string | null; valuation_status: string;
+  gas_budget_usdt: string | null; net_profit_usdt: string | null; worst_case_net_profit_usdt?: string | null; minimum_profit_status?: string;
+  roi: string | null; valuation_status: string;
   decision_status: string; block_reason: string | null; execution_status: string; simulation_status: string; simulation_reason: string | null; created_at: Date;
 };
 type QuoteRow = {
@@ -188,6 +190,14 @@ function decisionProfit(row: DecisionRow, helpers: Helpers): { text: string; cla
   return { text, className: new Decimal(row.net_profit_usdt).gt(0) ? "profit-positive" : row.net_profit_usdt === "0" ? "" : "profit-negative" };
 }
 
+function minimumProfitSummary(row: DecisionRow, helpers: Helpers): string | null {
+  if (!row.minimum_profit_status || row.minimum_profit_status === "NOT_APPLICABLE") return null;
+  if (row.minimum_profit_status === "UNCOMPUTABLE" || row.worst_case_net_profit_usdt == null) return "模型保守净收益无法计算";
+  if (row.minimum_profit_status !== "PASS" && row.minimum_profit_status !== "BELOW_FLOOR") return "模型保守净收益状态未知";
+  const status = row.minimum_profit_status === "PASS" ? "达到门槛" : "低于门槛";
+  return `模型保守 ${helpers.formatReportDecimal(row.worst_case_net_profit_usdt, 6)} USDT · ${status} ${OBSERVED_MINIMUM_PROFIT_FLOOR.minimumNetProfitUsdt}U`;
+}
+
 function correctedDecision(row: DecisionRow, offsetSeconds: number): DecisionRow {
   return { ...row, created_at: actualTime(row.created_at, offsetSeconds) };
 }
@@ -261,7 +271,7 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
       const windowWhere = "id >= ? AND id <= ? AND instrument_id = ? AND chain_index = ? AND pool_id = ? AND direction = ? AND size_usdt = ?";
       const windowParameters = [firstId, lastId, instrumentId, chainIndex, windowPoolId, direction, sizeUsdt];
       const [rows, countRows] = await Promise.all([
-        query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,simulation_status,simulation_reason,created_at FROM direct_pool_decision WHERE ${windowWhere} ORDER BY created_at ASC,id ASC LIMIT ? OFFSET ?`, [...windowParameters, pageSize + 1, (page - 1) * pageSize]),
+        query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(worst_case_net_profit_usdt AS CHAR) worst_case_net_profit_usdt,minimum_profit_status,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,simulation_status,simulation_reason,created_at FROM direct_pool_decision WHERE ${windowWhere} ORDER BY created_at ASC,id ASC LIMIT ? OFFSET ?`, [...windowParameters, pageSize + 1, (page - 1) * pageSize]),
         query<CountRow[]>(`SELECT COUNT(*) total FROM direct_pool_decision WHERE ${windowWhere}`, windowParameters),
       ]);
       const total = Number(countRows[0]?.total ?? 0);
@@ -272,10 +282,11 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
       const recordRows = rows.slice(0, pageSize).map((raw) => {
         const row = correctedDecision(raw, offsetSeconds);
         const profit = decisionProfit(row, helpers);
+        const minimumProfit = minimumProfitSummary(row, helpers);
         const positive = !isInvalidated(row.valuation_status) && row.net_profit_usdt !== null && new Decimal(row.net_profit_usdt).gt(0);
         const included = positive ? "计入正收益窗口指标" : row.net_profit_usdt !== null && !isInvalidated(row.valuation_status) ? "非正收益，仅用于连续性判断" : "无有效收益估值，不计入窗口判断";
         const quote = row.selected_quote_id === null ? "原始报价已过保留期或未关联" : `<a href="${directPoolHref("/direct-pools/quote", range, { id: String(row.selected_quote_id), back: "window", ...windowParams, ...(page > 1 ? { page: String(page) } : {}) })}">报价拆分详情 →</a>`;
-        return `<tr><td>${escapeHtml(formatUtc8(row.created_at))}</td><td class="numeric ${profit.className}"><strong>${escapeHtml(profit.text)}</strong></td><td class="numeric">${escapeHtml(row.cex_vwap === null ? "—" : formatReportDecimal(row.cex_vwap, 8))}</td><td class="numeric">${escapeHtml(row.gross_profit_usdt === null ? "—" : `${formatReportDecimal(row.gross_profit_usdt, 6)} USDT`)}</td><td class="numeric">${escapeHtml(row.cex_fee_usdt === null ? "—" : `${formatReportDecimal(row.cex_fee_usdt, 6)} USDT`)}</td><td class="numeric">${escapeHtml(row.gas_budget_usdt === null ? "—" : `${formatReportDecimal(row.gas_budget_usdt, 6)} USDT`)}</td><td>${escapeHtml(included)}<small>${escapeHtml(row.decision_status)} · ${escapeHtml(row.valuation_status)} · ${escapeHtml(row.execution_status)}${row.block_reason ? ` · ${escapeHtml(row.block_reason)}` : ""}</small></td><td>${quote}</td></tr>`;
+        return `<tr><td>${escapeHtml(formatUtc8(row.created_at))}</td><td class="numeric ${profit.className}"><strong>${escapeHtml(profit.text)}</strong>${minimumProfit ? `<small>${escapeHtml(minimumProfit)}</small>` : ""}</td><td class="numeric">${escapeHtml(row.cex_vwap === null ? "—" : formatReportDecimal(row.cex_vwap, 8))}</td><td class="numeric">${escapeHtml(row.gross_profit_usdt === null ? "—" : `${formatReportDecimal(row.gross_profit_usdt, 6)} USDT`)}</td><td class="numeric">${escapeHtml(row.cex_fee_usdt === null ? "—" : `${formatReportDecimal(row.cex_fee_usdt, 6)} USDT`)}</td><td class="numeric">${escapeHtml(row.gas_budget_usdt === null ? "—" : `${formatReportDecimal(row.gas_budget_usdt, 6)} USDT`)}</td><td>${escapeHtml(included)}<small>${escapeHtml(row.decision_status)} · ${escapeHtml(row.valuation_status)} · ${escapeHtml(row.execution_status)}${row.block_reason ? ` · ${escapeHtml(row.block_reason)}` : ""}</small></td><td>${quote}</td></tr>`;
       }).join("");
       const directionLabel = direction === "dex_buy_cex_sell" ? "DEX 买入 · CEX 卖出" : "CEX 买入 · DEX 卖出";
       return `${header}<div class="window-detail-meta"><div><small>资产</small><strong>${escapeHtml(instrumentId)}</strong></div><div><small>链 / 池</small><strong>${escapeHtml(chainIndex)} · ${escapeHtml(windowPoolId)}</strong></div><div><small>方向</small><strong>${escapeHtml(directionLabel)}</strong></div><div><small>规模</small><strong>${escapeHtml(formatReportDecimal(sizeUsdt, 8))} USDT</strong></div><div><small>正收益样本数</small><strong>${positiveCount}</strong></div><div class="window-range"><small>窗口范围（UTC+8）</small><strong>${escapeHtml(formatUtc8(from))} 至 ${escapeHtml(formatUtc8(to))}${closed ? " · 结束确认时间" : " · 当前查询截止"}</strong></div></div><p class="window-detail-note">按时间正序展示窗口内的收益观测。正收益样本计入窗口指标；零/负收益样本用于连续性判断；无法估值样本仅供诊断。结果是观察估算，不代表可成交或实际收益。</p><section class="overview"><div class="section-heading"><h3>窗口内全部样本</h3><span>每页 20 条</span></div><div class="table-wrap"><table class="direct-record-table window-sample-table"><thead><tr><th>时间（UTC+8）</th><th>净收益 / ROI (bp)</th><th>CEX VWAP</th><th>毛收益</th><th>CEX 手续费</th><th>Gas 预算</th><th>窗口统计 / 状态</th><th>详情</th></tr></thead><tbody>${recordRows || `<tr><td class="window-sample-empty" colspan="8">${positiveCount ? `明细查询未返回记录，但摘要统计有 ${positiveCount} 个正收益样本。` : "该窗口没有可显示的收益样本。"}</td></tr>`}</tbody></table></div>${pagination(path, range, page, total, "窗口收益样本分页", windowParams)}</section>${pageStyle()}<style>.window-detail-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin:16px 0;padding:14px 16px;border:1px solid #e5eaf2;border-radius:10px;background:#fff}.window-detail-meta>div{min-width:0}.window-detail-meta small{display:block;margin-bottom:3px;color:#758198;font-size:11px}.window-detail-meta strong{display:block;overflow-wrap:anywhere;color:#26364f;font-size:13px}.window-detail-meta .window-range{grid-column:1/-1}.window-detail-note{margin:0 0 14px;color:#65738a;font-size:12px;line-height:1.55}.window-sample-table{table-layout:fixed;min-width:1040px}.window-sample-table th,.window-sample-table td{padding:10px 8px;white-space:normal;overflow-wrap:anywhere;line-height:1.45}.window-sample-table th:nth-child(1){width:14%}.window-sample-table th:nth-child(2){width:15%}.window-sample-table th:nth-child(3){width:11%}.window-sample-table th:nth-child(4){width:11%}.window-sample-table th:nth-child(5){width:12%}.window-sample-table th:nth-child(6){width:10%}.window-sample-table th:nth-child(7){width:20%}.window-sample-table th:nth-child(8){width:7%}.window-sample-empty{padding:22px!important;color:#65738a;text-align:center!important}@media(max-width:700px){.window-detail-meta{grid-template-columns:1fr 1fr}.window-sample-table{min-width:960px}}</style>`;
@@ -329,17 +340,18 @@ export async function renderDirectPoolPage(options: PageOptions): Promise<string
       if (positiveOnly) decisionPredicates.push(`${validEstimateSql} AND net_profit_usdt > 0`);
       const filterSql = decisionPredicates.map((predicate) => ` AND ${predicate}`).join("");
       const [rows, countRows] = await Promise.all([
-        query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,simulation_status,simulation_reason,created_at FROM direct_pool_decision WHERE created_at >= ? AND created_at < ?${filterSql} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, [...decisionParameters, pageSize + 1, (page - 1) * pageSize]),
+        query<DecisionRow[]>(`SELECT id,instrument_id,chain_index,pool_id,direction,CAST(size_usdt AS CHAR) size_usdt,selected_quote_id,CAST(cex_vwap AS CHAR) cex_vwap,CAST(gross_profit_usdt AS CHAR) gross_profit_usdt,CAST(cex_fee_usdt AS CHAR) cex_fee_usdt,CAST(gas_budget_usdt AS CHAR) gas_budget_usdt,CAST(net_profit_usdt AS CHAR) net_profit_usdt,CAST(worst_case_net_profit_usdt AS CHAR) worst_case_net_profit_usdt,minimum_profit_status,CAST(roi AS CHAR) roi,valuation_status,decision_status,block_reason,execution_status,simulation_status,simulation_reason,created_at FROM direct_pool_decision WHERE created_at >= ? AND created_at < ?${filterSql} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, [...decisionParameters, pageSize + 1, (page - 1) * pageSize]),
         query<CountRow[]>(`SELECT COUNT(*) total FROM direct_pool_decision WHERE created_at >= ? AND created_at < ?${filterSql}`, decisionParameters),
       ]);
       const total = Number(countRows[0]?.total ?? 0);
       const recordRows = rows.slice(0, pageSize).map((raw) => {
         const row = correctedDecision(raw, offsetSeconds);
         const profit = decisionProfit(row, helpers);
+        const minimumProfit = minimumProfitSummary(row, helpers);
         const quoteLink = row.selected_quote_id === null ? (row.net_profit_usdt === null && !isInvalidated(row.valuation_status) ? "无关联报价" : "原始报价已过保留期") : `<a href="${directPoolHref("/direct-pools/quote", range, { id: String(row.selected_quote_id), back: "decisions", ...filterParams, ...(page > 1 ? { page: String(page) } : {}) })}">报价详情 →</a>`;
         const quote = `${quoteLink}<small>模拟：${escapeHtml(directPoolSimulationLabel(row.simulation_status))}${row.simulation_reason ? ` · ${escapeHtml(row.simulation_reason)}` : ""}</small>`;
         const direction = row.direction === "dex_buy_cex_sell" ? "DEX 买入 · CEX 卖出" : "CEX 买入 · DEX 卖出";
-        return `<tr><td>${escapeHtml(formatUtc8(row.created_at))}</td><td><strong>${escapeHtml(row.instrument_id)}</strong><small>${escapeHtml(row.chain_index)} · ${escapeHtml(row.pool_id ?? "池 ID 不可用")}</small></td><td>${escapeHtml(direction)}</td><td class="numeric">${escapeHtml(formatReportDecimal(row.size_usdt, 8))} USDT</td><td class="numeric ${profit.className}"><strong>${escapeHtml(profit.text)}</strong></td><td>${quote}</td></tr>`;
+        return `<tr><td>${escapeHtml(formatUtc8(row.created_at))}</td><td><strong>${escapeHtml(row.instrument_id)}</strong><small>${escapeHtml(row.chain_index)} · ${escapeHtml(row.pool_id ?? "池 ID 不可用")}</small></td><td>${escapeHtml(direction)}</td><td class="numeric">${escapeHtml(formatReportDecimal(row.size_usdt, 8))} USDT</td><td class="numeric ${profit.className}"><strong>${escapeHtml(profit.text)}</strong>${minimumProfit ? `<small>${escapeHtml(minimumProfit)}</small>` : ""}</td><td>${quote}</td></tr>`;
       }).join("");
       const profitFilter = `<nav class="direct-subnav direct-profit-filter" aria-label="收益筛选"><a href="${directPoolHref(path, range, decisionFilterParams({ ...filters!, positiveOnly: false }))}"${positiveOnly ? "" : ' aria-current="page"'}>全部收益</a><a href="${directPoolHref(path, range, decisionFilterParams({ ...filters!, positiveOnly: true }))}"${positiveOnly ? ' aria-current="page"' : ""}>净收益大于 0</a></nav>`;
       const decisionNote = `<div class="direct-decision-note"><span>${positiveOnly ? "筛选结果：净收益为正且估值有效。" : "筛选结果：所选时间范围内的全部收益记录。"}</span><span>观察估算 · NOT_EXECUTABLE</span><span>CEX VWAP、收益拆分与估值口径见“报价详情”；保留 ${config.marketdata.directDecisionRetentionDays} 天，每页 20 条。</span></div>`;

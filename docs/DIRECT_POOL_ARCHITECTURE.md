@@ -325,6 +325,8 @@ Raydium 固定监听器只解析 Raydium CLMM `PoolState`；不得复用来读�
 
 候选交易路线的净收益必须基于已核验的估值和所有已知成本。观察路线另行保存假设收益：扣除 CEX 手续费、X Layer 配置的固定 Gas 预算，或 Solana 单签名基础费的 SOL-USDT 估值；估值标记 `ASSUMED_1_TO_1`。CEX 深度不足、订单簿变化、Wrapper 预览失败或 SOL-USDT 价格不可用时只保存报价并记录收益阻断原因。Solana 优先费、ATA 租金、USDG/USDC 真实兑换成本及 X Layer 实时 Gas 折算仍未纳入，因此观察收益不代表可成交净收益。
 
+指定 Raydium CLMM、Orca Whirlpool、Meteora DLMM 和 Byreal CLMM XSPCX/USDC 观察路线的 100 USDT `dex_buy_cex_sell` 样本，按 10 bp 报价滑点的 `minimum_amount_out_raw` 计算 `worst_case_net_profit_usdt`，并以 `minimum_profit_status` 标记是否达到 0.01 USDT。该值使用 SOL-USDT 卖价估值基础网络费，并基于 OKX 盘口深度计算卖出收入；报价币仍按 USDC/USDT 1:1 假设，且未包含优先费或 ATA 租金。它不改变 `net_profit_usdt`、池的 `observe_only` 模式或 `NOT_EXECUTABLE` 执行状态。
+
 ### 7.2 成交前复核（第二阶段的强制契约）
 
 第二阶段即使允许真实执行，也必须在广播前重新执行：
@@ -363,6 +365,7 @@ Raydium 固定监听器只解析 Raydium CLMM `PoolState`；不得复用来读�
 - `selected_quote_id`（可空，关联 `direct_pool_quote`）；
 - CEX book 时间、接收时间、seqId、bid/ask 与本次 VWAP；
 - CEX fee、DEX 网络费、独立记录的观察 Gas 预算、估值输入、gross/net profit、ROI；
+- `worst_case_net_profit_usdt` 与 `minimum_profit_status`：仅适用观察路线有值，其它记录为 `NULL` / `NOT_APPLICABLE`；
 - `valuation_status`、`decision_status`、`block_reason`；
 - `execution_status`，第一期仅允许 `NOT_EXECUTABLE`；
 - `created_at`。

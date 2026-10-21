@@ -12,6 +12,7 @@
 | --- | --- |
 | [TODO.md](TODO.md) | 未完成事项与后续阶段工作。 |
 | [DIRECT_POOL_LIVE_EXECUTION.md](DIRECT_POOL_LIVE_EXECUTION.md) | 尚未实施的实盘执行前置条件、状态机、风控与灰度规划。 |
+| [DIRECT_POOL_MINIMUM_PROFIT_FLOOR_DESIGN.md](DIRECT_POOL_MINIMUM_PROFIT_FLOOR_DESIGN.md) | 先在只读观察阶段验证 0.01 USDT 保守净收益门槛，再将同一规则接入交易执行。 |
 | [SOLANA_SIMULATED_COST_IMPLEMENTATION.md](SOLANA_SIMULATED_COST_IMPLEMENTATION.md) | 尚未实施的 Raydium 模拟成本折算、独立收益口径与验收方案。 |
 
 ## 操作

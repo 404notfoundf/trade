@@ -80,6 +80,18 @@ docker compose logs --tail=100 -f app
 
 迁移命令会检查并应用尚未执行的数据库迁移；没有新迁移时不会改动数据库。若 MySQL 容器未运行，先执行 `docker compose up -d mysql`。更新应用不需要删除数据库卷，也不要运行 `docker compose down -v`。Compose 会自动把应用和 MySQL 放在同一网络，应用始终使用 `mysql:3306`；MySQL 的 `3306:3306` 和应用的 `3000:3000` 仍发布到宿主机。远程客户端可访问 `<Ubuntu服务器公网IP>:3306`，网页访问 `http://<Ubuntu服务器地址>:3000`。云安全组应限制 3306 的来源 IP；Docker 发布的端口可能绕过 UFW 规则。公网开放 root 登录风险较高。若需保留旧版回滚，验证新服务前不要删除已停止的旧容器。
 
+#### 修改配置后重启
+
+在项目目录执行对应命令；配置会在应用启动时重新读取：
+
+| 修改文件 | 命令 | 原因 |
+| --- | --- | --- |
+| `config.yaml` | `docker compose restart app` | 文件以只读挂载方式提供给容器，重启应用进程即可读取新内容。 |
+| `.env` | `docker compose up -d --force-recreate app` | `.env` 通过 Compose `env_file` 注入，必须重建容器才能更新环境变量。 |
+| `market-registry.yaml` | `docker compose up -d --build --force-recreate app` | 文件打包在应用镜像中，需重新构建镜像并替换容器。 |
+
+同时修改多个文件时，使用 `market-registry.yaml` 对应的命令即可。上述操作只重启应用，不会删除 MySQL 数据卷。`mysql.env` 仅在 MySQL 数据目录首次初始化时设置账号；已有 `mysql_data` 卷不会因修改该文件自动更新数据库账号密码。
+
 ### 用新方法开始只读观察
 
 1. 将 `.env.example` 中的 direct-pool RPC 配置（`XLAYER_RPC_HTTP/WS`、`SOLANA_RPC_URL/WS`）补齐或更新到现有 `.env`，保留已有 API 密钥并避免重复定义变量；也可替换为自己的 RPC。协议部署地址已固定登记在 `market-registry.yaml`。只读观察不需要私钥；启用 Solana 模拟时才配置 `SOLANA_SIMULATION_PRIVATE_KEY`。当前公开端点适合开始观察，持续运行时可能限流；对应项缺失时该链会显示 `not_configured`。
